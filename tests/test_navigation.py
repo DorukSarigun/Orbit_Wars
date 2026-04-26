@@ -276,6 +276,43 @@ class TestPathCollision:
         t_arrival = 80 / v
         assert path_collision(src, 0.0, 100, t_arrival, [off_path], 0.0) is None
 
+    def test_rotating_blocker_start_of_interval(self):
+        """Regression for bug where a rotating blocker slipped through
+        because path_collision only checked the END of each sub-interval.
+
+        Scenario reproduced from user report (step 69 launch from planet 0
+        at (68.6, 95.1) toward planet 17). Rotating planet 15 crosses
+        the trajectory at turn ~80, at position_at(~11).
+        """
+        # Src at the actual coords from the bug report
+        src = Planet.from_obs_row(
+            [0, 0, 68.60863828631827, 95.09783068169907, 2.386, 298, 4],
+        )
+        src.is_rotating = False
+        src.initial_theta = None
+
+        # Rotating blocker matching planet 15: r_sun=26.2, theta_launch=0.148
+        r15 = 26.2
+        theta15_launch = 0.148
+        blocker = make_rotating(15, r=r15, theta0=theta15_launch, radius=1.0)
+
+        # Fake target placeholder (far away, off-path) -- compute_launch's
+        # intercept was (77.9, 28.7). We only care that path_collision flags
+        # the rotating blocker on the way there.
+        v = fleet_speed(20)
+        angle = -1.4309822458870551  # from history
+        # Fly ~27 turns at this speed, matching the original arrival.
+        t_arrival = 27.6
+
+        blocker_id = path_collision(
+            src, angle=angle, ships=20, t_arrival=t_arrival,
+            other_planets=[blocker],
+            angular_velocity=0.036833916252796396,
+            sample_step=1.0, extra_margin=0.1,
+        )
+        # THE fix: this MUST now return 15 (previously silently passed).
+        assert blocker_id == 15
+
 
 # =============================================================================
 # compute_launch (top-level)

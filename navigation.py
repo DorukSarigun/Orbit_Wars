@@ -167,10 +167,14 @@ def path_collision(
     extra_margin: float = 0.1,
 ) -> Optional[int]:
     """Walk the fleet's straight-line path in `sample_step` increments;
-    at each interval, test whether the fleet's motion segment passes
-    within (planet.radius + extra_margin) of any planet (at that planet's
-    position at the END of the interval, since the env rotates planets
-    AFTER fleet movement each turn).
+    at each interval, test whether the fleet collides with any planet.
+
+    Two checks per sub-interval, matching the env's turn order
+    (fleet movement, THEN planet rotation):
+      1. Fleet movement: fleet segment vs planet at START-of-interval
+         position (env step 5). This is the primary check.
+      2. Planet sweep: planet segment vs fleet END position (env step 6).
+         Catches rotating planets that sweep into a slow fleet.
 
     Returns the id of the first blocking planet, or None if the path is
     clear for the entire interval [0, t_arrival].
@@ -201,10 +205,16 @@ def path_collision(
         for p in other_planets:
             if p.id == src.id:
                 continue
-            # Planet position at the end of the sub-interval (env rotates
-            # after fleet movement; see README turn order).
-            px, py = p.position_at(t_next, angular_velocity=angular_velocity)
-            if segment_min_dist_to_point(fx, fy, nx, ny, px, py) < (p.radius + extra_margin):
+            threshold = p.radius + extra_margin
+            # (1) Fleet movement check: planet at START of interval
+            #     (= end of previous turn = before this turn's rotation).
+            px0, py0 = p.position_at(t, angular_velocity=angular_velocity)
+            if segment_min_dist_to_point(fx, fy, nx, ny, px0, py0) < threshold:
+                return p.id
+            # (2) Planet sweep check: planet rotates from pos0 to pos1 while
+            #     fleet sits at its new position.
+            px1, py1 = p.position_at(t_next, angular_velocity=angular_velocity)
+            if segment_min_dist_to_point(px0, py0, px1, py1, nx, ny) < threshold:
                 return p.id
         t, fx, fy = t_next, nx, ny
 
@@ -426,9 +436,16 @@ def path_collision_from(
         t_next = min(t + sample_step, t_arrival)
         nx, ny = fleet_pos(t_next)
         for p in other_planets:
-            px, py = p.position_at(t_offset + t_next,
-                                   angular_velocity=angular_velocity)
-            if segment_min_dist_to_point(fx, fy, nx, ny, px, py) < (p.radius + extra_margin):
+            threshold = p.radius + extra_margin
+            # (1) Fleet movement check: planet at START of interval.
+            px0, py0 = p.position_at(t_offset + t,
+                                     angular_velocity=angular_velocity)
+            if segment_min_dist_to_point(fx, fy, nx, ny, px0, py0) < threshold:
+                return p.id
+            # (2) Planet sweep check: planet moves, fleet sits at new pos.
+            px1, py1 = p.position_at(t_offset + t_next,
+                                     angular_velocity=angular_velocity)
+            if segment_min_dist_to_point(px0, py0, px1, py1, nx, ny) < threshold:
                 return p.id
         t, fx, fy = t_next, nx, ny
 
