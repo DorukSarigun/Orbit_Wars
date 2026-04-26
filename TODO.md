@@ -59,9 +59,10 @@ Agent'ın gördüğü gözlem zenginleştirmesi:
 - [ ] Garrison ihtiyacı: `defenders_needed = sum(incoming_ships) - my_ships - production_until_arrival`.
 
 ### Tests
-- [ ] `test_navigation.py` — `find_intercepts` için statik + rotating + edge case'ler (tam karşıda, çok yakın, vs).
-- [ ] Regression: `compute_launch` ↔ `compute_launch_at(t_offset=0)` aynı sonucu mu veriyor?
-- [ ] `path_collision` rotating engelleyiciyi gerçekten zaman-bağımlı yakalıyor mu?
+- [x] `tests/test_navigation.py` — 41 test, pytest, < 0.1s.
+- [ ] Comet kinematiği için ayrı bir test grubu (`position_at` path interpolation).
+- [ ] Playground smoke test: `Playground().step()` 10 tur crash'siz.
+- [ ] `path_collision` rotating engelleyici zaman-bağımlı yakalama testi (pozitif + negatif case).
 
 ---
 
