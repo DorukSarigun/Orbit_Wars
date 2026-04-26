@@ -15,7 +15,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from feature_extraction import Planet, fleet_speed, SUN_X, SUN_Y, SUN_RADIUS
+from feature_extraction import Planet, Fleet, fleet_speed, SUN_X, SUN_Y, SUN_RADIUS
 from navigation import (
     segment_min_dist_to_point,
     crosses_sun,
@@ -27,6 +27,9 @@ from navigation import (
     compute_launch_at,
     earliest_reachable,
     reachability_scan,
+    predict_fleet_target,
+    predict_all_fleet_targets,
+    incoming_threats,
 )
 
 
@@ -44,6 +47,11 @@ def make_static(pid: int, x: float, y: float, *,
     p.is_rotating = False
     p.initial_theta = None
     return p
+
+
+def make_fleet(fid: int, owner: int, x: float, y: float, angle: float,
+               from_pid: int, ships: int) -> Fleet:
+    return Fleet.from_obs_row([fid, owner, x, y, angle, from_pid, ships])
 
 
 def make_rotating(pid: int, r: float, theta0: float, *,
@@ -428,3 +436,105 @@ class TestReachabilityScan:
         rows = reachability_scan(src, [src, other], 30, [src, other], 0.0)
         ids = [r["target_id"] for r in rows]
         assert src.id not in ids
+
+
+# =============================================================================
+# predict_fleet_target
+# =============================================================================
+class TestPredictFleetTarget:
+    def test_head_on_static_hit(self):
+        # Fleet at (10, 10) flying east toward static planet at (50, 10).
+        # y=10 keeps us well away from the sun at (50, 50).
+        target = make_static(7, 50, 10, radius=2.0)
+        fleet = make_fleet(0, owner=0, x=10, y=10, angle=0.0,
+                           from_pid=99, ships=20)
+        pred = predict_fleet_target(fleet, [target], 0.0)
+        assert pred is not None
+        assert pred["target_id"] == 7
+        v = fleet_speed(20)
+        assert pred["eta"] == pytest.approx(38.0 / v, rel=0.1)
+
+    def test_perpendicular_miss_returns_none(self):
+        # Fleet flying south; planet far to the east
+        target = make_static(7, 80, 50, radius=2.0)
+        fleet = make_fleet(0, 0, 10, 10, math.pi / 2, 99, 20)
+        pred = predict_fleet_target(fleet, [target], 0.0, t_max=100.0)
+        assert pred is None
+
+    def test_source_planet_excluded(self):
+        # Fleet just spawned next to its source. Without exclusion it
+        # would 'predict' itself hitting the source planet.
+        source = make_static(5, 10, 10, radius=2.0)
+        far_target = make_static(7, 80, 10, radius=2.0)
+        fleet = make_fleet(0, 0, 12.5, 10, 0.0, from_pid=5, ships=20)
+        pred = predict_fleet_target(fleet, [source, far_target], 0.0)
+        assert pred is not None
+        assert pred["target_id"] == far_target.id
+
+    def test_out_of_bounds_returns_none(self):
+        # Fleet at (95, 50) flying east -> leaves board with no planets nearby
+        fleet = make_fleet(0, 0, 95, 50, 0.0, from_pid=99, ships=20)
+        # Nothing in the way
+        pred = predict_fleet_target(fleet, [], 0.0)
+        assert pred is None
+
+    def test_sun_destroys_fleet_returns_none(self):
+        # Fleet at (10, 50) flying east into the sun, with planet only on
+        # the FAR side -> fleet dies before reaching planet
+        target = make_static(7, 90, 50, radius=2.0)
+        fleet = make_fleet(0, 0, 10, 50, 0.0, from_pid=99, ships=20)
+        pred = predict_fleet_target(fleet, [target], 0.0)
+        assert pred is None
+
+    def test_rotating_target_intercept(self):
+        # Rotating planet at theta=-pi/2 (above sun, at (50, 20)).
+        # Fleet flies east along y=20 -> hits it.
+        tgt = make_rotating(7, r=30, theta0=-math.pi / 2)  # at (50, 20)
+        fleet = make_fleet(0, 0, 10, 20, 0.0, from_pid=99, ships=30)
+        pred = predict_fleet_target(fleet, [tgt], 0.0)  # omega=0
+        assert pred is not None
+        assert pred["target_id"] == 7
+
+
+# =============================================================================
+# predict_all_fleet_targets + incoming_threats
+# =============================================================================
+class TestThreats:
+    def test_predict_all_keys_by_fleet_id(self):
+        target = make_static(7, 50, 10)
+        f1 = make_fleet(11, 0, 10, 10, 0.0, 99, 20)        # east -> hits
+        f2 = make_fleet(22, 1, 90, 10, math.pi, 99, 20)    # west -> hits
+        out = predict_all_fleet_targets([f1, f2], [target], 0.0)
+        assert set(out.keys()) == {11, 22}
+        assert out[11]["target_id"] == 7
+        assert out[22]["target_id"] == 7
+
+    def test_incoming_threats_filters_my_planets(self):
+        # Player 0 owns planet 7. Enemy fleet heading to it = threat.
+        # Friendly fleet heading to enemy planet 8 = NOT a threat.
+        my_planet = make_static(7, 50, 10, owner=0)
+        enemy_planet = make_static(8, 50, 90, owner=1)
+        enemy_attacker = make_fleet(11, 1, 10, 10, 0.0, 99, 25)  # -> my 7
+        my_outgoing = make_fleet(22, 0, 10, 90, 0.0, 99, 20)     # -> enemy 8
+
+        threats = incoming_threats(
+            player=0,
+            fleets=[enemy_attacker, my_outgoing],
+            planets=[my_planet, enemy_planet],
+            angular_velocity=0.0,
+        )
+        ids = [t["fleet_id"] for t in threats]
+        assert 11 in ids
+        assert 22 not in ids
+
+    def test_incoming_threats_sorted_by_eta(self):
+        my_planet = make_static(7, 50, 10, owner=0)
+        # Two enemies, one closer than the other
+        near_enemy = make_fleet(11, 1, 30, 10, 0.0, 99, 20)
+        far_enemy = make_fleet(22, 1, 5, 10, 0.0, 99, 20)
+        threats = incoming_threats(0, [far_enemy, near_enemy],
+                                   [my_planet], 0.0)
+        assert len(threats) == 2
+        # Closer enemy should arrive first
+        assert threats[0]["fleet_id"] == 11
+        assert threats[0]["eta"] < threats[1]["eta"]

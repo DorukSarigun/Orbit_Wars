@@ -55,11 +55,12 @@ Agent'ın gördüğü gözlem zenginleştirmesi:
 - [ ] Filo trail (geçtiği yolu çiz) — debug için faydalı.
 
 ### Defense / Reactive
-- [ ] Düşman filolarının ETA hesaplama — gelen tehditleri sırala.
+- [x] Düşman filolarının ETA hesaplama — `predict_fleet_target` + `incoming_threats` (navigation.py).
+- [x] Render overlay: tahmini intercept noktası (kesikli + halka).
 - [ ] Garrison ihtiyacı: `defenders_needed = sum(incoming_ships) - my_ships - production_until_arrival`.
 
 ### Tests
-- [x] `tests/test_navigation.py` — 41 test, pytest, < 0.1s.
+- [x] `tests/test_navigation.py` — 50 test, pytest, < 0.1s.
 - [ ] Comet kinematiği için ayrı bir test grubu (`position_at` path interpolation).
 - [ ] Playground smoke test: `Playground().step()` 10 tur crash'siz.
 - [ ] `path_collision` rotating engelleyici zaman-bağımlı yakalama testi (pozitif + negatif case).

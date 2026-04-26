@@ -40,6 +40,7 @@ from typing import Iterable, Optional
 
 from feature_extraction import (
     Planet,
+    Fleet,
     SUN_X,
     SUN_Y,
     SUN_RADIUS,
@@ -577,6 +578,161 @@ def earliest_reachable(
         k += step
 
     return None
+
+
+# =============================================================================
+# 9) Fleet target prediction
+# =============================================================================
+#
+# The env's fleet observation row is [id, owner, x, y, angle, from_planet_id,
+# ships]. Notably it does NOT include a target planet id -- destination must
+# be inferred from the fleet's straight-line trajectory.
+#
+# Because a fleet flies in a straight line at constant speed, prediction is
+# deterministic: step time forward, compute fleet position and every planet's
+# position at that time, and report the first planet whose capture radius
+# the fleet enters.
+# =============================================================================
+BOARD_SIZE = 100.0
+
+
+def predict_fleet_target(
+    fleet: Fleet,
+    planets: Iterable[Planet],
+    angular_velocity: float,
+    *,
+    t_max: float = 300.0,
+    step: float = 0.5,
+    margin: float = 0.1,
+) -> Optional[dict]:
+    """Predict which planet an in-flight fleet will hit, and when.
+
+    Walks the fleet's trajectory forward in `step`-turn increments, checking
+    each sub-segment against every planet's time-shifted position. Returns
+    the first hit, or None if the fleet leaves the board / enters the sun
+    / reaches t_max without contact.
+
+    Args:
+        fleet: active Fleet (position, angle, speed already resolved).
+        planets: all planets (source planet is auto-excluded).
+        angular_velocity: env's omega for rotating planets.
+        t_max: max turns to simulate forward.
+        step: time granularity for the scan.
+        margin: extra slack added to each planet's radius (matches env's
+            per-turn collision tolerance).
+
+    Returns dict with:
+        target_id, eta, intercept_x, intercept_y
+    or None if no target predicted.
+    """
+    v = fleet.speed
+    if v <= 0.0:
+        return None
+    cos_a, sin_a = math.cos(fleet.angle), math.sin(fleet.angle)
+
+    # Exclude source planet: fleet is just leaving it, so distance is ~radius.
+    others = [p for p in planets if p.id != fleet.from_planet_id]
+
+    t_prev = 0.0
+    fx_prev, fy_prev = fleet.x, fleet.y
+
+    t = step
+    while t <= t_max + 1e-9:
+        fx = fleet.x + cos_a * v * t
+        fy = fleet.y + sin_a * v * t
+
+        # Fleet destroyed by sun? (segment passes through it)
+        if segment_min_dist_to_point(fx_prev, fy_prev, fx, fy,
+                                     SUN_X, SUN_Y) < SUN_RADIUS:
+            return None
+        # Fleet out of bounds?
+        if fx < 0 or fx > BOARD_SIZE or fy < 0 or fy > BOARD_SIZE:
+            return None
+
+        # Check each planet at the END of this sub-interval.
+        best: Optional[tuple[float, Planet, float, float]] = None
+        for p in others:
+            px, py = p.position_at(t, angular_velocity=angular_velocity)
+            # Minimum distance between the fleet's motion segment
+            # (fx_prev, fy_prev) -> (fx, fy) and the planet's end position.
+            d = segment_min_dist_to_point(fx_prev, fy_prev, fx, fy, px, py)
+            if d <= p.radius + margin:
+                if best is None or d < best[0]:
+                    best = (d, p, px, py)
+
+        if best is not None:
+            _, p, px, py = best
+            return {
+                "target_id": p.id,
+                "eta": t,
+                "intercept_x": px,
+                "intercept_y": py,
+                "fleet_id": fleet.id,
+            }
+
+        t_prev, fx_prev, fy_prev = t, fx, fy
+        t += step
+
+    return None
+
+
+def predict_all_fleet_targets(
+    fleets: Iterable[Fleet],
+    planets: Iterable[Planet],
+    angular_velocity: float,
+    **kwargs,
+) -> dict[int, Optional[dict]]:
+    """Batch predict_fleet_target for every fleet; keyed by fleet.id."""
+    plist = list(planets)
+    out: dict[int, Optional[dict]] = {}
+    for f in fleets:
+        out[f.id] = predict_fleet_target(f, plist, angular_velocity, **kwargs)
+    return out
+
+
+def incoming_threats(
+    player: int,
+    fleets: Iterable[Fleet],
+    planets: Iterable[Planet],
+    angular_velocity: float,
+    **kwargs,
+) -> list[dict]:
+    """Enemy fleets predicted to hit any of `player`'s planets, sorted by
+    ETA ascending. Each entry:
+
+        {
+            "fleet_id":    int,
+            "owner":       int,
+            "ships":       int,
+            "target_id":   int,
+            "eta":         float,
+            "intercept":   (x, y),
+        }
+
+    Useful for defensive planning: pairs each incoming threat with its
+    target so the agent can decide whether to reinforce.
+    """
+    plist = list(planets)
+    my_planet_ids = {p.id for p in plist if p.owner == player}
+    rows: list[dict] = []
+    for f in fleets:
+        if f.owner == player:
+            continue
+        pred = predict_fleet_target(f, plist, angular_velocity, **kwargs)
+        if pred is None:
+            continue
+        if pred["target_id"] not in my_planet_ids:
+            continue
+        rows.append({
+            "fleet_id": f.id,
+            "owner": f.owner,
+            "ships": f.ships,
+            "target_id": pred["target_id"],
+            "eta": pred["eta"],
+            "intercept": (pred["intercept_x"], pred["intercept_y"]),
+        })
+    rows.sort(key=lambda r: r["eta"])
+    return rows
 
 
 def reachability_scan(

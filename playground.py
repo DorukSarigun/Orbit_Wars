@@ -32,7 +32,13 @@ from feature_extraction import (
     parse_fleets,
     SUN_X, SUN_Y, SUN_RADIUS,
 )
-from navigation import compute_launch, earliest_reachable, reachability_scan
+from navigation import (
+    compute_launch,
+    earliest_reachable,
+    reachability_scan,
+    predict_all_fleet_targets,
+    incoming_threats,
+)
 
 
 # ----- Color palette ---------------------------------------------------------
@@ -59,6 +65,7 @@ def render_board(
     figsize: tuple[float, float] = (8.5, 8.5),
     show_orbits: bool = True,
     show_fleet_arrows: bool = True,
+    show_predicted_targets: bool = True,
 ):
     """Draw the full board state for a given observation."""
     planets = parse_planets(obs)
@@ -165,6 +172,22 @@ def render_board(
                 path_effects=outline,
             )
 
+    # ---- Predicted intercept points for each fleet (dashed line + ring) ----
+    if show_predicted_targets and fleets:
+        omega = (obs.get("angular_velocity", 0.0) if isinstance(obs, dict)
+                 else getattr(obs, "angular_velocity", 0.0)) or 0.0
+        preds = predict_all_fleet_targets(fleets, planets, omega)
+        for f in fleets:
+            pred = preds.get(f.id)
+            if pred is None:
+                continue
+            c = OWNER_COLORS.get(f.owner, "#fff")
+            ix, iy = pred["intercept_x"], pred["intercept_y"]
+            ax.plot([f.x, ix], [f.y, iy],
+                    ls="--", color=c, lw=0.9, alpha=0.55, zorder=2)
+            ax.plot(ix, iy, marker="o", mfc="none", mec=c,
+                    ms=8, mew=1.4, zorder=6)
+
     # ---- Pending/recent launch trajectories (dotted preview) ----
     if recent_launches:
         for L in recent_launches:
@@ -258,6 +281,42 @@ class Playground:
             else:
                 print(f"{tid:>3}  {kind_of[tid]:<6}  {owner_of[tid]:<5}  "
                       f"{r['k']:>6}  {r['eta']:>6.2f}  {r['total_time']:>6.2f}")
+
+    def fleet_targets(self, player: int = 0):
+        """Print every active fleet alongside its predicted target planet."""
+        flts = self.fleets()
+        if not flts:
+            print("(no fleets in flight)")
+            return
+        omega = self.obs["angular_velocity"]
+        preds = predict_all_fleet_targets(flts, self.planets(), omega)
+        print(f"{'FID':>3}  {'Owner':<5}  {'Ships':>5}  "
+              f"{'From':>4}  {'-> Tgt':>6}  {'ETA':>6}")
+        print("-" * 45)
+        for f in flts:
+            owner = "ME" if f.owner == player else f"P{f.owner}"
+            pred = preds.get(f.id)
+            if pred is None:
+                tgt, eta = "?", "--"
+            else:
+                tgt, eta = pred["target_id"], f"{pred['eta']:>6.2f}"
+            print(f"{f.id:>3}  {owner:<5}  {f.ships:>5}  "
+                  f"{f.from_planet_id:>4}  {tgt:>6}  {eta:>6}")
+
+    def threats(self, player: int = 0):
+        """Print enemy fleets predicted to hit any of `player`'s planets."""
+        omega = self.obs["angular_velocity"]
+        threats = incoming_threats(player, self.fleets(), self.planets(), omega)
+        if not threats:
+            print(f"(no incoming threats to player {player})")
+            return
+        print(f"{'FID':>3}  {'From':>4}  {'P':>2}  {'Ships':>5}  "
+              f"{'-> My':>6}  {'ETA':>6}")
+        print("-" * 40)
+        for t in threats:
+            print(f"{t['fleet_id']:>3}  "
+                  f"{'?':>4}  P{t['owner']:<1}  {t['ships']:>5}  "
+                  f"{t['target_id']:>6}  {t['eta']:>6.2f}")
 
     def fleet_table(self, player: int = 0):
         """Print all fleets currently in flight."""
