@@ -1,0 +1,245 @@
+"""Main training loop for OrbitWarsPolicy via self-play PPO.
+
+Usage:
+    python -m rl.train --iterations 100 --episodes-per-iter 4
+
+Each iteration:
+    1. Roll out N self-play episodes -> rollout buffer
+    2. Compute GAE advantages
+    3. PPO update (K epochs)
+    4. Log metrics, optionally checkpoint
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Optional
+
+import torch
+
+from model import OrbitWarsPolicy
+
+from .buffer import RolloutBuffer
+from .ppo import PPOConfig, ppo_update
+from .rewards import RewardConfig
+from .rollout import collect_episode
+
+
+@dataclass
+class TrainConfig:
+    iterations: int = 100
+    episodes_per_iter: int = 4
+    max_episode_steps: int = 500
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    learning_rate: float = 3e-4
+    seed: int = 0
+    checkpoint_every: int = 10
+    checkpoint_dir: str = "checkpoints"
+    log_path: str = "checkpoints/train_log.jsonl"
+    device: str = "cpu"
+    # Model arch (small by default; bump for serious training)
+    d_model: int = 128
+    n_heads: int = 4
+    n_layers: int = 4
+
+
+def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int,
+               train_cfg: TrainConfig, ppo_cfg: PPOConfig, reward_cfg: RewardConfig) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "iteration": iteration,
+        "policy_state_dict": policy.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "train_cfg": asdict(train_cfg),
+        "ppo_cfg": asdict(ppo_cfg),
+        "reward_cfg": asdict(reward_cfg),
+        # Architecture is needed to rebuild the model on load.
+        "arch": {
+            "p_max": policy.p_max,
+            "f_max": policy.f_max,
+            "d_model": policy.d_model,
+            "n_heads": policy.n_heads,
+            "n_layers": len(policy.blocks),
+            "n_ship_bins": policy.n_ship_bins,
+        },
+    }, path)
+
+
+def load_checkpoint(path: str | Path, device: torch.device | None = None) -> tuple:
+    """Load a checkpoint and rebuild policy. Returns (policy, ckpt_dict)."""
+    device = device or torch.device("cpu")
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    arch = ckpt["arch"]
+    policy = OrbitWarsPolicy(
+        p_max=arch["p_max"], f_max=arch["f_max"],
+        d_model=arch["d_model"], n_heads=arch["n_heads"],
+        n_layers=arch["n_layers"], n_ship_bins=arch["n_ship_bins"],
+    )
+    policy.load_state_dict(ckpt["policy_state_dict"])
+    policy.to(device)
+    return policy, ckpt
+
+
+def train(
+    train_cfg: Optional[TrainConfig] = None,
+    ppo_cfg: Optional[PPOConfig] = None,
+    reward_cfg: Optional[RewardConfig] = None,
+    *,
+    resume_from: Optional[str] = None,
+) -> OrbitWarsPolicy:
+    train_cfg = train_cfg or TrainConfig()
+    ppo_cfg = ppo_cfg or PPOConfig()
+    reward_cfg = reward_cfg or RewardConfig()
+
+    torch.manual_seed(train_cfg.seed)
+    device = torch.device(train_cfg.device)
+
+    if resume_from is not None:
+        policy, ckpt = load_checkpoint(resume_from, device=device)
+        start_iter = int(ckpt.get("iteration", 0)) + 1
+        print(f"Resumed from {resume_from} at iter {start_iter}")
+    else:
+        policy = OrbitWarsPolicy(
+            d_model=train_cfg.d_model,
+            n_heads=train_cfg.n_heads,
+            n_layers=train_cfg.n_layers,
+        ).to(device)
+        start_iter = 0
+
+    optimizer = torch.optim.Adam(policy.parameters(), lr=train_cfg.learning_rate)
+    n_params = sum(p.numel() for p in policy.parameters())
+    print(f"Policy: {n_params:,} params, T={policy.p_max+policy.f_max+1}, "
+          f"device={device}")
+
+    log_path = Path(train_cfg.log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for it in range(start_iter, train_cfg.iterations):
+        t0 = time.time()
+        buffer = RolloutBuffer()
+        ep_stats_list = []
+        for ep in range(train_cfg.episodes_per_iter):
+            seed = train_cfg.seed * 100000 + it * 1000 + ep
+            stats = collect_episode(
+                policy, buffer,
+                max_steps=train_cfg.max_episode_steps,
+                reward_cfg=reward_cfg,
+                device=device,
+                seed=seed,
+            )
+            ep_stats_list.append(stats)
+
+        # Bootstrap value for GAE: 0 since each episode ends terminally.
+        # (collect_episode already sets done=True at the last stored step.)
+        buffer.compute_gae(last_value=0.0,
+                           gamma=train_cfg.gamma, lam=train_cfg.gae_lambda)
+        ppo_stats = ppo_update(policy, buffer, optimizer, ppo_cfg, device=device)
+
+        wins_p0 = sum(1 for s in ep_stats_list if s.winner == 0)
+        wins_p1 = sum(1 for s in ep_stats_list if s.winner == 1)
+        draws = sum(1 for s in ep_stats_list if s.winner == -1)
+        avg_len = sum(s.length for s in ep_stats_list) / len(ep_stats_list)
+        avg_launches = sum((s.n_launches_p0 + s.n_launches_p1) / 2
+                           for s in ep_stats_list) / len(ep_stats_list)
+        elapsed = time.time() - t0
+
+        log = {
+            "iter": it,
+            "episodes": train_cfg.episodes_per_iter,
+            "transitions": len(buffer),
+            "avg_episode_length": round(avg_len, 1),
+            "avg_launches_per_player": round(avg_launches, 1),
+            "wins_p0": wins_p0, "wins_p1": wins_p1, "draws": draws,
+            "policy_loss": round(ppo_stats.policy_loss, 5),
+            "value_loss": round(ppo_stats.value_loss, 5),
+            "entropy": round(ppo_stats.entropy, 4),
+            "approx_kl": round(ppo_stats.approx_kl, 5),
+            "clip_fraction": round(ppo_stats.clip_fraction, 4),
+            "elapsed_sec": round(elapsed, 1),
+        }
+        print(f"[iter {it:>4}] len={log['avg_episode_length']:>5.1f} "
+              f"launch/p={log['avg_launches_per_player']:>4.1f} "
+              f"P0={wins_p0} P1={wins_p1} D={draws} | "
+              f"polL={log['policy_loss']:+.4f} valL={log['value_loss']:.3f} "
+              f"H={log['entropy']:.3f} KL={log['approx_kl']:.4f} "
+              f"clip={log['clip_fraction']:.2f} ({elapsed:.1f}s)")
+
+        with log_path.open("a") as fp:
+            fp.write(json.dumps(log) + "\n")
+
+        if (it + 1) % train_cfg.checkpoint_every == 0 or it == train_cfg.iterations - 1:
+            ckpt_path = Path(train_cfg.checkpoint_dir) / f"policy_iter{it:05d}.pt"
+            _save_ckpt(policy, optimizer, ckpt_path,
+                       iteration=it, train_cfg=train_cfg,
+                       ppo_cfg=ppo_cfg, reward_cfg=reward_cfg)
+            latest = Path(train_cfg.checkpoint_dir) / "latest.pt"
+            _save_ckpt(policy, optimizer, latest,
+                       iteration=it, train_cfg=train_cfg,
+                       ppo_cfg=ppo_cfg, reward_cfg=reward_cfg)
+            print(f"  checkpoint saved -> {ckpt_path}")
+
+    return policy
+
+
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="OrbitWars self-play PPO")
+    p.add_argument("--iterations", type=int, default=100)
+    p.add_argument("--episodes-per-iter", type=int, default=4)
+    p.add_argument("--max-episode-steps", type=int, default=500)
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gae-lambda", type=float, default=0.95)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--checkpoint-every", type=int, default=10)
+    p.add_argument("--checkpoint-dir", default="checkpoints")
+    p.add_argument("--log-path", default="checkpoints/train_log.jsonl")
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--d-model", type=int, default=128)
+    p.add_argument("--n-heads", type=int, default=4)
+    p.add_argument("--n-layers", type=int, default=4)
+    p.add_argument("--clip-range", type=float, default=0.2)
+    p.add_argument("--epochs", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--entropy-coef", type=float, default=0.01)
+    p.add_argument("--planet-diff-weight", type=float, default=0.01)
+    p.add_argument("--ship-diff-weight", type=float, default=0.0005)
+    p.add_argument("--resume-from", default=None,
+                   help="Checkpoint path to resume from")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = _build_argparser().parse_args(argv)
+    train_cfg = TrainConfig(
+        iterations=args.iterations,
+        episodes_per_iter=args.episodes_per_iter,
+        max_episode_steps=args.max_episode_steps,
+        gamma=args.gamma, gae_lambda=args.gae_lambda,
+        learning_rate=args.lr, seed=args.seed,
+        checkpoint_every=args.checkpoint_every,
+        checkpoint_dir=args.checkpoint_dir,
+        log_path=args.log_path,
+        device=args.device,
+        d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
+    )
+    ppo_cfg = PPOConfig(
+        clip_range=args.clip_range,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        entropy_coef=args.entropy_coef,
+    )
+    reward_cfg = RewardConfig(
+        planet_diff_weight=args.planet_diff_weight,
+        ship_diff_weight=args.ship_diff_weight,
+    )
+    train(train_cfg, ppo_cfg, reward_cfg, resume_from=args.resume_from)
+
+
+if __name__ == "__main__":
+    main()

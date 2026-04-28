@@ -347,6 +347,46 @@ class OrbitWarsPolicy(nn.Module):
             "log_prob": log_prob,
         }
 
+    # ----------------------------------------- PPO re-evaluation (with grad)
+    def evaluate_actions(
+        self,
+        out: "PolicyOutput",
+        src: torch.Tensor,         # (B,) long
+        tgt: torch.Tensor,         # (B,) long
+        ship_bin: torch.Tensor,    # (B,) long
+    ) -> dict:
+        """Re-evaluate stored actions under the current policy distribution.
+
+        Used by PPO to compute the new log-prob and entropy of actions that
+        were sampled by an *older* policy snapshot. Gradients flow back
+        through the logits (no `no_grad` here).
+
+        Returns dict with `log_prob` (B,), `entropy` (B,), and `value` (B,)
+        passthrough for convenience.
+        """
+        is_noop = src == self.p_max
+        src_idx = torch.where(is_noop, torch.zeros_like(src), src)
+
+        src_dist = torch.distributions.Categorical(logits=out.src_logits)
+
+        gather_idx = src_idx[:, None, None].expand(-1, 1, self.p_max)
+        tgt_logits_sel = out.tgt_logits.gather(1, gather_idx).squeeze(1)
+        tgt_dist = torch.distributions.Categorical(logits=tgt_logits_sel)
+
+        ship_idx = src_idx[:, None, None].expand(-1, 1, self.n_ship_bins)
+        ship_logits_sel = out.ship_logits.gather(1, ship_idx).squeeze(1)
+        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+
+        valid = (~is_noop).float()
+        log_prob = src_dist.log_prob(src) + valid * (
+            tgt_dist.log_prob(tgt) + ship_dist.log_prob(ship_bin)
+        )
+        # Entropy: sum src + (only if not noop) tgt + ship; matches the
+        # log-prob factorization so it's mathematically consistent.
+        entropy = src_dist.entropy() + valid * (tgt_dist.entropy() + ship_dist.entropy())
+
+        return {"log_prob": log_prob, "entropy": entropy, "value": out.value}
+
 
 # =============================================================================
 # Convenience: tensor packing from a list of Observations

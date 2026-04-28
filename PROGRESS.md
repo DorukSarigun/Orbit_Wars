@@ -297,6 +297,97 @@ Detayı `TODO.md` içinde; özetle:
 
 ---
 
+## 6.5. RL Eğitim Stack'i
+
+Self-play tabanlı online RL infrastructure'ı eklendi. Üç algoritma destekli:
+
+### 6.5.1 PPO (`rl/`)
+
+| Modül | İşlev |
+| --- | --- |
+| `rl/rewards.py` | Terminal +1/-1 + opsiyonel dense shaping (planet/ship farkı) |
+| `rl/buffer.py`  | On-policy rollout buffer + GAE advantage |
+| `rl/rollout.py` | Self-play episode collector (her step iki perspektif kaydı) |
+| `rl/ppo.py`     | Clipped surrogate + value clipping + entropy bonus |
+| `rl/train.py`   | Main loop, checkpoint, JSONL logging, CLI |
+
+`evaluate_actions` `model.py`'de eklendi: PPO update'inde stored action'lar yeni
+politika altında log-prob/entropy yeniden hesaplanır, gradient akar.
+
+### 6.5.2 DQN / Dueling DQN (`rl/dqn*`, `model_q.py`)
+
+Branching DQN (Tavakoli et al. 2018) yaklaşımı:
+
+```
+Q_total(s, src, tgt, ship) =
+    Q_src(s, src)
+  + 1{src != NOOP} * (Q_tgt(s, src, tgt) + Q_ship(s, src, ship))
+```
+
+Greedy action: per-branch argmax (factored max). Target: Double DQN
+(default) veya vanilla. Dueling: paylaşılan `V(s)` + per-branch
+mean-centered advantage (`Q_b = V + A_b - mean A_b`).
+
+| Modül | İşlev |
+| --- | --- |
+| `model_q.py`      | `OrbitWarsQNet(dueling=False/True)` — encoder paylaşımlı |
+| `rl/replay.py`    | FIFO experience replay (uniform sampling) |
+| `rl/dqn.py`       | Double DQN update + target net soft/hard sync |
+| `rl/dqn_train.py` | ε-greedy decay, replay learn-starts, target sync, CLI |
+
+### 6.5.3 Watch utility (`rl/watch.py`)
+
+`load_any_checkpoint()` — PPO ve DQN checkpoint'lerini otomatik tanır.
+`play_self_play_game(net, render=True, render_every=N)` — kendine karşı
+oynatır, `playground.render_board` ile her N turda matplotlib çizimi.
+
+### 6.5.4 CLI komutları
+
+```bash
+# PPO
+python -m rl.train --iterations 500 --episodes-per-iter 8 \
+    --d-model 128 --n-heads 4 --n-layers 4 \
+    --batch-size 256 --epochs 4 --entropy-coef 0.01
+
+# DQN
+python -m rl.dqn_train --iterations 500 --episodes-per-iter 4 \
+    --d-model 128 --n-layers 4 --replay-capacity 200000 \
+    --learn-starts 5000 --eps-decay-steps 100000
+
+# Dueling DQN: yukarıdakine --dueling ekle
+
+# Watch (otomatik ppo/dqn ayrımı)
+python -m rl.watch --ckpt checkpoints/latest.pt --render-every 25
+```
+
+Default network 849K parametre (d=128, L=4, H=4); CPU'da ~1-3 sn/iter
+küçük config, gerçek eğitim için GPU önerilir.
+
+### 6.5.5 Self-play tasarımı
+
+Tek live policy/Q-net iki tarafı da oynatır. Her env adımında 2 transition
+(her perspektif) buffer'a yazılır → 2× data efficiency. Reward iki taraf
+için ayrı hesaplanır (zero-sum simetri otomatik). Frozen opponent pool
+şu an yok; ileride collapse görülürse eklenebilir.
+
+### 6.5.6 Notebook
+
+`orbit-wars-data/notebooks/notebooks/training_watch.ipynb` — PPO + DQN +
+Dueling tiny eğitim koşusu, sonrasında checkpoint'i yüklü olarak inline
+render.
+
+### 6.5.7 Test kapsamı
+
+`tests/test_rl.py` (18 yeni test): `evaluate_actions` (log-prob match,
+entropy non-negative, gradient flow, NOOP factorization), GAE buffer
+(terminal advantage, returns invariant, minibatch coverage), replay
+(capacity, sampling), reward shaping (terminal-only, neutral state,
+planet capture), Q-net forward shapes/dueling centering/masked argmax.
+
+**Toplam: 91 test, hepsi geçiyor.**
+
+---
+
 ## 7. Hızlı Başlangıç
 
 ```bash

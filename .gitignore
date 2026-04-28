@@ -21,3 +21,11 @@ __pycache__/
 .vscode/
 .idea/
 *.swp
+
+# RL training artifacts
+checkpoints/
+checkpoints_dqn/
+checkpoints_duel/
+nb_ckpt_*/
+*.pt
+!docs/**/*.pt
