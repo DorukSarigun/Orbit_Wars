@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_q import OrbitWarsQNet
+from .metrics import grad_norms_by_module
 
 
 @dataclass
@@ -112,6 +113,8 @@ def dqn_update(
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
+    # Per-module grad norm BEFORE clipping (raw signal magnitudes).
+    per_mod_grad = grad_norms_by_module(online_net)
     grad_norm = nn.utils.clip_grad_norm_(online_net.parameters(), cfg.max_grad_norm)
     optimizer.step()
 
@@ -123,6 +126,7 @@ def dqn_update(
         "td_error": float(td_err),
         "q_mean": float(q_mean),
         "grad_norm": float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm),
+        "grad_norms_by_module": per_mod_grad,
     }
 
 

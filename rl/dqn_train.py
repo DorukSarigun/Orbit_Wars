@@ -34,6 +34,9 @@ from model_q import OrbitWarsQNet
 
 from .replay import DQNTransition, ReplayBuffer
 from .dqn import DQNConfig, dqn_update, hard_update_target, soft_update_target
+from .metrics import (
+    WeightSnapshot, round_metrics, weight_norms_by_module,
+)
 from .rewards import RewardConfig, compute_step_reward
 
 
@@ -191,6 +194,11 @@ def train_dqn(
         t0 = time.time()
         ep_lengths, ep_rewards_p0, ep_rewards_p1, ep_winners, ep_launches = [], [], [], [], []
         update_stats = {"dqn_loss": [], "td_error": [], "q_mean": [], "grad_norm": []}
+        # Aggregate per-module grad norms across all updates this iteration.
+        grad_norms_accum: dict[str, float] = {}
+        grad_norms_count = 0
+        # Snapshot weights at iter start to compute ||Δw|| / ||w||.
+        snap = WeightSnapshot(online)
 
         for ep in range(train_cfg.episodes_per_iter):
             env = make("orbit_wars", debug=False)
@@ -266,6 +274,12 @@ def train_dqn(
                     sample = replay.sample(train_cfg.batch_size,
                                            device=device, rng=rng_np)
                     stats = dqn_update(online, target_net, sample, optimizer, cfg=dqn_cfg)
+                    # Pop the per-module dict before flat aggregation.
+                    per_mod = stats.pop("grad_norms_by_module", {})
+                    for k, v in per_mod.items():
+                        grad_norms_accum[k] = grad_norms_accum.get(k, 0.0) + float(v)
+                    if per_mod:
+                        grad_norms_count += 1
                     for k, v in stats.items():
                         update_stats[k].append(v)
                     update_count += 1
@@ -294,11 +308,23 @@ def train_dqn(
         wins_p0 = sum(1 for w in ep_winners if w == 0)
         wins_p1 = sum(1 for w in ep_winners if w == 1)
         draws = sum(1 for w in ep_winners if w == -1)
+        # Average per-module grad norms across all updates this iter.
+        avg_grad_norms = {
+            k: v / max(1, grad_norms_count) for k, v in grad_norms_accum.items()
+        }
+        weight_norms = weight_norms_by_module(online)
+        update_norms = snap.compute_update_norms(online)
+        update_ratios = snap.compute_update_ratios(online)
+        ur_vals = list(update_ratios.values())
+        ur_mean = sum(ur_vals) / max(1, len(ur_vals))
+        current_lr = optimizer.param_groups[0]["lr"]
+
         log = {
             "iter": it,
             "total_env_steps": total_env_steps,
             "replay_size": len(replay),
             "epsilon": round(_epsilon_at(total_env_steps, train_cfg), 4),
+            "learning_rate": current_lr,
             "avg_episode_length": round(sum(ep_lengths)/len(ep_lengths), 1),
             "avg_launches_per_player": round(sum(ep_launches)/len(ep_launches), 1),
             "wins_p0": wins_p0, "wins_p1": wins_p1, "draws": draws,
@@ -307,12 +333,17 @@ def train_dqn(
             "td_error": round(np.mean(update_stats["td_error"]) if update_stats["td_error"] else 0.0, 4),
             "q_mean": round(np.mean(update_stats["q_mean"]) if update_stats["q_mean"] else 0.0, 4),
             "elapsed_sec": round(elapsed, 1),
+            # Per-module training health.
+            "grad_norms": round_metrics(avg_grad_norms, 4),
+            "weight_norms": round_metrics(weight_norms, 3),
+            "update_norms": round_metrics(update_norms, 5),
+            "update_ratios": round_metrics(update_ratios, 6),
         }
         print(f"[iter {it:>4}] env_steps={total_env_steps:>6} replay={len(replay):>6} "
               f"eps={log['epsilon']:.3f} len={log['avg_episode_length']:>5.1f} "
               f"P0={wins_p0} P1={wins_p1} D={draws} | "
               f"loss={log['dqn_loss']:.4f} td={log['td_error']:.3f} q={log['q_mean']:+.3f} "
-              f"upd={log['n_updates']} ({elapsed:.1f}s)")
+              f"ur={ur_mean:.2e} upd={log['n_updates']} ({elapsed:.1f}s)")
         with log_path.open("a") as fp:
             fp.write(json.dumps(log) + "\n")
 

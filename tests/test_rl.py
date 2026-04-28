@@ -12,6 +12,9 @@ from obs_builder import build_observation
 from rl.buffer import RolloutBuffer, Transition
 from rl.replay import ReplayBuffer, DQNTransition
 from rl.rewards import RewardConfig, compute_step_reward
+from rl.metrics import (
+    WeightSnapshot, grad_norms_by_module, weight_norms_by_module,
+)
 
 
 # ----------------------------------------------------------------------- helpers
@@ -481,3 +484,73 @@ class TestQNet:
         out = net(**batch)
         q_max = net.max_joint_q(out, batch["source_mask"], batch["planet_mask"])
         assert torch.isfinite(q_max).all()
+
+
+# ---------------------------------------------------------------- Metrics
+
+class TestMetrics:
+    """Per-parameter training health metrics."""
+
+    def _toy_policy_and_loss(self):
+        """Build a loss that touches all logits + value -> all heads grad-aware."""
+        torch.manual_seed(0)
+        net = OrbitWarsPolicy(p_max=4, f_max=4, d_model=32, n_heads=2, n_layers=2)
+        obs = _toy_obs(p_max=4, f_max=4)
+        batch = pack_observations([obs])
+        out = net(**batch)
+        # Pull every head into the loss directly by summing all logits + value.
+        loss = (out.src_logits.sum()
+                + out.tgt_logits.sum()
+                + out.ship_logits.sum()
+                + out.value.pow(2).sum())
+        return net, loss
+
+    def test_grad_norms_grouped_by_top_module(self):
+        net, loss = self._toy_policy_and_loss()
+        loss.backward()
+        norms = grad_norms_by_module(net)
+        # All these top-level groups should receive gradient.
+        for expected in ("planet_proj", "global_proj",
+                         "type_embed", "edge_proj", "blocks.0", "blocks.1",
+                         "src_head", "tgt_query", "tgt_key", "ship_head",
+                         "value_head"):
+            assert expected in norms, f"missing group: {expected}"
+            assert norms[expected] > 0, f"zero grad in {expected}"
+        # Note: fleet_proj receives no grad in this toy obs because fleet
+        # tokens are all padded (mask=False) and therefore never feed any
+        # head's output. That's correct, not a bug.
+
+    def test_weight_norms_match_manual(self):
+        net, _ = self._toy_policy_and_loss()
+        # planet_proj norm = ||W||^2 + ||b||^2 sqrt
+        manual = (net.planet_proj.weight.pow(2).sum() +
+                  net.planet_proj.bias.pow(2).sum()).sqrt().item()
+        wn = weight_norms_by_module(net)
+        assert wn["planet_proj"] == pytest.approx(manual, rel=1e-5)
+
+    def test_weight_snapshot_update_norm_matches_manual(self):
+        net, _ = self._toy_policy_and_loss()
+        snap = WeightSnapshot(net)
+        # Hand-edit one parameter group; rest stay identical.
+        with torch.no_grad():
+            net.planet_proj.weight.add_(0.1)
+        deltas = snap.compute_update_norms(net)
+        # Other groups should have ||Δw|| ≈ 0 (they didn't move).
+        for k, v in deltas.items():
+            if k == "planet_proj":
+                assert v > 0
+            else:
+                assert v == pytest.approx(0.0, abs=1e-6)
+        # Update ratio = ||Δw|| / ||w_before||.
+        ratios = snap.compute_update_ratios(net)
+        assert ratios["planet_proj"] > 0
+        # Other groups: ratio = 0 (no update).
+        for k, v in ratios.items():
+            if k != "planet_proj":
+                assert v == pytest.approx(0.0, abs=1e-8)
+
+    def test_grad_norms_empty_when_no_grad(self):
+        net = OrbitWarsPolicy(p_max=4, f_max=4, d_model=32, n_heads=2, n_layers=2)
+        # No backward called -> no grads.
+        norms = grad_norms_by_module(net)
+        assert norms == {}

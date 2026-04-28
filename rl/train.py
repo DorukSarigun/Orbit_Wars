@@ -25,6 +25,10 @@ import torch
 from model import OrbitWarsPolicy
 
 from .buffer import RolloutBuffer
+from .metrics import (
+    WeightSnapshot, grad_norms_by_module,
+    round_metrics, weight_norms_by_module,
+)
 from .ppo import PPOConfig, ppo_update
 from .rewards import RewardConfig
 from .rollout import collect_episode
@@ -139,7 +143,14 @@ def train(
         # (collect_episode already sets done=True at the last stored step.)
         buffer.compute_gae(last_value=0.0,
                            gamma=train_cfg.gamma, lam=train_cfg.gae_lambda)
+        # Snapshot weights before PPO so we can compute per-module update norms.
+        snap = WeightSnapshot(policy)
         ppo_stats = ppo_update(policy, buffer, optimizer, ppo_cfg, device=device)
+        # Per-module post-update stats.
+        weight_norms = weight_norms_by_module(policy)
+        update_norms = snap.compute_update_norms(policy)
+        update_ratios = snap.compute_update_ratios(policy)
+        current_lr = optimizer.param_groups[0]["lr"]
 
         wins_p0 = sum(1 for s in ep_stats_list if s.winner == 0)
         wins_p1 = sum(1 for s in ep_stats_list if s.winner == 1)
@@ -162,13 +173,24 @@ def train(
             "approx_kl": round(ppo_stats.approx_kl, 5),
             "clip_fraction": round(ppo_stats.clip_fraction, 4),
             "elapsed_sec": round(elapsed, 1),
+            # Hyperparameters in effect this iter.
+            "learning_rate": current_lr,
+            # Per-module training health metrics.
+            "grad_norms": round_metrics(ppo_stats.last_grad_norms or {}, 4),
+            "weight_norms": round_metrics(weight_norms, 3),
+            "update_norms": round_metrics(update_norms, 5),
+            "update_ratios": round_metrics(update_ratios, 6),
         }
+        # Mean over update ratios is a one-number sanity check for lr scaling.
+        ur_vals = list(update_ratios.values())
+        ur_mean = sum(ur_vals) / max(1, len(ur_vals))
         print(f"[iter {it:>4}] len={log['avg_episode_length']:>5.1f} "
               f"launch/p={log['avg_launches_per_player']:>4.1f} "
               f"P0={wins_p0} P1={wins_p1} D={draws} | "
               f"polL={log['policy_loss']:+.4f} valL={log['value_loss']:.3f} "
               f"H={log['entropy']:.3f} KL={log['approx_kl']:.4f} "
-              f"clip={log['clip_fraction']:.2f} ({elapsed:.1f}s)")
+              f"clip={log['clip_fraction']:.2f} ur={ur_mean:.2e} "
+              f"({elapsed:.1f}s)")
 
         with log_path.open("a") as fp:
             fp.write(json.dumps(log) + "\n")

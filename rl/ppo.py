@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from model import OrbitWarsPolicy
 from .buffer import RolloutBuffer
+from .metrics import grad_norms_by_module
 
 
 @dataclass
@@ -36,6 +37,9 @@ class PPOStats:
     approx_kl: float
     clip_fraction: float
     n_updates: int
+    # Per-top-module L2 grad norm captured on the LAST minibatch of the
+    # last epoch (representative snapshot). Empty dict if no updates ran.
+    last_grad_norms: dict = None  # type: ignore[assignment]
 
 
 def ppo_update(
@@ -52,6 +56,7 @@ def ppo_update(
 
     pol_losses, val_losses, ents, kls, clips = [], [], [], [], []
     n_updates = 0
+    last_grad_norms: dict = {}
 
     for _ in range(cfg.epochs):
         for batch in buffer.iter_minibatches(cfg.batch_size, device=device):
@@ -101,6 +106,9 @@ def ppo_update(
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            # Capture per-module grad norm BEFORE clipping (so we see the
+            # raw signal, not the clipped one).
+            last_grad_norms = grad_norms_by_module(policy)
             nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
             optimizer.step()
 
@@ -125,4 +133,5 @@ def ppo_update(
         approx_kl=_mean(kls),
         clip_fraction=_mean(clips),
         n_updates=n_updates,
+        last_grad_norms=last_grad_norms,
     )
