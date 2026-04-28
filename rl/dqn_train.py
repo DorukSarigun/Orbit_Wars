@@ -358,6 +358,18 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Use Dueling DQN architecture (V + A decomposition)")
     p.add_argument("--no-double-dqn", action="store_true",
                    help="Disable Double DQN (use vanilla DQN target)")
+    # Reward shaping
+    p.add_argument("--capture-value-weight", type=float, default=0.05,
+                   help="Reward for MY production growth (per planet captured)")
+    p.add_argument("--denial-value-weight", type=float, default=0.05,
+                   help="Reward for OPP's production loss; >capture-weight = aggressive")
+    p.add_argument("--capture-value-kind", choices=("production", "radius"),
+                   default="production")
+    p.add_argument("--max-turns", type=int, default=500,
+                   help="Game length used for time-decay normalization")
+    p.add_argument("--time-decay-floor", type=float, default=0.0)
+    p.add_argument("--planet-diff-weight", type=float, default=0.0)
+    p.add_argument("--ship-diff-weight", type=float, default=0.0005)
     return p
 
 
@@ -387,7 +399,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         gamma=args.gamma,
         double_dqn=not args.no_double_dqn,
     )
-    train_dqn(train_cfg, dqn_cfg)
+    reward_cfg = RewardConfig(
+        capture_value_weight=args.capture_value_weight,
+        denial_value_weight=args.denial_value_weight,
+        capture_value_kind=args.capture_value_kind,
+        max_turns=args.max_turns,
+        time_decay_floor=args.time_decay_floor,
+        planet_diff_weight=args.planet_diff_weight,
+        ship_diff_weight=args.ship_diff_weight,
+    )
+    train_dqn(train_cfg, dqn_cfg, reward_cfg)
 
 
 if __name__ == "__main__":

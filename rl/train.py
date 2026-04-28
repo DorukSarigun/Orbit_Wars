@@ -207,7 +207,19 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--entropy-coef", type=float, default=0.01)
-    p.add_argument("--planet-diff-weight", type=float, default=0.01)
+    p.add_argument("--capture-value-weight", type=float, default=0.05,
+                   help="Reward for MY production growth (per planet captured)")
+    p.add_argument("--denial-value-weight", type=float, default=0.05,
+                   help="Reward for OPP's production loss (per planet they lose). "
+                        "Equal to capture-value-weight gives symmetric (mine - opp) "
+                        "swing; >capture-value-weight pushes aggressive play.")
+    p.add_argument("--capture-value-kind", choices=("production", "radius"),
+                   default="production")
+    p.add_argument("--max-turns", type=int, default=500,
+                   help="Game length used for time-decay normalization")
+    p.add_argument("--time-decay-floor", type=float, default=0.0)
+    p.add_argument("--planet-diff-weight", type=float, default=0.0,
+                   help="Legacy un-weighted planet count delta (off by default)")
     p.add_argument("--ship-diff-weight", type=float, default=0.0005)
     p.add_argument("--resume-from", default=None,
                    help="Checkpoint path to resume from")
@@ -235,6 +247,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         entropy_coef=args.entropy_coef,
     )
     reward_cfg = RewardConfig(
+        capture_value_weight=args.capture_value_weight,
+        denial_value_weight=args.denial_value_weight,
+        capture_value_kind=args.capture_value_kind,
+        max_turns=args.max_turns,
+        time_decay_floor=args.time_decay_floor,
         planet_diff_weight=args.planet_diff_weight,
         ship_diff_weight=args.ship_diff_weight,
     )

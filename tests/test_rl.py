@@ -206,15 +206,212 @@ class TestRewards:
         # Same state -> shaping = 0.
         assert pytest.approx(r, abs=1e-6) == 0.0
 
-    def test_planet_capture_increases_reward(self):
+    def test_legacy_planet_diff_increases_reward(self):
+        """Old un-weighted planet count differential still works when enabled."""
         prev = _toy_env_obs(player=0)
-        # Player 0 captures planet 2 (was neutral).
         curr = _toy_env_obs(player=0)
-        curr["planets"][2][1] = 0  # owner -1 -> 0
-        cfg = RewardConfig(planet_diff_weight=0.1, ship_diff_weight=0.0)
+        curr["planets"][2][1] = 0  # neutral -> mine
+        cfg = RewardConfig(
+            planet_diff_weight=0.1,
+            ship_diff_weight=0.0,
+            capture_value_weight=0.0,
+        )
         r = compute_step_reward(prev, curr, 0, terminal=False,
                                 env_terminal_reward=0, cfg=cfg)
         assert r > 0
+
+
+class TestCaptureValueShaping:
+    """Time-decayed, production-weighted capture reward."""
+
+    @staticmethod
+    def _two_planet_world(turn: int = 0, *, captured: bool = False, value: int = 5):
+        """Tiny world with one neutral planet that may be captured by P0."""
+        owner = 0 if captured else -1
+        return {
+            "planets": [
+                # [id, owner, x, y, radius, ships, production]
+                [0, 0, 70.0, 70.0, 3.0, 100, 3],
+                [1, owner, 30.0, 30.0, 1 + 1.6, 50, value],
+            ],
+            "fleets": [],
+            "initial_planets": [
+                [0, 0, 70.0, 70.0, 3.0, 100, 3],
+                [1, -1, 30.0, 30.0, 1 + 1.6, 50, value],
+            ],
+            "comet_planet_ids": [],
+            "comets": [],
+            "angular_velocity": 0.05,
+            "step": turn,
+            "player": 0,
+        }
+
+    def test_neutral_capture_positive_and_production_weighted(self):
+        prev = self._two_planet_world(turn=0, captured=False, value=5)
+        curr = self._two_planet_world(turn=0, captured=True, value=5)
+        cfg = RewardConfig(
+            capture_value_weight=1.0, denial_value_weight=1.0,
+            max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0,
+        )
+        r = compute_step_reward(prev, curr, 0, terminal=False,
+                                env_terminal_reward=0, cfg=cfg)
+        # turn=0 -> time_factor = 1.0; gain = production = 5; denial = 0 (neutral)
+        assert r == pytest.approx(5.0, abs=1e-5)
+
+    def test_higher_production_yields_higher_reward(self):
+        cfg = RewardConfig(capture_value_weight=1.0, denial_value_weight=1.0,
+                           max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0)
+        r_small = compute_step_reward(
+            self._two_planet_world(turn=0, captured=False, value=1),
+            self._two_planet_world(turn=0, captured=True, value=1),
+            0, terminal=False, env_terminal_reward=0, cfg=cfg,
+        )
+        r_big = compute_step_reward(
+            self._two_planet_world(turn=0, captured=False, value=5),
+            self._two_planet_world(turn=0, captured=True, value=5),
+            0, terminal=False, env_terminal_reward=0, cfg=cfg,
+        )
+        assert r_big > r_small > 0
+
+    def test_early_capture_worth_more_than_late(self):
+        cfg = RewardConfig(capture_value_weight=1.0, denial_value_weight=1.0,
+                           max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0)
+        r_early = compute_step_reward(
+            self._two_planet_world(turn=10, captured=False, value=3),
+            self._two_planet_world(turn=10, captured=True, value=3),
+            0, terminal=False, env_terminal_reward=0, cfg=cfg,
+        )
+        r_late = compute_step_reward(
+            self._two_planet_world(turn=90, captured=False, value=3),
+            self._two_planet_world(turn=90, captured=True, value=3),
+            0, terminal=False, env_terminal_reward=0, cfg=cfg,
+        )
+        # turn=10 -> factor 0.9; turn=90 -> factor 0.1; ratio 9:1
+        assert r_early > r_late > 0
+        assert r_early / r_late == pytest.approx(9.0, rel=1e-3)
+
+    def test_steal_from_opponent_double_swing(self):
+        """Capturing FROM the opponent should be worth 2x capturing neutral."""
+        # neutral -> mine
+        prev_n = self._two_planet_world(turn=0, captured=False, value=4)
+        curr_n = self._two_planet_world(turn=0, captured=True, value=4)
+        # opponent -> mine
+        prev_o = dict(self._two_planet_world(turn=0, captured=False, value=4))
+        prev_o["planets"] = [list(p) for p in prev_o["planets"]]
+        prev_o["planets"][1][1] = 1  # opp owns
+        curr_o = self._two_planet_world(turn=0, captured=True, value=4)
+
+        cfg = RewardConfig(capture_value_weight=1.0, denial_value_weight=1.0,
+                           max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0)
+        r_neutral = compute_step_reward(prev_n, curr_n, 0, terminal=False,
+                                        env_terminal_reward=0, cfg=cfg)
+        r_steal = compute_step_reward(prev_o, curr_o, 0, terminal=False,
+                                      env_terminal_reward=0, cfg=cfg)
+        # capture=denial=1: gain (+4) + denial (+4) vs neutral gain (+4) -> 2x
+        assert r_steal == pytest.approx(2.0 * r_neutral, rel=1e-5)
+
+    def test_losing_planet_gives_negative_reward(self):
+        """Losing a planet to opponent should be the symmetric negative."""
+        prev = self._two_planet_world(turn=0, captured=True, value=3)
+        curr = dict(self._two_planet_world(turn=0, captured=True, value=3))
+        curr["planets"] = [list(p) for p in curr["planets"]]
+        curr["planets"][1][1] = 1   # mine -> opp (steal)
+        cfg = RewardConfig(capture_value_weight=1.0, denial_value_weight=1.0,
+                           max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0)
+        r = compute_step_reward(prev, curr, 0, terminal=False,
+                                env_terminal_reward=0, cfg=cfg)
+        # gain = -3 (mine lost), denial = -3 (opp gained 3); both weight 1 -> -6
+        assert r == pytest.approx(-6.0, abs=1e-5)
+
+    def test_radius_kind_uses_radius_not_production(self):
+        prev = self._two_planet_world(turn=0, captured=False, value=5)
+        curr = self._two_planet_world(turn=0, captured=True, value=5)
+        cfg = RewardConfig(
+            capture_value_weight=1.0, denial_value_weight=1.0,
+            max_turns=100, capture_value_kind="radius",
+            ship_diff_weight=0.0, planet_diff_weight=0.0,
+        )
+        r = compute_step_reward(prev, curr, 0, terminal=False,
+                                env_terminal_reward=0, cfg=cfg)
+        # planet[1].radius = 1 + 1.6 = 2.6 (neutral capture: gain only)
+        assert r == pytest.approx(2.6, abs=1e-5)
+
+    def test_time_decay_floor_keeps_minimum_signal(self):
+        prev = self._two_planet_world(turn=200, captured=False, value=3)
+        curr = self._two_planet_world(turn=200, captured=True, value=3)
+        cfg = RewardConfig(
+            capture_value_weight=1.0, denial_value_weight=1.0,
+            max_turns=100, time_decay_floor=0.2,
+            ship_diff_weight=0.0, planet_diff_weight=0.0,
+        )
+        r = compute_step_reward(prev, curr, 0, terminal=False,
+                                env_terminal_reward=0, cfg=cfg)
+        # turn=200 > max_turns -> raw factor would be 0; floor=0.2 -> reward 3*0.2=0.6
+        assert r == pytest.approx(0.6, abs=1e-5)
+
+    def test_no_change_no_capture_signal(self):
+        prev = self._two_planet_world(turn=10, captured=False, value=3)
+        curr = self._two_planet_world(turn=11, captured=False, value=3)
+        cfg = RewardConfig(capture_value_weight=1.0, denial_value_weight=1.0,
+                           max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0)
+        r = compute_step_reward(prev, curr, 0, terminal=False,
+                                env_terminal_reward=0, cfg=cfg)
+        assert r == pytest.approx(0.0, abs=1e-6)
+
+    # ----- New: independent denial weight tests --------------------------
+
+    def test_denial_weight_zero_means_only_my_growth(self):
+        """With denial_weight=0, stealing == capturing neutral (gain only)."""
+        prev_o = dict(self._two_planet_world(turn=0, captured=False, value=4))
+        prev_o["planets"] = [list(p) for p in prev_o["planets"]]
+        prev_o["planets"][1][1] = 1  # opp owns initially
+        curr_o = self._two_planet_world(turn=0, captured=True, value=4)
+        cfg = RewardConfig(capture_value_weight=1.0, denial_value_weight=0.0,
+                           max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0)
+        r = compute_step_reward(prev_o, curr_o, 0, terminal=False,
+                                env_terminal_reward=0, cfg=cfg)
+        # Only mine grew by 4 -> reward = 4 (no extra denial bonus)
+        assert r == pytest.approx(4.0, abs=1e-5)
+
+    def test_aggressive_denial_amplifies_steal_reward(self):
+        """denial_weight = 2 * capture_weight -> stealing 3x more than neutral."""
+        prev_n = self._two_planet_world(turn=0, captured=False, value=4)
+        curr_n = self._two_planet_world(turn=0, captured=True, value=4)
+        prev_o = dict(self._two_planet_world(turn=0, captured=False, value=4))
+        prev_o["planets"] = [list(p) for p in prev_o["planets"]]
+        prev_o["planets"][1][1] = 1
+        curr_o = self._two_planet_world(turn=0, captured=True, value=4)
+
+        cfg = RewardConfig(capture_value_weight=1.0, denial_value_weight=2.0,
+                           max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0)
+        r_neutral = compute_step_reward(prev_n, curr_n, 0, terminal=False,
+                                        env_terminal_reward=0, cfg=cfg)
+        r_steal = compute_step_reward(prev_o, curr_o, 0, terminal=False,
+                                      env_terminal_reward=0, cfg=cfg)
+        # neutral: gain*1*4 = 4. steal: gain*1*4 + denial*2*4 = 4 + 8 = 12.
+        assert r_neutral == pytest.approx(4.0, abs=1e-5)
+        assert r_steal == pytest.approx(12.0, abs=1e-5)
+        assert r_steal / r_neutral == pytest.approx(3.0, rel=1e-5)
+
+    def test_denial_only_when_my_planet_destroyed(self):
+        """capture_weight=0, denial_weight=1: only opp's losses matter."""
+        # neutral capture by ME -> only my gain, no denial -> r=0
+        prev_n = self._two_planet_world(turn=0, captured=False, value=4)
+        curr_n = self._two_planet_world(turn=0, captured=True, value=4)
+        cfg = RewardConfig(capture_value_weight=0.0, denial_value_weight=1.0,
+                           max_turns=100, ship_diff_weight=0.0, planet_diff_weight=0.0)
+        r_neutral = compute_step_reward(prev_n, curr_n, 0, terminal=False,
+                                        env_terminal_reward=0, cfg=cfg)
+        assert r_neutral == pytest.approx(0.0, abs=1e-6)
+
+        # steal from opp -> opp shrunk -> denial fires, r=4
+        prev_o = dict(self._two_planet_world(turn=0, captured=False, value=4))
+        prev_o["planets"] = [list(p) for p in prev_o["planets"]]
+        prev_o["planets"][1][1] = 1
+        curr_o = self._two_planet_world(turn=0, captured=True, value=4)
+        r_steal = compute_step_reward(prev_o, curr_o, 0, terminal=False,
+                                      env_terminal_reward=0, cfg=cfg)
+        assert r_steal == pytest.approx(4.0, abs=1e-5)
 
 
 # ---------------------------------------------------------------------- Q-net
