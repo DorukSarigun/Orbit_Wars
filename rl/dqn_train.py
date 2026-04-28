@@ -339,7 +339,9 @@ def train_dqn(
             "update_norms": round_metrics(update_norms, 5),
             "update_ratios": round_metrics(update_ratios, 6),
         }
-        print(f"[iter {it:>4}] env_steps={total_env_steps:>6} replay={len(replay):>6} "
+        print(f"[epoch {it:>4}/{train_cfg.iterations}] "
+              f"games={train_cfg.episodes_per_iter} "
+              f"env_steps={total_env_steps:>6} replay={len(replay):>6} "
               f"eps={log['epsilon']:.3f} len={log['avg_episode_length']:>5.1f} "
               f"P0={wins_p0} P1={wins_p1} D={draws} | "
               f"loss={log['dqn_loss']:.4f} td={log['td_error']:.3f} q={log['q_mean']:+.3f} "
@@ -363,9 +365,14 @@ def train_dqn(
 
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="OrbitWars self-play DQN / Dueling DQN")
-    p.add_argument("--iterations", type=int, default=100)
-    p.add_argument("--episodes-per-iter", type=int, default=4)
-    p.add_argument("--max-episode-steps", type=int, default=500)
+    p.add_argument("--iterations", "--epochs", type=int, default=100,
+                   dest="iterations",
+                   help="Number of training epochs (rollout + updates)")
+    p.add_argument("--episodes-per-iter", "--games-per-epoch", type=int, default=4,
+                   dest="episodes_per_iter",
+                   help="Self-play games per epoch")
+    p.add_argument("--max-episode-steps", type=int, default=500,
+                   help="Per-game turn cap (env's natural max is ~500)")
     p.add_argument("--updates-per-step", type=float, default=1.0)
     p.add_argument("--learn-starts", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=256)

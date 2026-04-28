@@ -184,7 +184,9 @@ def train(
         # Mean over update ratios is a one-number sanity check for lr scaling.
         ur_vals = list(update_ratios.values())
         ur_mean = sum(ur_vals) / max(1, len(ur_vals))
-        print(f"[iter {it:>4}] len={log['avg_episode_length']:>5.1f} "
+        print(f"[epoch {it:>4}/{train_cfg.iterations}] "
+              f"games={train_cfg.episodes_per_iter} "
+              f"len={log['avg_episode_length']:>5.1f} "
               f"launch/p={log['avg_launches_per_player']:>4.1f} "
               f"P0={wins_p0} P1={wins_p1} D={draws} | "
               f"polL={log['policy_loss']:+.4f} valL={log['value_loss']:.3f} "
@@ -211,9 +213,14 @@ def train(
 
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="OrbitWars self-play PPO")
-    p.add_argument("--iterations", type=int, default=100)
-    p.add_argument("--episodes-per-iter", type=int, default=4)
-    p.add_argument("--max-episode-steps", type=int, default=500)
+    p.add_argument("--iterations", "--epochs", type=int, default=100,
+                   dest="iterations",
+                   help="Number of training epochs (rollout + update cycles)")
+    p.add_argument("--episodes-per-iter", "--games-per-epoch", type=int, default=4,
+                   dest="episodes_per_iter",
+                   help="Self-play games per epoch (rolled into one update)")
+    p.add_argument("--max-episode-steps", type=int, default=500,
+                   help="Per-game turn cap (env's natural max is ~500)")
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -226,7 +233,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--clip-range", type=float, default=0.2)
-    p.add_argument("--epochs", type=int, default=4)
+    p.add_argument("--ppo-epochs", type=int, default=4, dest="epochs",
+                   help="Number of optimization epochs over each rollout buffer "
+                        "(inner PPO update; not the outer training-epoch count)")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--entropy-coef", type=float, default=0.01)
     p.add_argument("--capture-value-weight", type=float, default=0.05,
