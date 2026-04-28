@@ -47,8 +47,10 @@ from navigation import predict_all_fleet_targets
 # -----------------------------------------------------------------------------
 # Sizing / feature dims (edit here if you change features below).
 # -----------------------------------------------------------------------------
-P_MAX_DEFAULT = 32   # max planets (env usually has 10..25)
-F_MAX_DEFAULT = 32   # max fleets in flight (rarely > 20)
+P_MAX_DEFAULT = 48   # env: 5..10 planet groups x 4 mirrors = 20..40 base,
+                     # + up to ~8 active comets => 48 covers worst case.
+F_MAX_DEFAULT = 64   # no env hard cap on in-flight fleets; 64 is a safe
+                     # ceiling for both players' typical/peak load.
 
 PLANET_FEATURE_DIM = 15
 FLEET_FEATURE_DIM = 11
