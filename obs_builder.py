@@ -53,7 +53,14 @@ F_MAX_DEFAULT = 32   # max fleets in flight (rarely > 20)
 PLANET_FEATURE_DIM = 15
 FLEET_FEATURE_DIM = 11
 GLOBAL_FEATURE_DIM = 12
-EDGE_FEATURE_DIM = 3  # (dist_norm, dx_norm, dy_norm)
+EDGE_FEATURE_DIM = 5  # (dist_norm, dx_norm, dy_norm, sin(dphi_sun), cos(dphi_sun))
+# The last two channels encode the angular difference between the two tokens
+# as seen from the sun (the orbital center). For two planets that share the
+# same angular velocity this difference is *time-invariant*, so the model
+# gets a stable orbital-relationship signal independent of board rotation.
+# For fleets / global token the angle is still well-defined geometrically
+# but no longer time-invariant; the model can learn to weight it via the
+# per-head edge_proj mixing.
 
 
 # -----------------------------------------------------------------------------
@@ -301,10 +308,28 @@ def build_observation(
 
     diffs = positions[None, :, :] - positions[:, None, :]   # (T, T, 2)
     dists = np.linalg.norm(diffs, axis=-1)                  # (T, T)
+
+    # Polar angle of every token around the sun. For tokens that orbit at
+    # the global angular_velocity (i.e. real planets), phi shifts uniformly
+    # each turn, so the *difference* phi_j - phi_i is time-invariant.
+    # The global token sits exactly on the sun (radius 0); its phi is
+    # ill-defined and falls back to atan2(0, 0) == 0, which is a harmless
+    # fixed reference.
+    phi = np.arctan2(positions[:, 1] - SUN_Y, positions[:, 0] - SUN_X)  # (T,)
+    dphi = phi[None, :] - phi[:, None]                                  # (T, T)
+
     edge_bias = np.zeros((T, T, EDGE_FEATURE_DIM), dtype=np.float32)
     edge_bias[..., 0] = dists / BOARD_SIZE
     edge_bias[..., 1] = diffs[..., 0] / BOARD_SIZE
     edge_bias[..., 2] = diffs[..., 1] / BOARD_SIZE
+    edge_bias[..., 3] = np.sin(dphi)
+    edge_bias[..., 4] = np.cos(dphi)
+
+    # Diagonal must remain exactly zero (token paired with itself carries
+    # no edge signal). cos(0) would otherwise leak a constant 1.0 onto the
+    # diagonal and bias self-attention.
+    diag_idx = np.arange(T)
+    edge_bias[diag_idx, diag_idx, :] = 0.0
 
     return Observation(
         planet_feats=planet_feats,

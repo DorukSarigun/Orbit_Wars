@@ -120,7 +120,7 @@ RL ağı için tasarlandı; permutation invariant.
   - `planet_mask: (P_max,)`, `source_mask: (P_max,)` (kim launch yapabilir)
   - `fleet_feats: (F_max, 11)`, `fleet_mask: (F_max,)`
   - `global_feats: (12,)` — CLS-style global istatistik
-  - `edge_bias: (T, T, 3)` — pairwise (dist, dx, dy), transformer'a geometrik prior
+  - `edge_bias: (T, T, 5)` — pairwise (dist, dx, dy, sin Δφ, cos Δφ); son iki kanal güneşe göre polar açı farkı ile rotasyondan bağımsız orbital ilişki sinyali
   - `planet_ids`, `fleet_ids` — env id eşlemesi (action decoding için)
 
 - **Planet özellikleri (15-d):** ownership one-hot, ships/prod/radius normalize,

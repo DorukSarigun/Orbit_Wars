@@ -148,6 +148,60 @@ def test_edge_bias_distance_matches_geometry():
     assert math.isclose(o.edge_bias[1, 0, 0], expected, abs_tol=1e-5)
 
 
+def test_edge_bias_angular_features_match_geometry():
+    # Planet 0 at (sun + (10, 0)) -> phi = 0
+    # Planet 1 at (sun + (0, 10)) -> phi = pi/2
+    # dphi (0 -> 1) = pi/2  =>  sin = 1, cos = 0
+    obs = make_obs(planets=[
+        [0, 0, 60.0, 50.0, 2.0, 10, 1],
+        [1, 0, 50.0, 60.0, 2.0, 10, 1],
+    ])
+    o = build_observation(obs, player=0, angular_velocity=0.0, p_max=4, f_max=2)
+    sin_dphi = o.edge_bias[0, 1, 3]
+    cos_dphi = o.edge_bias[0, 1, 4]
+    assert math.isclose(sin_dphi, 1.0, abs_tol=1e-5)
+    assert math.isclose(cos_dphi, 0.0, abs_tol=1e-5)
+    # Anti-symmetric (pair flip): dphi(1->0) = -pi/2
+    assert math.isclose(o.edge_bias[1, 0, 3], -1.0, abs_tol=1e-5)
+    assert math.isclose(o.edge_bias[1, 0, 4], 0.0, abs_tol=1e-5)
+
+
+def test_edge_bias_dphi_is_rotation_invariant():
+    # Two planets orbiting together: rotating the whole board around the
+    # sun must leave (sin dphi, cos dphi) unchanged. This is the whole
+    # reason the angular edge features were added.
+    import numpy as np
+
+    def rotate(x, y, theta):
+        cx, cy = 50.0, 50.0
+        dx, dy = x - cx, y - cy
+        return cx + dx * math.cos(theta) - dy * math.sin(theta), \
+               cy + dx * math.sin(theta) + dy * math.cos(theta)
+
+    base = [
+        [0, 0, 70.0, 50.0, 2.0, 10, 1],   # east of sun
+        [1, 0, 50.0, 80.0, 2.0, 10, 1],   # north of sun
+    ]
+    o0 = build_observation(make_obs(planets=base), player=0,
+                           angular_velocity=0.0, p_max=4, f_max=2)
+
+    rot = []
+    for pid, owner, x, y, r, s, prod in base:
+        nx, ny = rotate(x, y, 0.7)
+        rot.append([pid, owner, nx, ny, r, s, prod])
+    o1 = build_observation(make_obs(planets=rot), player=0,
+                           angular_velocity=0.0, p_max=4, f_max=2)
+
+    # Invariance holds only for planet-planet pairs (both ends co-rotate
+    # with the board). The global token sits at the sun and padding slots
+    # are fixed at (0, 0), so their phi is rotation-dependent and must be
+    # excluded from this check.
+    n = 2
+    assert np.allclose(
+        o0.edge_bias[:n, :n, 3:5], o1.edge_bias[:n, :n, 3:5], atol=1e-5
+    )
+
+
 # -----------------------------------------------------------------------------
 # Fleets and global features
 # -----------------------------------------------------------------------------
