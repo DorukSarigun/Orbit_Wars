@@ -21,6 +21,7 @@ import torch
 
 @dataclass
 class Transition:
+    player: int
     # Observation tensors (already on CPU as numpy; we tensorize on flush).
     planet_feats: np.ndarray
     fleet_feats: np.ndarray
@@ -65,7 +66,7 @@ class RolloutBuffer:
         self.data.append(t)
 
     # --------------------------------------------------------------- GAE
-    def compute_gae(self, last_value: float, *, gamma: float = 0.99, lam: float = 0.95) -> None:
+    def compute_gae(self, last_value: float | dict[int, float], *, gamma: float = 0.99, lam: float = 0.95) -> None:
         """Compute Generalized Advantage Estimation for all transitions.
 
         `last_value` is V(s_T) for bootstrapping at the final stored step
@@ -73,15 +74,22 @@ class RolloutBuffer:
         """
         n = len(self.data)
         adv = np.zeros(n, dtype=np.float32)
-        last_gae = 0.0
-        next_value = last_value
-        for t in reversed(range(n)):
-            tr = self.data[t]
-            mask = 0.0 if tr.done else 1.0
-            delta = tr.reward + gamma * next_value * mask - tr.value
-            last_gae = delta + gamma * lam * mask * last_gae
-            adv[t] = last_gae
-            next_value = tr.value
+        players = sorted({tr.player for tr in self.data})
+        for player in players:
+            indices = [i for i, tr in enumerate(self.data) if tr.player == player]
+            last_gae = 0.0
+            next_value = (
+                float(last_value.get(player, 0.0))
+                if isinstance(last_value, dict)
+                else float(last_value)
+            )
+            for t in reversed(indices):
+                tr = self.data[t]
+                mask = 0.0 if tr.done else 1.0
+                delta = tr.reward + gamma * next_value * mask - tr.value
+                last_gae = delta + gamma * lam * mask * last_gae
+                adv[t] = last_gae
+                next_value = tr.value
         self._advantages = adv
         self._returns = adv + np.array([tr.value for tr in self.data], dtype=np.float32)
 
@@ -134,6 +142,7 @@ class RolloutBuffer:
             "tgt":          torch.tensor([t.tgt for t in sub], dtype=torch.long),
             "ship_bin":     torch.tensor([t.ship_bin for t in sub], dtype=torch.long),
             "is_noop":      torch.tensor([t.is_noop for t in sub], dtype=torch.bool),
+            "player":       torch.tensor([t.player for t in sub], dtype=torch.long),
             "old_log_prob": torch.tensor([t.log_prob for t in sub], dtype=torch.float32),
             "old_value":    torch.tensor([t.value for t in sub], dtype=torch.float32),
             "returns":      torch.tensor([self._returns[i] for i in idx], dtype=torch.float32),

@@ -52,7 +52,8 @@ P_MAX_DEFAULT = 48   # env: 5..10 planet groups x 4 mirrors = 20..40 base,
 F_MAX_DEFAULT = 64   # no env hard cap on in-flight fleets; 64 is a safe
                      # ceiling for both players' typical/peak load.
 
-PLANET_FEATURE_DIM = 15
+MAX_ENEMY_INCOMING_SLOTS = 3
+PLANET_FEATURE_DIM = 23
 FLEET_FEATURE_DIM = 11
 GLOBAL_FEATURE_DIM = 12
 EDGE_FEATURE_DIM = 5  # (dist_norm, dx_norm, dy_norm, sin(dphi_sun), cos(dphi_sun))
@@ -87,8 +88,13 @@ class Observation:
 # -----------------------------------------------------------------------------
 # Feature extraction helpers
 # -----------------------------------------------------------------------------
-def _planet_features(p: Planet, player: int, omega: float) -> np.ndarray:
-    """15-dim feature vector for a single planet."""
+def _planet_features(
+    p: Planet,
+    player: int,
+    omega: float,
+    incoming: Optional[dict[str, Any]] = None,
+) -> np.ndarray:
+    """23-dim feature vector for a single planet."""
     is_self = float(p.owner == player)
     is_enemy = float(p.owner != player and p.owner != -1)
     is_neutral = float(p.owner == -1)
@@ -106,6 +112,13 @@ def _planet_features(p: Planet, player: int, omega: float) -> np.ndarray:
 
     # "How many ships do I need to capture this?" - rough lower bound.
     ships_to_cap = ships + 1.0 if not is_self else 0.0
+    incoming = incoming or {}
+    self_ships = float(incoming.get("self_ships", 0.0))
+    self_eta = float(incoming.get("self_eta_min", 0.0))
+    enemy_ships = list(incoming.get("enemy_ships", [0.0] * MAX_ENEMY_INCOMING_SLOTS))
+    enemy_eta = list(incoming.get("enemy_eta_min", [0.0] * MAX_ENEMY_INCOMING_SLOTS))
+    enemy_ships = (enemy_ships + [0.0] * MAX_ENEMY_INCOMING_SLOTS)[:MAX_ENEMY_INCOMING_SLOTS]
+    enemy_eta = (enemy_eta + [0.0] * MAX_ENEMY_INCOMING_SLOTS)[:MAX_ENEMY_INCOMING_SLOTS]
 
     return np.asarray([
         is_self,
@@ -123,6 +136,14 @@ def _planet_features(p: Planet, player: int, omega: float) -> np.ndarray:
         omega_dt,
         ships_to_cap / 100.0,
         log_ships,
+        self_ships / 500.0,
+        min(self_eta, 50.0) / 50.0 if self_eta > 0.0 else 0.0,
+        enemy_ships[0] / 500.0,
+        min(enemy_eta[0], 50.0) / 50.0 if enemy_eta[0] > 0.0 else 0.0,
+        enemy_ships[1] / 500.0,
+        min(enemy_eta[1], 50.0) / 50.0 if enemy_eta[1] > 0.0 else 0.0,
+        enemy_ships[2] / 500.0,
+        min(enemy_eta[2], 50.0) / 50.0 if enemy_eta[2] > 0.0 else 0.0,
     ], dtype=np.float32)
 
 
@@ -207,7 +228,7 @@ def build_observation(
     player: int,
     angular_velocity: float,
     *,
-    turn: int = 0,
+    turn: Optional[int] = None,
     p_max: int = P_MAX_DEFAULT,
     f_max: int = F_MAX_DEFAULT,
     min_ships_to_launch: int = 1,
@@ -235,6 +256,8 @@ def build_observation(
     """
     planets = parse_planets(env_obs)
     fleets = parse_fleets(env_obs)
+    if turn is None:
+        turn = int(env_obs.get("step", 0) if isinstance(env_obs, dict) else getattr(env_obs, "step", 0) or 0)
 
     if len(planets) > p_max:
         # Defensive: keep this loud rather than silently truncating planets
@@ -253,13 +276,42 @@ def build_observation(
     else:
         preds = {}
 
+    enemy_owners = sorted({f.owner for f in fleets if f.owner not in (player, -1)})
+    enemy_owner_to_slot = {
+        owner: i for i, owner in enumerate(enemy_owners[:MAX_ENEMY_INCOMING_SLOTS])
+    }
+    incoming_by_planet: dict[int, dict[str, Any]] = {
+        p.id: {
+            "self_ships": 0.0,
+            "self_eta_min": 0.0,
+            "enemy_ships": [0.0] * MAX_ENEMY_INCOMING_SLOTS,
+            "enemy_eta_min": [0.0] * MAX_ENEMY_INCOMING_SLOTS,
+        }
+        for p in planets
+    }
+
     # Threat aggregation for global features.
     my_ids = {p.id for p in planets if p.owner == player}
     incoming_other = 0  # enemy ships en route to my planets
     incoming_self = 0   # friendly ships en route to my planets
     for f in fleets:
         pred = preds.get(f.id)
-        if pred is None or pred["target_id"] not in my_ids:
+        if pred is None:
+            continue
+        target_id = pred["target_id"]
+        eta = float(pred["eta"])
+        planet_incoming = incoming_by_planet.get(target_id)
+        if planet_incoming is not None:
+            if f.owner == player:
+                planet_incoming["self_ships"] += f.ships
+                old_eta = float(planet_incoming["self_eta_min"])
+                planet_incoming["self_eta_min"] = eta if old_eta <= 0.0 else min(old_eta, eta)
+            elif f.owner != -1 and f.owner in enemy_owner_to_slot:
+                slot = enemy_owner_to_slot[f.owner]
+                planet_incoming["enemy_ships"][slot] += f.ships
+                old_eta = float(planet_incoming["enemy_eta_min"][slot])
+                planet_incoming["enemy_eta_min"][slot] = eta if old_eta <= 0.0 else min(old_eta, eta)
+        if target_id not in my_ids:
             continue
         if f.owner == player:
             incoming_self += f.ships
@@ -274,7 +326,9 @@ def build_observation(
     planet_pos = np.zeros((p_max, 2), dtype=np.float32)  # for edge bias
 
     for i, p in enumerate(planets):
-        planet_feats[i] = _planet_features(p, player, angular_velocity)
+        planet_feats[i] = _planet_features(
+            p, player, angular_velocity, incoming=incoming_by_planet.get(p.id)
+        )
         planet_mask[i] = True
         planet_ids[i] = p.id
         planet_pos[i] = (p.x, p.y)

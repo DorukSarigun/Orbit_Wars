@@ -136,6 +136,7 @@ def collect_episode(
             (obs1, act1, out1, r1, 1),
         ]:
             buffer.add(Transition(
+                player=p,
                 planet_feats=obs.planet_feats,
                 fleet_feats=obs.fleet_feats,
                 global_feats=obs.global_feats,

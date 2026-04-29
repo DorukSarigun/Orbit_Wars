@@ -230,6 +230,32 @@ def test_fleet_features_populated_and_threats_counted():
     assert o.global_feats[10] > 0.0   # incoming_other slot in global feats
 
 
+def test_planet_features_track_multi_enemy_incoming_slots():
+    planets = [
+        [0, 0, 60.0, 60.0, 2.0, 100, 2],
+        [1, 0, 90.0, 60.0, 2.0, 50, 2],
+    ]
+    fleets = [
+        [10, 0, 70.0, 60.0, 0.0, 0, 20],
+        [11, 1, 72.0, 60.0, 0.0, 0, 30],
+        [12, 2, 74.0, 60.0, 0.0, 0, 40],
+        [13, 3, 76.0, 60.0, 0.0, 0, 50],
+        [14, 4, 78.0, 60.0, 0.0, 0, 60],
+    ]
+    obs = make_obs(planets=planets, fleets=fleets)
+    o = build_observation(obs, player=0, angular_velocity=0.0, f_max=8)
+
+    target_feats = o.planet_feats[1]
+    assert math.isclose(target_feats[15], 20 / 500.0, abs_tol=1e-6)
+    assert target_feats[16] > 0.0
+    assert math.isclose(target_feats[17], 30 / 500.0, abs_tol=1e-6)
+    assert target_feats[18] > 0.0
+    assert math.isclose(target_feats[19], 40 / 500.0, abs_tol=1e-6)
+    assert target_feats[20] > 0.0
+    assert math.isclose(target_feats[21], 50 / 500.0, abs_tol=1e-6)
+    assert target_feats[22] > 0.0
+
+
 def test_global_features_player_aggregates():
     obs = make_obs(planets=[
         [0, 0, 70.0, 70.0, 2.0, 200, 4],   # mine

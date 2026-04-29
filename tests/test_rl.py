@@ -112,6 +112,7 @@ def _dummy_transition(reward: float = 0.0, done: bool = False, p_max: int = 4,
                       f_max: int = 4) -> Transition:
     obs = _toy_obs(p_max=p_max, f_max=f_max)
     return Transition(
+        player=0,
         planet_feats=obs.planet_feats, fleet_feats=obs.fleet_feats,
         global_feats=obs.global_feats, edge_bias=obs.edge_bias,
         planet_mask=obs.planet_mask, fleet_mask=obs.fleet_mask,
@@ -150,6 +151,21 @@ class TestRolloutBuffer:
         for batch in buf.iter_minibatches(batch_size=3, shuffle=False):
             seen += batch["src"].shape[0]
         assert seen == n
+
+    def test_gae_separates_interleaved_self_play_players(self):
+        buf = RolloutBuffer()
+        for player, value in [(0, 10.0), (1, 100.0), (0, 20.0), (1, 200.0)]:
+            tr = _dummy_transition(reward=0.0, done=False)
+            tr.player = player
+            tr.value = value
+            buf.add(tr)
+        buf.data[2].done = True
+        buf.data[3].done = True
+
+        buf.compute_gae(last_value=0.0, gamma=1.0, lam=1.0)
+
+        assert buf._returns[0] == pytest.approx(20.0, abs=1e-6)
+        assert buf._returns[1] == pytest.approx(200.0, abs=1e-6)
 
 
 # ------------------------------------------------------------------ ReplayBuffer
