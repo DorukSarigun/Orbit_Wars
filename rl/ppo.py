@@ -69,11 +69,12 @@ def ppo_update(
                 fleet_mask=batch["fleet_mask"],
                 source_mask=batch["source_mask"],
             )
-            ev = policy.evaluate_actions(
+            ev = policy.evaluate_source_actions(
                 out,
                 src=batch["src"],
                 tgt=batch["tgt"],
                 ship_bin=batch["ship_bin"],
+                is_noop=batch["is_noop"],
             )
             new_logp = ev["log_prob"]
             entropy = ev["entropy"].mean()

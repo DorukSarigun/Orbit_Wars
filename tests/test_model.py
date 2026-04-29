@@ -143,6 +143,27 @@ def test_act_deterministic_is_argmax(batch):
     assert torch.equal(a1["ship_bin"], a2["ship_bin"])
 
 
+def test_act_source_returns_fixed_source_and_matches_eval(batch):
+    torch.manual_seed(0)
+    _, b = batch
+    net = _net()
+    out = net(**b)
+    src = torch.zeros(b["planet_feats"].shape[0], dtype=torch.long)
+    action = net.act_source(out, src, deterministic=False)
+    assert torch.equal(action["src"], src)
+    assert action["tgt"].shape == src.shape
+    assert action["ship_bin"].shape == src.shape
+    assert action["is_noop"].shape == src.shape
+    ev = net.evaluate_source_actions(
+        out,
+        action["src"],
+        action["tgt"],
+        action["ship_bin"],
+        action["is_noop"],
+    )
+    assert torch.allclose(ev["log_prob"], action["log_prob"], atol=1e-5)
+
+
 def test_gradient_flows_through_network(batch):
     _, b = batch
     net = _net()

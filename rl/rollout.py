@@ -14,7 +14,7 @@ which is fine for a symmetric zero-sum game.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -45,30 +45,61 @@ def _act_for_player(
     *,
     device: torch.device,
 ) -> tuple:
-    """Run policy on a single env-observation; return (obs_dataclass,
-    action_dict, env_action_list, output) so the caller can store the
-    transition and step the env."""
     angular_velocity = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=angular_velocity,
                             p_max=policy.p_max, f_max=policy.f_max)
-    batch = pack_observations([obs], device=device)
-    with torch.no_grad():
-        out = policy(**batch)
-        action = policy.act(out, deterministic=False)
-
-    src_slot = int(action["src"][0])
-    tgt_slot = int(action["tgt"][0])
-    ship_bin = int(action["ship_bin"][0])
-    is_noop = bool(action["is_noop"][0])
-
     parsed = parse_planets(env_obs)
-    move = decode_action(
-        obs, src_slot, tgt_slot, ship_bin,
-        planets=parsed, angular_velocity=angular_velocity, no_op=is_noop,
+    env_action = []
+    decisions = []
+    launch_count = 0
+    obs_work = replace(
+        obs,
+        planet_feats=obs.planet_feats.copy(),
+        source_mask=obs.source_mask.copy(),
     )
-    env_action = [move] if move is not None else []
+    source_slots = [int(i) for i, ok in enumerate(obs.source_mask) if ok]
+    last_out = None
 
-    return obs, action, env_action, out, is_noop
+    for src_slot in source_slots:
+        obs_decision = replace(
+            obs_work,
+            planet_feats=obs_work.planet_feats.copy(),
+            source_mask=obs_work.source_mask.copy(),
+        )
+        batch = pack_observations([obs_decision], device=device)
+        with torch.no_grad():
+            out = policy(**batch)
+            action = policy.act_source(
+                out,
+                torch.tensor([src_slot], device=device),
+                deterministic=False,
+            )
+        last_out = out
+
+        tgt_slot = int(action["tgt"][0])
+        ship_bin = int(action["ship_bin"][0])
+        is_noop = bool(action["is_noop"][0])
+        move = decode_action(
+            obs_decision, src_slot, tgt_slot, ship_bin,
+            planets=parsed, angular_velocity=angular_velocity, no_op=is_noop,
+        )
+        if move is not None:
+            env_action.append(move)
+            launch_count += 1
+            sent_ships = float(move[2])
+            obs_work.planet_feats[src_slot, 3] = max(
+                0.0, obs_work.planet_feats[src_slot, 3] - sent_ships / 100.0
+            )
+            obs_work.planet_feats[tgt_slot, 15] += sent_ships / 500.0
+        obs_work.source_mask[src_slot] = False
+        decisions.append((obs_decision, action, out))
+
+    if last_out is None:
+        batch = pack_observations([obs], device=device)
+        with torch.no_grad():
+            last_out = policy(**batch)
+
+    return decisions, env_action, last_out, launch_count
 
 
 def collect_episode(
@@ -104,12 +135,10 @@ def collect_episode(
 
         # Both players act on the same underlying state but with their
         # own perspective (different feature normalization in obs_builder).
-        obs0, act0, em0, out0, noop0 = _act_for_player(policy, env_obs0, 0, device=device)
-        obs1, act1, em1, out1, noop1 = _act_for_player(policy, env_obs1, 1, device=device)
-        if not noop0:
-            n_launches[0] += 1
-        if not noop1:
-            n_launches[1] += 1
+        dec0, em0, out0, launches0 = _act_for_player(policy, env_obs0, 0, device=device)
+        dec1, em1, out1, launches1 = _act_for_player(policy, env_obs1, 1, device=device)
+        n_launches[0] += launches0
+        n_launches[1] += launches1
 
         new_state = env.step([em0, em1])
         new_obs0 = new_state[0]["observation"]
@@ -130,29 +159,30 @@ def collect_episode(
         last_value[0] = float(out0.value[0].item())
         last_value[1] = float(out1.value[0].item())
 
-        # Store both perspectives.
-        for obs, act, out, r, p in [
-            (obs0, act0, out0, r0, 0),
-            (obs1, act1, out1, r1, 1),
+        for decisions, r, p in [
+            (dec0, r0, 0),
+            (dec1, r1, 1),
         ]:
-            buffer.add(Transition(
-                player=p,
-                planet_feats=obs.planet_feats,
-                fleet_feats=obs.fleet_feats,
-                global_feats=obs.global_feats,
-                edge_bias=obs.edge_bias,
-                planet_mask=obs.planet_mask,
-                fleet_mask=obs.fleet_mask,
-                source_mask=obs.source_mask,
-                src=int(act["src"][0]),
-                tgt=int(act["tgt"][0]),
-                ship_bin=int(act["ship_bin"][0]),
-                is_noop=bool(act["is_noop"][0]),
-                log_prob=float(act["log_prob"][0].item()),
-                value=float(out.value[0].item()),
-                reward=r,
-                done=terminal,
-            ))
+            reward = r / max(1, len(decisions))
+            for obs, act, out in decisions:
+                buffer.add(Transition(
+                    player=p,
+                    planet_feats=obs.planet_feats,
+                    fleet_feats=obs.fleet_feats,
+                    global_feats=obs.global_feats,
+                    edge_bias=obs.edge_bias,
+                    planet_mask=obs.planet_mask,
+                    fleet_mask=obs.fleet_mask,
+                    source_mask=obs.source_mask,
+                    src=int(act["src"][0]),
+                    tgt=int(act["tgt"][0]),
+                    ship_bin=int(act["ship_bin"][0]),
+                    is_noop=bool(act["is_noop"][0]),
+                    log_prob=float(act["log_prob"][0].item()),
+                    value=float(out.value[0].item()),
+                    reward=reward,
+                    done=terminal,
+                ))
 
         state = new_state
         if progress_cb is not None:

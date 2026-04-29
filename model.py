@@ -347,6 +347,57 @@ class OrbitWarsPolicy(nn.Module):
             "log_prob": log_prob,
         }
 
+    @torch.no_grad()
+    def act_source(
+        self,
+        out: PolicyOutput,
+        source_slot: torch.Tensor,
+        deterministic: bool = False,
+    ) -> dict:
+        source_slot = source_slot.to(out.src_logits.device).long()
+        B = out.src_logits.shape[0]
+        src_raw = out.src_logits[:, : self.p_max]
+        launch_logits = torch.stack(
+            [torch.zeros_like(src_raw), src_raw],
+            dim=-1,
+        )
+        launch_sel = launch_logits[torch.arange(B, device=src_raw.device), source_slot]
+        launch_dist = torch.distributions.Categorical(logits=launch_sel)
+        if deterministic:
+            launch = launch_sel.argmax(dim=-1)
+        else:
+            launch = launch_dist.sample()
+        is_noop = launch == 0
+
+        gather_idx = source_slot[:, None, None].expand(-1, 1, self.p_max)
+        tgt_logits_sel = out.tgt_logits.gather(1, gather_idx).squeeze(1)
+        tgt_dist = torch.distributions.Categorical(logits=tgt_logits_sel)
+        if deterministic:
+            tgt = tgt_logits_sel.argmax(dim=-1)
+        else:
+            tgt = tgt_dist.sample()
+
+        ship_idx = source_slot[:, None, None].expand(-1, 1, self.n_ship_bins)
+        ship_logits_sel = out.ship_logits.gather(1, ship_idx).squeeze(1)
+        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+        if deterministic:
+            ship = ship_logits_sel.argmax(dim=-1)
+        else:
+            ship = ship_dist.sample()
+
+        valid = (~is_noop).float()
+        log_prob = launch_dist.log_prob(launch) + valid * (
+            tgt_dist.log_prob(tgt) + ship_dist.log_prob(ship)
+        )
+
+        return {
+            "src": source_slot,
+            "tgt": tgt,
+            "ship_bin": ship,
+            "is_noop": is_noop,
+            "log_prob": log_prob,
+        }
+
     # ----------------------------------------- PPO re-evaluation (with grad)
     def evaluate_actions(
         self,
@@ -384,6 +435,47 @@ class OrbitWarsPolicy(nn.Module):
         # Entropy: sum src + (only if not noop) tgt + ship; matches the
         # log-prob factorization so it's mathematically consistent.
         entropy = src_dist.entropy() + valid * (tgt_dist.entropy() + ship_dist.entropy())
+
+        return {"log_prob": log_prob, "entropy": entropy, "value": out.value}
+
+    def evaluate_source_actions(
+        self,
+        out: "PolicyOutput",
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        ship_bin: torch.Tensor,
+        is_noop: torch.Tensor,
+    ) -> dict:
+        src = src.long()
+        tgt = tgt.long()
+        ship_bin = ship_bin.long()
+        is_noop = is_noop.bool()
+
+        B = out.src_logits.shape[0]
+        src_raw = out.src_logits[:, : self.p_max]
+        launch_logits = torch.stack(
+            [torch.zeros_like(src_raw), src_raw],
+            dim=-1,
+        )
+        launch_sel = launch_logits[torch.arange(B, device=src.device), src]
+        launch_dist = torch.distributions.Categorical(logits=launch_sel)
+        launch = (~is_noop).long()
+
+        gather_idx = src[:, None, None].expand(-1, 1, self.p_max)
+        tgt_logits_sel = out.tgt_logits.gather(1, gather_idx).squeeze(1)
+        tgt_dist = torch.distributions.Categorical(logits=tgt_logits_sel)
+
+        ship_idx = src[:, None, None].expand(-1, 1, self.n_ship_bins)
+        ship_logits_sel = out.ship_logits.gather(1, ship_idx).squeeze(1)
+        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+
+        valid = (~is_noop).float()
+        log_prob = launch_dist.log_prob(launch) + valid * (
+            tgt_dist.log_prob(tgt) + ship_dist.log_prob(ship_bin)
+        )
+        entropy = launch_dist.entropy() + valid * (
+            tgt_dist.entropy() + ship_dist.entropy()
+        )
 
         return {"log_prob": log_prob, "entropy": entropy, "value": out.value}
 
