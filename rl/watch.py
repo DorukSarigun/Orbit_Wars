@@ -1,15 +1,18 @@
 """Load a checkpoint and play a self-play game with rendering.
 
-Two ways to use:
+Three ways to use (most to least recommended):
 
-  CLI / stdout play (no rendering):
-    python -m rl.watch --ckpt checkpoints/latest.pt --no-render
+  **Interactive HTML replay** (kaggle_environments native player):
+    python -m rl.watch --ckpt checkpoints/latest.pt --html replay.html
+    python -m rl.watch --ckpt ... --html replays/g.html --games 5
+    # -> open replay.html in any browser: full scrub-bar animation.
 
-  CLI with matplotlib popups every N steps:
+  **Notebook inline**: import `record_game_html` and embed the result
+    via IPython.display.IFrame, or call `play_self_play_game(render=True)`
+    for matplotlib snapshots every N steps.
+
+  **CLI matplotlib popup** (GUI desktop only):
     python -m rl.watch --ckpt checkpoints/latest.pt --render-every 20
-
-  Notebook: import `play_self_play_game` and call it; pass `render=True`
-  to draw frames inline as the game progresses.
 """
 
 from __future__ import annotations
@@ -161,6 +164,64 @@ def play_self_play_game(
     return summary
 
 
+def record_game_html(
+    net,
+    out_path: str | Path,
+    *,
+    max_steps: int = 500,
+    deterministic: bool = False,
+    seed: Optional[int] = None,
+    device: Optional[torch.device] = None,
+    verbose: bool = True,
+) -> dict:
+    """Play one game, write kaggle_environments' native interactive HTML
+    replay to `out_path`, and return a summary dict.
+
+    The resulting .html is a full replay player (scrub bar, play/pause,
+    planet/fleet visualization) -- open it in any browser.
+    """
+    device = device or torch.device("cpu")
+    net.eval().to(device)
+
+    env = make("orbit_wars", debug=False)
+    if seed is not None:
+        env.configuration["randomSeed"] = int(seed)
+    state = env.reset(num_agents=2)
+    state = env.step([[], []])
+
+    for t in range(max_steps):
+        env_obs0 = state[0]["observation"]
+        env_obs1 = state[1]["observation"]
+        em0, _ = _act(net, env_obs0, 0, deterministic=deterministic, device=device)
+        em1, _ = _act(net, env_obs1, 1, deterministic=deterministic, device=device)
+        state = env.step([em0, em1])
+        if state[0].status == "DONE" or env.done:
+            break
+
+    html = env.render(mode="html")
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html)
+
+    final_r = [int(s.reward or 0) for s in state]
+    winner = 0 if final_r[0] > final_r[1] else 1 if final_r[1] > final_r[0] else -1
+    final_planets = parse_planets(state[0]["observation"])
+    summary = {
+        "length": t + 1,
+        "winner": winner,
+        "final_reward": final_r,
+        "planets_p0": sum(1 for p in final_planets if p.owner == 0 and not p.is_comet),
+        "planets_p1": sum(1 for p in final_planets if p.owner == 1 and not p.is_comet),
+        "html_path": str(out_path),
+        "html_size_kb": round(len(html) / 1024, 1),
+    }
+    if verbose:
+        winner_str = {0: "P0", 1: "P1", -1: "DRAW"}[winner]
+        print(f"[replay] {winner_str} wins @ step {t+1} -> {out_path} "
+              f"({summary['html_size_kb']} KB)")
+    return summary
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(description="Watch self-play with a trained checkpoint")
     p.add_argument("--ckpt", required=True, help="Path to checkpoint .pt file")
@@ -171,11 +232,33 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--no-render", action="store_true",
                    help="Don't open matplotlib windows")
     p.add_argument("--render-every", type=int, default=20)
+    p.add_argument("--html", default=None, metavar="PATH",
+                   help="Export interactive HTML replay to PATH and skip "
+                        "matplotlib rendering. Open PATH in a browser.")
+    p.add_argument("--games", type=int, default=1,
+                   help="Number of games to play/record (with --html, each "
+                        "becomes a separate file PATH_NNN.html).")
     p.add_argument("--device", default="cpu")
     args = p.parse_args(argv)
 
     net, kind, _ = load_any_checkpoint(args.ckpt, device=torch.device(args.device))
     print(f"Loaded {kind.upper()} checkpoint: {sum(p.numel() for p in net.parameters()):,} params")
+
+    if args.html:
+        base = Path(args.html)
+        for i in range(args.games):
+            if args.games == 1:
+                out = base
+            else:
+                out = base.with_stem(f"{base.stem}_{i:03d}")
+            seed = (args.seed or 0) + i if args.seed is not None else None
+            record_game_html(
+                net, out, max_steps=args.max_steps,
+                deterministic=args.deterministic, seed=seed,
+                device=torch.device(args.device),
+            )
+        return
+
     play_self_play_game(
         net,
         max_steps=args.max_steps,
