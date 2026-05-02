@@ -37,7 +37,7 @@ from .dqn import DQNConfig, dqn_update, hard_update_target, soft_update_target
 from .metrics import (
     WeightSnapshot, round_metrics, weight_norms_by_module,
 )
-from .rewards import RewardConfig, compute_step_reward
+from .rewards import RewardConfig, build_reward_config, compute_step_reward, normalize_terminal_rewards
 
 
 @dataclass
@@ -45,6 +45,7 @@ class DQNTrainConfig:
     iterations: int = 100
     episodes_per_iter: int = 4
     max_episode_steps: int = 500
+    num_agents: int = 2
     updates_per_step: float = 1.0       # ratio: gradient steps per env step
     learn_starts: int = 1_000           # min transitions before any update
     batch_size: int = 256
@@ -87,7 +88,8 @@ def _act_q(
     """Build observation, run Q-net + ε-greedy action selection, decode env move."""
     omega = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=omega,
-                            p_max=online.p_max, f_max=online.f_max)
+                            p_max=online.p_max, f_max=online.f_max,
+                            planet_feature_dim=online.planet_dim)
     batch = pack_observations([obs], device=device)
     with torch.no_grad():
         out = online(**batch)
@@ -205,62 +207,71 @@ def train_dqn(
             env.configuration["randomSeed"] = (
                 train_cfg.seed * 100000 + it * 1000 + ep
             )
-            state = env.reset(num_agents=2)
-            state = env.step([[], []])
-            n_launches = [0, 0]
-            cum_reward = [0.0, 0.0]
+            state = env.reset(num_agents=train_cfg.num_agents)
+            state = env.step([[] for _ in range(train_cfg.num_agents)])
+            n_launches = [0 for _ in range(train_cfg.num_agents)]
+            cum_reward = [0.0 for _ in range(train_cfg.num_agents)]
 
             for t in range(train_cfg.max_episode_steps):
                 eps = _epsilon_at(total_env_steps, train_cfg)
-                env_obs0 = state[0]["observation"]
-                env_obs1 = state[1]["observation"]
+                env_obs = [state[p]["observation"] for p in range(train_cfg.num_agents)]
 
-                obs0, src0, tgt0, sh0, no0, em0 = _act_q(
-                    online, env_obs0, 0, epsilon=eps, device=device, rng_torch=rng_torch)
-                obs1, src1, tgt1, sh1, no1, em1 = _act_q(
-                    online, env_obs1, 1, epsilon=eps, device=device, rng_torch=rng_torch)
-                if not no0: n_launches[0] += 1
-                if not no1: n_launches[1] += 1
+                acted = [
+                    _act_q(
+                        online, env_obs[p], p,
+                        epsilon=eps, device=device, rng_torch=rng_torch,
+                    )
+                    for p in range(train_cfg.num_agents)
+                ]
+                env_actions = []
+                for p, (_, _, _, _, no, em) in enumerate(acted):
+                    env_actions.append(em)
+                    if not no:
+                        n_launches[p] += 1
 
-                new_state = env.step([em0, em1])
-                terminal = (new_state[0].status == "DONE") or env.done \
+                new_state = env.step(env_actions)
+                terminal = any(s.status == "DONE" for s in new_state) or env.done \
                     or (t == train_cfg.max_episode_steps - 1)
 
-                new_obs0 = new_state[0]["observation"]
-                new_obs1 = new_state[1]["observation"]
-                r0 = compute_step_reward(env_obs0, new_obs0, 0,
-                                         terminal=terminal,
-                                         env_terminal_reward=new_state[0].reward or 0,
-                                         cfg=reward_cfg)
-                r1 = compute_step_reward(env_obs1, new_obs1, 1,
-                                         terminal=terminal,
-                                         env_terminal_reward=new_state[1].reward or 0,
-                                         cfg=reward_cfg)
-                cum_reward[0] += r0; cum_reward[1] += r1
+                new_obs = [new_state[p]["observation"] for p in range(train_cfg.num_agents)]
+                terminal_rewards = normalize_terminal_rewards([float(s.reward or 0.0) for s in new_state]) if terminal else [0.0 for _ in range(train_cfg.num_agents)]
+                rewards = [
+                    compute_step_reward(
+                        env_obs[p], new_obs[p], p,
+                        terminal=terminal,
+                        env_terminal_reward=terminal_rewards[p],
+                        cfg=reward_cfg,
+                    )
+                    for p in range(train_cfg.num_agents)
+                ]
+                for p, r in enumerate(rewards):
+                    cum_reward[p] += r
 
                 # We need next-state observations from each player's view.
                 from obs_builder import build_observation as _bo
-                omega_next = new_obs0.get("angular_velocity", 0.0) or 0.0
-                next_obs0 = _bo(new_obs0, player=0, angular_velocity=omega_next,
-                                p_max=online.p_max, f_max=online.f_max)
-                next_obs1 = _bo(new_obs1, player=1, angular_velocity=omega_next,
-                                p_max=online.p_max, f_max=online.f_max)
+                next_obs_built = []
+                for p in range(train_cfg.num_agents):
+                    omega_next = new_obs[p].get("angular_velocity", 0.0) or 0.0
+                    next_obs_built.append(
+                        _bo(new_obs[p], player=p, angular_velocity=omega_next,
+                            p_max=online.p_max, f_max=online.f_max)
+                    )
 
-                for cur, nxt, sl, tg, sh, no, r in [
-                    (obs0, next_obs0, src0, tgt0, sh0, no0, r0),
-                    (obs1, next_obs1, src1, tgt1, sh1, no1, r1),
-                ]:
+                for p, (cur, sl, tg, sh, no, _) in enumerate(acted):
                     replay.add(DQNTransition(
                         planet_feats=cur.planet_feats, fleet_feats=cur.fleet_feats,
                         global_feats=cur.global_feats, edge_bias=cur.edge_bias,
                         planet_mask=cur.planet_mask, fleet_mask=cur.fleet_mask,
                         source_mask=cur.source_mask,
                         src=sl, tgt=tg, ship_bin=sh, is_noop=no,
-                        reward=r, done=terminal,
-                        next_planet_feats=nxt.planet_feats, next_fleet_feats=nxt.fleet_feats,
-                        next_global_feats=nxt.global_feats, next_edge_bias=nxt.edge_bias,
-                        next_planet_mask=nxt.planet_mask, next_fleet_mask=nxt.fleet_mask,
-                        next_source_mask=nxt.source_mask,
+                        reward=rewards[p], done=terminal,
+                        next_planet_feats=next_obs_built[p].planet_feats,
+                        next_fleet_feats=next_obs_built[p].fleet_feats,
+                        next_global_feats=next_obs_built[p].global_feats,
+                        next_edge_bias=next_obs_built[p].edge_bias,
+                        next_planet_mask=next_obs_built[p].planet_mask,
+                        next_fleet_mask=next_obs_built[p].fleet_mask,
+                        next_source_mask=next_obs_built[p].source_mask,
                     ))
 
                 total_env_steps += 1
@@ -295,18 +306,22 @@ def train_dqn(
                     break
 
             final_r = [int(s.reward or 0) for s in state]
-            if final_r[0] > final_r[1]: winner = 0
-            elif final_r[1] > final_r[0]: winner = 1
-            else: winner = -1
+            best_reward = max(final_r) if final_r else 0
+            winners = [p for p, r in enumerate(final_r) if r == best_reward]
+            winner = winners[0] if len(winners) == 1 and best_reward > 0 else -1
             ep_lengths.append(t + 1)
-            ep_rewards_p0.append(cum_reward[0])
-            ep_rewards_p1.append(cum_reward[1])
+            ep_rewards_p0.append(cum_reward[0] if len(cum_reward) > 0 else 0.0)
+            ep_rewards_p1.append(cum_reward[1] if len(cum_reward) > 1 else 0.0)
             ep_winners.append(winner)
-            ep_launches.append((n_launches[0] + n_launches[1]) / 2)
+            ep_launches.append(sum(n_launches) / max(1, len(n_launches)))
 
         elapsed = time.time() - t0
         wins_p0 = sum(1 for w in ep_winners if w == 0)
         wins_p1 = sum(1 for w in ep_winners if w == 1)
+        wins_by_player = {
+            f"p{p}": sum(1 for w in ep_winners if w == p)
+            for p in range(train_cfg.num_agents)
+        }
         draws = sum(1 for w in ep_winners if w == -1)
         # Average per-module grad norms across all updates this iter.
         avg_grad_norms = {
@@ -328,6 +343,7 @@ def train_dqn(
             "avg_episode_length": round(sum(ep_lengths)/len(ep_lengths), 1),
             "avg_launches_per_player": round(sum(ep_launches)/len(ep_launches), 1),
             "wins_p0": wins_p0, "wins_p1": wins_p1, "draws": draws,
+            "wins_by_player": wins_by_player,
             "n_updates": len(update_stats["dqn_loss"]),
             "dqn_loss": round(np.mean(update_stats["dqn_loss"]) if update_stats["dqn_loss"] else 0.0, 5),
             "td_error": round(np.mean(update_stats["td_error"]) if update_stats["td_error"] else 0.0, 4),
@@ -339,11 +355,13 @@ def train_dqn(
             "update_norms": round_metrics(update_norms, 5),
             "update_ratios": round_metrics(update_ratios, 6),
         }
+        wins_str = " ".join(f"P{p}={wins_by_player.get(f'p{p}', 0)}"
+                            for p in range(train_cfg.num_agents))
         print(f"[epoch {it:>4}/{train_cfg.iterations}] "
               f"games={train_cfg.episodes_per_iter} "
               f"env_steps={total_env_steps:>6} replay={len(replay):>6} "
               f"eps={log['epsilon']:.3f} len={log['avg_episode_length']:>5.1f} "
-              f"P0={wins_p0} P1={wins_p1} D={draws} | "
+              f"{wins_str} D={draws} | "
               f"loss={log['dqn_loss']:.4f} td={log['td_error']:.3f} q={log['q_mean']:+.3f} "
               f"ur={ur_mean:.2e} upd={log['n_updates']} ({elapsed:.1f}s)")
         with log_path.open("a") as fp:
@@ -373,6 +391,8 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Self-play games per epoch")
     p.add_argument("--max-episode-steps", type=int, default=500,
                    help="Per-game turn cap (env's natural max is ~500)")
+    p.add_argument("--num-agents", type=int, choices=(2, 4), default=2,
+                   help="Number of self-play agents in each game")
     p.add_argument("--updates-per-step", type=float, default=1.0)
     p.add_argument("--learn-starts", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=256)
@@ -397,17 +417,21 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no-double-dqn", action="store_true",
                    help="Disable Double DQN (use vanilla DQN target)")
     # Reward shaping
-    p.add_argument("--capture-value-weight", type=float, default=0.05,
+    p.add_argument("--reward-system", choices=("current", "aggressive"), default="current",
+                   help="Reward preset to start from; individual reward flags override it.")
+    p.add_argument("--capture-value-weight", type=float, default=None,
                    help="Reward for MY production growth (per planet captured)")
-    p.add_argument("--denial-value-weight", type=float, default=0.05,
+    p.add_argument("--denial-value-weight", type=float, default=None,
                    help="Reward for OPP's production loss; >capture-weight = aggressive")
     p.add_argument("--capture-value-kind", choices=("production", "radius"),
-                   default="production")
-    p.add_argument("--max-turns", type=int, default=500,
+                   default=None)
+    p.add_argument("--max-turns", type=int, default=None,
                    help="Game length used for time-decay normalization")
-    p.add_argument("--time-decay-floor", type=float, default=0.0)
-    p.add_argument("--planet-diff-weight", type=float, default=0.0)
-    p.add_argument("--ship-diff-weight", type=float, default=0.0005)
+    p.add_argument("--time-decay-floor", type=float, default=None)
+    p.add_argument("--planet-diff-weight", type=float, default=None)
+    p.add_argument("--ship-diff-weight", type=float, default=None)
+    p.add_argument("--ship-loss-weight", type=float, default=None)
+    p.add_argument("--invalid-action-penalty", type=float, default=None)
     return p
 
 
@@ -417,6 +441,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         iterations=args.iterations,
         episodes_per_iter=args.episodes_per_iter,
         max_episode_steps=args.max_episode_steps,
+        num_agents=args.num_agents,
         updates_per_step=args.updates_per_step,
         learn_starts=args.learn_starts,
         batch_size=args.batch_size,
@@ -437,7 +462,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         gamma=args.gamma,
         double_dqn=not args.no_double_dqn,
     )
-    reward_cfg = RewardConfig(
+    reward_cfg = build_reward_config(
+        args.reward_system,
         capture_value_weight=args.capture_value_weight,
         denial_value_weight=args.denial_value_weight,
         capture_value_kind=args.capture_value_kind,
@@ -445,6 +471,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         time_decay_floor=args.time_decay_floor,
         planet_diff_weight=args.planet_diff_weight,
         ship_diff_weight=args.ship_diff_weight,
+        ship_loss_weight=args.ship_loss_weight,
+        invalid_action_penalty=args.invalid_action_penalty,
     )
     train_dqn(train_cfg, dqn_cfg, reward_cfg)
 

@@ -41,6 +41,7 @@ class Transition:
     # Per-step reward and terminal flag.
     reward: float
     done: bool
+    turn: int = 0
 
 
 class RolloutBuffer:
@@ -62,8 +63,17 @@ class RolloutBuffer:
     def __len__(self) -> int:
         return len(self.data)
 
-    def add(self, t: Transition) -> None:
+    def add(self, t: Transition) -> int:
+        idx = len(self.data)
         self.data.append(t)
+        return idx
+
+    def add_reward(self, idx: int, reward: float) -> None:
+        self.data[idx].reward += float(reward)
+
+    def add_delayed_reward(self, idx: int, reward: float, *, event_turn: int, discount: float) -> None:
+        delay = max(0, int(event_turn) - int(self.data[idx].turn))
+        self.add_reward(idx, float(reward) * (float(discount) ** delay))
 
     # --------------------------------------------------------------- GAE
     def compute_gae(self, last_value: float | dict[int, float], *, gamma: float = 0.99, lam: float = 0.95) -> None:

@@ -18,6 +18,7 @@ sys.path.insert(0, ROOT)
 from feature_extraction import Planet, Fleet, fleet_speed, SUN_X, SUN_Y, SUN_RADIUS
 from navigation import (
     segment_min_dist_to_point,
+    segment_stays_in_bounds,
     crosses_sun,
     find_intercepts,
     find_intercepts_from,
@@ -121,6 +122,10 @@ class TestSegmentGeometry:
         # Zero-length segment falls back to point distance
         d = segment_min_dist_to_point(5, 5, 5, 5, 8, 9)
         assert d == pytest.approx(math.hypot(3, 4))
+
+    def test_segment_bounds_rejects_outside_endpoint(self):
+        assert segment_stays_in_bounds(10, 10, 90, 90)
+        assert not segment_stays_in_bounds(10, 10, 101, 90)
 
 
 # =============================================================================
@@ -369,8 +374,8 @@ class TestComputeLaunchRegression:
 
     def test_equivalent_at_t_offset_zero_rotating(self):
         # Src static, tgt rotating -- same equivalence
-        src = make_static(0, 90, 10)
-        tgt = make_rotating(1, r=30, theta0=math.pi * 0.3)
+        src = make_static(0, 10, 10)
+        tgt = make_rotating(1, r=20, theta0=1.0)
         planets = [src, tgt]
         omega = 0.03
         a = compute_launch(src, tgt, 40, planets, omega)

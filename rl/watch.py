@@ -19,20 +19,34 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
 import torch
 from kaggle_environments import make
 
-from feature_extraction import parse_planets
-from obs_builder import build_observation, decode_action
+from feature_extraction import parse_planets, fleet_speed
+from obs_builder import (
+    build_observation,
+    decode_action,
+    INCOMING_ETA_BUCKETS,
+    PF_IDX_SHIPS,
+    PF_IDX_INCOMING_SELF_B0,
+)
 from model import OrbitWarsPolicy, pack_observations
 
 from .train import load_checkpoint as load_ppo_checkpoint
 from .dqn_train import load_dqn_checkpoint
 from model_q import OrbitWarsQNet
 from playground import render_board
+
+
+def _incoming_bucket_idx(eta: float) -> int:
+    for i, upper in enumerate(INCOMING_ETA_BUCKETS):
+        if eta <= upper:
+            return i
+    return len(INCOMING_ETA_BUCKETS) - 1
 
 
 def load_any_checkpoint(path, device=None):
@@ -52,7 +66,8 @@ def _act(net, env_obs, player: int, *,
     both `OrbitWarsPolicy` (PPO) and `OrbitWarsQNet` (DQN)."""
     omega = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=omega,
-                            p_max=net.p_max, f_max=net.f_max)
+                            p_max=net.p_max, f_max=net.f_max,
+                            planet_feature_dim=net.planet_dim)
     batch = pack_observations([obs], device=device)
 
     info_extra = {}
@@ -87,6 +102,90 @@ def _act(net, env_obs, player: int, *,
     }
 
 
+def _act_all_sources(net, env_obs, player: int, *,
+                     deterministic: bool, device: torch.device) -> tuple:
+    if isinstance(net, OrbitWarsQNet):
+        return _act(net, env_obs, player, deterministic=deterministic, device=device)
+
+    omega = env_obs.get("angular_velocity", 0.0) or 0.0
+    obs = build_observation(env_obs, player=player, angular_velocity=omega,
+                            p_max=net.p_max, f_max=net.f_max,
+                            planet_feature_dim=net.planet_dim)
+    parsed = parse_planets(env_obs)
+    env_actions = []
+    infos = []
+    obs_work = replace(
+        obs,
+        planet_feats=obs.planet_feats.copy(),
+        source_mask=obs.source_mask.copy(),
+    )
+
+    for src_slot in [int(i) for i, ok in enumerate(obs.source_mask) if ok]:
+        obs_decision = replace(
+            obs_work,
+            planet_feats=obs_work.planet_feats.copy(),
+            source_mask=obs_work.source_mask.copy(),
+        )
+        batch = pack_observations([obs_decision], device=device)
+        with torch.no_grad():
+            out = net(**batch)
+            action = net.act_source(
+                out,
+                torch.tensor([src_slot], device=device),
+                deterministic=deterministic,
+            )
+
+        tgt_slot = int(action["tgt"][0])
+        ship_bin = int(action["ship_bin"][0])
+        is_noop = bool(action["is_noop"][0])
+        move = decode_action(
+            obs_decision, src_slot, tgt_slot, ship_bin,
+            planets=parsed, angular_velocity=omega, no_op=is_noop,
+        )
+        if move is not None:
+            env_actions.append(move)
+            sent_ships = float(move[2])
+            obs_work.planet_feats[src_slot, PF_IDX_SHIPS] = max(
+                0.0, obs_work.planet_feats[src_slot, PF_IDX_SHIPS] - sent_ships / 100.0
+            )
+            src_planet_id = int(obs_decision.planet_ids[src_slot])
+            tgt_planet_id = int(obs_decision.planet_ids[tgt_slot])
+            src_planet = next((p for p in parsed if p.id == src_planet_id), None)
+            tgt_planet = next((p for p in parsed if p.id == tgt_planet_id), None)
+            distance = 0.0
+            if src_planet and tgt_planet:
+                distance = ((src_planet.x - tgt_planet.x) ** 2 + (src_planet.y - tgt_planet.y) ** 2) ** 0.5
+            eta = distance / max(fleet_speed(int(sent_ships)), 1e-6)
+            bucket = _incoming_bucket_idx(eta)
+            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 500.0
+        obs_work.source_mask[src_slot] = False
+        infos.append({
+            "src_slot": src_slot,
+            "tgt_slot": tgt_slot,
+            "ship_bin": ship_bin,
+            "is_noop": is_noop,
+            "value": float(out.value[0].item()),
+        })
+
+    return env_actions, infos
+
+
+def _winner_from_rewards(final_r: list[int]) -> int:
+    best_reward = max(final_r) if final_r else 0
+    winners = [p for p, r in enumerate(final_r) if r == best_reward]
+    return winners[0] if len(winners) == 1 and best_reward > 0 else -1
+
+
+def _planet_counts_by_owner(env_obs: dict, num_agents: int) -> dict:
+    final_planets = parse_planets(env_obs)
+    counts = {
+        f"planets_p{p}": sum(1 for pl in final_planets if pl.owner == p and not pl.is_comet)
+        for p in range(num_agents)
+    }
+    counts["planets_neutral"] = sum(1 for pl in final_planets if pl.owner == -1 and not pl.is_comet)
+    return counts
+
+
 def play_self_play_game(
     policy: OrbitWarsPolicy,
     *,
@@ -94,6 +193,7 @@ def play_self_play_game(
     deterministic: bool = False,
     render: bool = False,
     render_every: int = 20,
+    num_agents: int = 2,
     seed: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
@@ -109,8 +209,8 @@ def play_self_play_game(
     env = make("orbit_wars", debug=False)
     if seed is not None:
         env.configuration["randomSeed"] = int(seed)
-    state = env.reset(num_agents=2)
-    state = env.step([[], []])
+    state = env.reset(num_agents=num_agents)
+    state = env.step([[] for _ in range(num_agents)])
 
     frames = []
     history = []
@@ -118,49 +218,47 @@ def play_self_play_game(
         render_board(state[0]["observation"], title="Step 0 — start")
 
     for t in range(max_steps):
-        env_obs0 = state[0]["observation"]
-        env_obs1 = state[1]["observation"]
-        em0, info0 = _act(policy, env_obs0, 0, deterministic=deterministic, device=device)
-        em1, info1 = _act(policy, env_obs1, 1, deterministic=deterministic, device=device)
-        state = env.step([em0, em1])
-        history.append({"step": t, "p0": info0, "p1": info1})
+        acted = [
+            _act_all_sources(
+                policy, state[p]["observation"], p,
+                deterministic=deterministic, device=device,
+            )
+            for p in range(num_agents)
+        ]
+        state = env.step([actions for actions, _ in acted])
+        history.append({
+            "step": t,
+            **{f"p{p}": info for p, (_, info) in enumerate(acted)},
+        })
 
         if render and ((t + 1) % render_every == 0):
             render_board(state[0]["observation"], title=f"Step {t+1}")
 
-        if state[0].status == "DONE" or env.done:
+        if any(s.status == "DONE" for s in state) or env.done:
             break
 
     if render:
         render_board(state[0]["observation"], title=f"Final — step {t+1}")
 
     final_r = [int(s.reward or 0) for s in state]
-    if final_r[0] > final_r[1]:
-        winner = 0
-    elif final_r[1] > final_r[0]:
-        winner = 1
-    else:
-        winner = -1
-
-    # Final ownership tally for a quick "who won what" summary.
-    final_planets = parse_planets(state[0]["observation"])
-    own_p0 = sum(1 for p in final_planets if p.owner == 0 and not p.is_comet)
-    own_p1 = sum(1 for p in final_planets if p.owner == 1 and not p.is_comet)
-    own_neutral = sum(1 for p in final_planets if p.owner == -1 and not p.is_comet)
+    winner = _winner_from_rewards(final_r)
+    planet_counts = _planet_counts_by_owner(state[0]["observation"], num_agents)
 
     summary = {
         "length": t + 1,
         "winner": winner,
         "final_reward": final_r,
-        "planets_p0": own_p0,
-        "planets_p1": own_p1,
-        "planets_neutral": own_neutral,
+        **planet_counts,
         "history": history,
     }
     if verbose:
-        winner_str = {0: "P0", 1: "P1", -1: "DRAW"}[winner]
+        winner_str = f"P{winner}" if winner >= 0 else "DRAW"
+        counts_str = " / ".join(
+            f"P{p}={planet_counts.get(f'planets_p{p}', 0)}"
+            for p in range(num_agents)
+        )
         print(f"Game over @ step {t+1}: winner={winner_str}, "
-              f"planets P0={own_p0} / P1={own_p1} / neutral={own_neutral}")
+              f"planets {counts_str} / neutral={planet_counts['planets_neutral']}")
     return summary
 
 
@@ -170,6 +268,7 @@ def record_game_html(
     *,
     max_steps: int = 500,
     deterministic: bool = False,
+    num_agents: int = 2,
     seed: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
@@ -186,16 +285,19 @@ def record_game_html(
     env = make("orbit_wars", debug=False)
     if seed is not None:
         env.configuration["randomSeed"] = int(seed)
-    state = env.reset(num_agents=2)
-    state = env.step([[], []])
+    state = env.reset(num_agents=num_agents)
+    state = env.step([[] for _ in range(num_agents)])
 
     for t in range(max_steps):
-        env_obs0 = state[0]["observation"]
-        env_obs1 = state[1]["observation"]
-        em0, _ = _act(net, env_obs0, 0, deterministic=deterministic, device=device)
-        em1, _ = _act(net, env_obs1, 1, deterministic=deterministic, device=device)
-        state = env.step([em0, em1])
-        if state[0].status == "DONE" or env.done:
+        acted = [
+            _act_all_sources(
+                net, state[p]["observation"], p,
+                deterministic=deterministic, device=device,
+            )
+            for p in range(num_agents)
+        ]
+        state = env.step([actions for actions, _ in acted])
+        if any(s.status == "DONE" for s in state) or env.done:
             break
 
     html = env.render(mode="html")
@@ -204,19 +306,18 @@ def record_game_html(
     out_path.write_text(html)
 
     final_r = [int(s.reward or 0) for s in state]
-    winner = 0 if final_r[0] > final_r[1] else 1 if final_r[1] > final_r[0] else -1
-    final_planets = parse_planets(state[0]["observation"])
+    winner = _winner_from_rewards(final_r)
+    planet_counts = _planet_counts_by_owner(state[0]["observation"], num_agents)
     summary = {
         "length": t + 1,
         "winner": winner,
         "final_reward": final_r,
-        "planets_p0": sum(1 for p in final_planets if p.owner == 0 and not p.is_comet),
-        "planets_p1": sum(1 for p in final_planets if p.owner == 1 and not p.is_comet),
+        **planet_counts,
         "html_path": str(out_path),
         "html_size_kb": round(len(html) / 1024, 1),
     }
     if verbose:
-        winner_str = {0: "P0", 1: "P1", -1: "DRAW"}[winner]
+        winner_str = f"P{winner}" if winner >= 0 else "DRAW"
         print(f"[replay] {winner_str} wins @ step {t+1} -> {out_path} "
               f"({summary['html_size_kb']} KB)")
     return summary
@@ -232,6 +333,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--no-render", action="store_true",
                    help="Don't open matplotlib windows")
     p.add_argument("--render-every", type=int, default=20)
+    p.add_argument("--num-agents", type=int, default=2,
+                   help="Number of self-play agents in each game")
     p.add_argument("--html", default=None, metavar="PATH",
                    help="Export interactive HTML replay to PATH and skip "
                         "matplotlib rendering. Open PATH in a browser.")
@@ -254,7 +357,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             seed = (args.seed or 0) + i if args.seed is not None else None
             record_game_html(
                 net, out, max_steps=args.max_steps,
-                deterministic=args.deterministic, seed=seed,
+                deterministic=args.deterministic, num_agents=args.num_agents, seed=seed,
                 device=torch.device(args.device),
             )
         return
@@ -265,7 +368,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         deterministic=args.deterministic,
         render=not args.no_render,
         render_every=args.render_every,
+        num_agents=args.num_agents,
         seed=args.seed,
+        device=torch.device(args.device),
     )
 
 

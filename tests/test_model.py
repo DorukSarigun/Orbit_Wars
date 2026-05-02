@@ -18,6 +18,7 @@ sys.path.insert(0, ROOT)
 
 from obs_builder import build_observation
 from model import OrbitWarsPolicy, pack_observations
+from model_planet_only import PlanetOnlyOrbitWarsPolicy
 
 
 def _toy_obs(player=0):
@@ -65,6 +66,18 @@ def test_forward_pass_shapes(batch):
     assert out.tgt_logits.shape == (B, 8, 8)
     assert out.ship_logits.shape == (B, 8, 5)
     assert out.value.shape == (B,)
+
+
+def test_planet_only_forward_pass_shapes(batch):
+    obs_list, b = batch
+    net = PlanetOnlyOrbitWarsPolicy(p_max=8, f_max=4, d_model=32, n_heads=2, n_layers=2)
+    out = net(**b)
+    B = len(obs_list)
+    assert out.src_logits.shape == (B, 8 + 1)
+    assert out.tgt_logits.shape == (B, 8, 8)
+    assert out.ship_logits.shape == (B, 8, 5)
+    assert out.value.shape == (B,)
+    assert out.tokens.shape == (B, 8 + 1, 32)
 
 
 def test_no_nan_in_logits(batch):

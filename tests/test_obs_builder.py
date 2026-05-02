@@ -246,14 +246,17 @@ def test_planet_features_track_multi_enemy_incoming_slots():
     o = build_observation(obs, player=0, angular_velocity=0.0, f_max=8)
 
     target_feats = o.planet_feats[1]
-    assert math.isclose(target_feats[15], 20 / 500.0, abs_tol=1e-6)
-    assert target_feats[16] > 0.0
-    assert math.isclose(target_feats[17], 30 / 500.0, abs_tol=1e-6)
-    assert target_feats[18] > 0.0
-    assert math.isclose(target_feats[19], 40 / 500.0, abs_tol=1e-6)
-    assert target_feats[20] > 0.0
-    assert math.isclose(target_feats[21], 50 / 500.0, abs_tol=1e-6)
-    assert target_feats[22] > 0.0
+    assert math.isclose(target_feats[16], 20 / 500.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[19], 150 / 500.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[20], 30 / 500.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[23], 20 / 500.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[24], 180 / 500.0, abs_tol=1e-6)
+    assert target_feats[25] > 0.0
+    assert target_feats[26] > 0.0
+    assert math.isclose(target_feats[27], 60 / 500.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[28], 60 / 500.0, abs_tol=1e-6)
+    assert target_feats[29] > 0.0
+    assert math.isclose(target_feats[30], (180 - 50 - 20) / 500.0, abs_tol=1e-6)
 
 
 def test_global_features_player_aggregates():

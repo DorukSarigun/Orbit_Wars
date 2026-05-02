@@ -37,7 +37,7 @@ policy under PPO/DQN; it just shortens credit-assignment chains.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from feature_extraction import parse_planets, parse_fleets
@@ -45,6 +45,7 @@ from feature_extraction import parse_planets, parse_fleets
 
 @dataclass
 class RewardConfig:
+    reward_system: str = "current"
     # Terminal reward scale (env emits +/- 1; we can amplify if we want).
     terminal_scale: float = 1.0
 
@@ -55,8 +56,12 @@ class RewardConfig:
     # When denial == capture they collapse to the symmetric (mine - opp)
     # swing form (zero-sum-balanced). Setting denial > capture pushes the
     # agent to prefer stealing/disrupting the opponent over neutral grabs.
-    capture_value_weight: float = 0.05    # gain side: my production growth
-    denial_value_weight: float = 0.05     # denial side: opp's production loss
+    # NOTE: capture credit is also assigned per-fleet at arrival via
+    # FleetTracker (see rl/fleet_tracker.py). These step-level weights are kept
+    # smaller than fleet_capture_weight so they provide state-change feedback
+    # without dominating launch-specific delayed credit.
+    capture_value_weight: float = 0.01    # gain side: my production growth
+    denial_value_weight: float = 0.01     # denial side: opp's production loss
     # 'production' (gameplay-true: ships/turn) or 'radius' (log-proxy)
     capture_value_kind: str = "production"
     # Total game length used to normalize the time-decay factor. Default
@@ -69,7 +74,27 @@ class RewardConfig:
 
     # ---- Auxiliary fast-feedback signals ----
     ship_diff_weight: float = 0.0005    # per ship advantage delta (normalized by 100)
+    ship_loss_weight: float = 0.001     # direct penalty per my ship lost
+    fleet_airborne_weight: float = 0.00002
+    fleet_capture_weight: float = 0.05
+    fleet_kill_weight: float = 0.001
+    fleet_waste_weight: float = 0.0015
+    enemy_capture_radius_weight: float = 0.02
+    planet_loss_weight: float = 0.05
+    planet_loss_credit_horizon: int = 30
+    defense_hold_weight: float = 0.001
+    defense_hold_horizon: int = 15
+    defense_arrival_window: float = 1.5
+    delayed_reward_discount: float = 1.0
+    invalid_action_penalty: float = 0.01
     step_cost: float = 0.0              # tiny per-step alive cost (typically 0 or negative)
+    # Deprecated compatibility knobs. Step-level shaping is no longer spread
+    # backward over recent actions; rollout assigns it only to the transitions
+    # created on that env step. Fleet capture/kill credit is still assigned
+    # directly to the original launching transition by FleetTracker.
+    eligibility_trace_horizon: int = 0
+    eligibility_trace_decay: float = 0.0
+    noop_trace_weight: float = 0.0
 
     # ---- Legacy / backward-compatible ----
     # Un-weighted planet count differential (superseded by capture-value).
@@ -78,6 +103,56 @@ class RewardConfig:
 
     # If True, shaping signals also fire on the terminal step.
     shape_on_terminal: bool = False
+
+
+REWARD_SYSTEMS: tuple[str, ...] = ("current", "aggressive", "production_simple")
+
+
+def build_reward_config(reward_system: str = "current", **overrides) -> RewardConfig:
+    if reward_system == "current":
+        cfg = RewardConfig(reward_system="current")
+    elif reward_system == "aggressive":
+        cfg = RewardConfig(
+            reward_system="aggressive",
+            capture_value_weight=0.015,
+            denial_value_weight=0.025,
+            fleet_airborne_weight=0.000025,
+            fleet_capture_weight=0.06,
+            fleet_kill_weight=0.001,
+            fleet_waste_weight=0.0015,
+            enemy_capture_radius_weight=0.035,
+            planet_loss_weight=0.075,
+            defense_hold_weight=0.0015,
+        )
+    elif reward_system == "production_simple":
+        cfg = RewardConfig(
+            reward_system="production_simple",
+            capture_value_weight=0.0,
+            denial_value_weight=0.0,
+            ship_diff_weight=0.0,
+            ship_loss_weight=0.0,
+            fleet_airborne_weight=0.01,
+            fleet_capture_weight=0.0,
+            fleet_kill_weight=1.0,
+            fleet_waste_weight=1.0,
+            enemy_capture_radius_weight=0.0,
+            planet_loss_weight=1.0,
+            defense_hold_weight=0.0,
+            delayed_reward_discount=0.995,
+            planet_diff_weight=0.0,
+        )
+    else:
+        raise ValueError(
+            f"Unknown reward_system={reward_system!r}; "
+            f"expected one of {', '.join(REWARD_SYSTEMS)}"
+        )
+
+    clean_overrides = {
+        key: value
+        for key, value in overrides.items()
+        if value is not None
+    }
+    return replace(cfg, **clean_overrides)
 
 
 # ---- helpers --------------------------------------------------------------
@@ -107,13 +182,17 @@ def _capture_value_components(prev_env_obs, curr_env_obs, player: int, *,
     """
     prev_planets = {p.id: p for p in parse_planets(prev_env_obs) if not p.is_comet}
     curr_planets = {p.id: p for p in parse_planets(curr_env_obs) if not p.is_comet}
-    opp = 1 - player
-
     def total_for(pmap, owner):
+        if owner == "opponents":
+            return sum(
+                _planet_value(p, kind)
+                for p in pmap.values()
+                if p.owner not in (player, -1)
+            )
         return sum(_planet_value(p, kind) for p in pmap.values() if p.owner == owner)
 
     d_mine = total_for(curr_planets, player) - total_for(prev_planets, player)
-    d_opp = total_for(curr_planets, opp) - total_for(prev_planets, opp)
+    d_opp = total_for(curr_planets, "opponents") - total_for(prev_planets, "opponents")
     return time_factor * d_mine, time_factor * (-d_opp)
 
 
@@ -133,6 +212,17 @@ def _current_turn(env_obs) -> int:
     return int(getattr(env_obs, "step", 0) or 0)
 
 
+def normalize_terminal_rewards(raw_rewards: list[float]) -> list[float]:
+    if not raw_rewards:
+        return []
+    best_reward = max(raw_rewards)
+    winners = [i for i, r in enumerate(raw_rewards) if r == best_reward]
+    if len(winners) != 1 or best_reward <= 0:
+        return [0.0 for _ in raw_rewards]
+    winner = winners[0]
+    return [1.0 if i == winner else -1.0 for i in range(len(raw_rewards))]
+
+
 def compute_step_reward(
     prev_env_obs,
     curr_env_obs,
@@ -141,6 +231,7 @@ def compute_step_reward(
     terminal: bool,
     env_terminal_reward: float,
     cfg: Optional[RewardConfig] = None,
+    invalid_actions: int = 0,
 ) -> float:
     """Compute the per-step reward for `player`.
 
@@ -176,17 +267,27 @@ def compute_step_reward(
 
     # ---- Auxiliary signals (legacy planet diff + ship diff + step cost) ----
     p_prev, s_prev = _player_score(prev_env_obs, player)
-    opp = 1 - player
-    op_prev, os_prev = _player_score(prev_env_obs, opp)
     p_curr, s_curr = _player_score(curr_env_obs, player)
-    op_curr, os_curr = _player_score(curr_env_obs, opp)
+    prev_planets = parse_planets(prev_env_obs)
+    prev_fleets = parse_fleets(prev_env_obs)
+    curr_planets = parse_planets(curr_env_obs)
+    curr_fleets = parse_fleets(curr_env_obs)
+    op_prev = sum(1 for p in prev_planets if p.owner not in (player, -1) and not p.is_comet)
+    os_prev = sum(p.ships for p in prev_planets if p.owner not in (player, -1) and not p.is_comet)
+    os_prev += sum(f.ships for f in prev_fleets if f.owner not in (player, -1))
+    op_curr = sum(1 for p in curr_planets if p.owner not in (player, -1) and not p.is_comet)
+    os_curr = sum(p.ships for p in curr_planets if p.owner not in (player, -1) and not p.is_comet)
+    os_curr += sum(f.ships for f in curr_fleets if f.owner not in (player, -1))
     d_planets = (p_curr - p_prev) - (op_curr - op_prev)
     d_ship_diff = ((s_curr - os_curr) - (s_prev - os_prev)) / 100.0
+    ship_loss = max(0.0, float(s_prev - s_curr))
 
     shaped = (cfg.capture_value_weight * gain
               + cfg.denial_value_weight * denial
               + cfg.planet_diff_weight * d_planets
               + cfg.ship_diff_weight * d_ship_diff
+              - cfg.ship_loss_weight * ship_loss
+              - cfg.invalid_action_penalty * max(0, int(invalid_actions))
               + cfg.step_cost)
 
     # Suppress shaping on terminal step if requested (some prefer clean

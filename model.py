@@ -160,6 +160,7 @@ class OrbitWarsPolicy(nn.Module):
         super().__init__()
         self.p_max = p_max
         self.f_max = f_max
+        self.planet_dim = planet_dim
         self.n_ship_bins = n_ship_bins
         self.d_model = d_model
         self.n_heads = n_heads
@@ -368,27 +369,35 @@ class OrbitWarsPolicy(nn.Module):
         else:
             launch = launch_dist.sample()
         is_noop = launch == 0
+        valid = (~is_noop).float()
 
+        # Only sample target/ship if launching (avoid wasted computation on NO-OP).
+        # Use zeros for NO-OP rows; they'll be masked out of log_prob anyway.
         gather_idx = source_slot[:, None, None].expand(-1, 1, self.p_max)
         tgt_logits_sel = out.tgt_logits.gather(1, gather_idx).squeeze(1)
-        tgt_dist = torch.distributions.Categorical(logits=tgt_logits_sel)
         if deterministic:
             tgt = tgt_logits_sel.argmax(dim=-1)
         else:
-            tgt = tgt_dist.sample()
+            # Mask NO-OP rows so they don't affect sampling (we'll overwrite below)
+            masked_logits = tgt_logits_sel.clone()
+            masked_logits[is_noop] = float("-inf")
+            masked_logits[is_noop, 0] = 0.0  # Ensure valid distribution for NO-OP rows
+            tgt = torch.distributions.Categorical(logits=masked_logits).sample()
 
         ship_idx = source_slot[:, None, None].expand(-1, 1, self.n_ship_bins)
         ship_logits_sel = out.ship_logits.gather(1, ship_idx).squeeze(1)
-        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
         if deterministic:
             ship = ship_logits_sel.argmax(dim=-1)
         else:
-            ship = ship_dist.sample()
+            masked_ship = ship_logits_sel.clone()
+            masked_ship[is_noop] = float("-inf")
+            masked_ship[is_noop, 0] = 0.0
+            ship = torch.distributions.Categorical(logits=masked_ship).sample()
 
-        valid = (~is_noop).float()
-        log_prob = launch_dist.log_prob(launch) + valid * (
-            tgt_dist.log_prob(tgt) + ship_dist.log_prob(ship)
-        )
+        # Conditional log_prob: only add tgt/ship terms when not NO-OP.
+        tgt_logp = torch.distributions.Categorical(logits=tgt_logits_sel).log_prob(tgt)
+        ship_logp = torch.distributions.Categorical(logits=ship_logits_sel).log_prob(ship)
+        log_prob = launch_dist.log_prob(launch) + valid * (tgt_logp + ship_logp)
 
         return {
             "src": source_slot,

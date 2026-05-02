@@ -39,6 +39,7 @@ import math
 from typing import Iterable, Optional
 
 from feature_extraction import (
+    BOARD_SIZE,
     Planet,
     Fleet,
     SUN_X,
@@ -73,6 +74,12 @@ def crosses_sun(x1, y1, x2, y2, margin: float = 0.5) -> bool:
     sub-segments, which can graze where a single straight segment doesn't.
     """
     return segment_min_dist_to_point(x1, y1, x2, y2, SUN_X, SUN_Y) < (SUN_RADIUS + margin)
+
+
+def segment_stays_in_bounds(x1, y1, x2, y2, margin: float = 0.0) -> bool:
+    lo = 0.0 + margin
+    hi = BOARD_SIZE - margin
+    return lo <= x1 <= hi and lo <= y1 <= hi and lo <= x2 <= hi and lo <= y2 <= hi
 
 
 # =============================================================================
@@ -233,7 +240,8 @@ def compute_launch(
     *,
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     t_max: float = 500.0,
-    sun_margin: float = 0.5,
+    sun_margin: float = 1.5,
+    board_margin: float = 0.0,
     planet_margin: float = 0.1,
     max_candidates: int = 8,
 ) -> Optional[dict]:
@@ -283,6 +291,9 @@ def compute_launch(
         # Spawn point of the fleet (matches env).
         sx = src.x + math.cos(angle) * (src.radius + 0.1)
         sy = src.y + math.sin(angle) * (src.radius + 0.1)
+
+        if not segment_stays_in_bounds(sx, sy, ix, iy, margin=board_margin):
+            continue
 
         # 1) Sun check on the actual flight segment.
         if crosses_sun(sx, sy, ix, iy, margin=sun_margin):
@@ -462,7 +473,8 @@ def compute_launch_at(
     t_offset: float = 0.0,
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     t_max: float = 500.0,
-    sun_margin: float = 0.5,
+    sun_margin: float = 1.5,
+    board_margin: float = 0.0,
     planet_margin: float = 0.1,
     max_candidates: int = 8,
 ) -> Optional[dict]:
@@ -493,6 +505,9 @@ def compute_launch_at(
         # Spawn point at launch moment.
         spawn_x = sx_launch + math.cos(angle) * (src.radius + 0.1)
         spawn_y = sy_launch + math.sin(angle) * (src.radius + 0.1)
+        if not segment_stays_in_bounds(spawn_x, spawn_y, ix, iy, margin=board_margin):
+            continue
+
         if crosses_sun(spawn_x, spawn_y, ix, iy, margin=sun_margin):
             continue
 

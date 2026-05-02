@@ -53,7 +53,42 @@ F_MAX_DEFAULT = 64   # no env hard cap on in-flight fleets; 64 is a safe
                      # ceiling for both players' typical/peak load.
 
 MAX_ENEMY_INCOMING_SLOTS = 3
-PLANET_FEATURE_DIM = 23
+PLANET_FEATURE_DIM = 31
+INCOMING_ETA_BUCKETS = (5.0, 15.0, 30.0, float("inf"))
+
+# Planet feature index constants (derived from _planet_features order).
+# Use these instead of hard-coded ints to survive feature reordering.
+PF_IDX_OWNER_SELF = 0
+PF_IDX_OWNER_ENEMY = 1
+PF_IDX_OWNER_NEUTRAL = 2
+PF_IDX_SHIPS = 3          # ships / 100.0
+PF_IDX_PRODUCTION = 4     # production / 5.0
+PF_IDX_RADIUS = 5         # radius / 5.0
+PF_IDX_R_SUN = 6          # r_sun / 50.0
+PF_IDX_COS_THETA = 7
+PF_IDX_SIN_THETA = 8
+PF_IDX_IS_STATIC = 9
+PF_IDX_IS_ROTATING = 10
+PF_IDX_IS_COMET = 11
+PF_IDX_OMEGA = 12         # omega if rotating else 0
+PF_IDX_SHIPS_TO_CAP = 13  # ships + 1 (if not self) / 100.0
+PF_IDX_LOG_SHIPS = 14
+PF_IDX_INCOMING_SELF_B0 = 15        # self ships arriving in [0, 5] turns / 500.0
+PF_IDX_INCOMING_SELF_B1 = 16        # self ships arriving in (5, 15] turns / 500.0
+PF_IDX_INCOMING_SELF_B2 = 17        # self ships arriving in (15, 30] turns / 500.0
+PF_IDX_INCOMING_SELF_B3 = 18        # self ships arriving after 30 turns / 500.0
+PF_IDX_INCOMING_ENEMY_B0 = 19       # enemy ships arriving in [0, 5] turns / 500.0
+PF_IDX_INCOMING_ENEMY_B1 = 20       # enemy ships arriving in (5, 15] turns / 500.0
+PF_IDX_INCOMING_ENEMY_B2 = 21       # enemy ships arriving in (15, 30] turns / 500.0
+PF_IDX_INCOMING_ENEMY_B3 = 22       # enemy ships arriving after 30 turns / 500.0
+PF_IDX_INCOMING_SELF_TOTAL = 23
+PF_IDX_INCOMING_ENEMY_TOTAL = 24
+PF_IDX_INCOMING_SELF_MIN_ETA = 25
+PF_IDX_INCOMING_ENEMY_MIN_ETA = 26
+PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS = 27
+PF_IDX_INCOMING_ENEMY_LARGEST_SHIPS = 28
+PF_IDX_INCOMING_ENEMY_LARGEST_ETA = 29
+PF_IDX_INCOMING_NET_THREAT = 30
 FLEET_FEATURE_DIM = 11
 GLOBAL_FEATURE_DIM = 12
 EDGE_FEATURE_DIM = 5  # (dist_norm, dx_norm, dy_norm, sin(dphi_sun), cos(dphi_sun))
@@ -93,8 +128,9 @@ def _planet_features(
     player: int,
     omega: float,
     incoming: Optional[dict[str, Any]] = None,
+    planet_feature_dim: int = PLANET_FEATURE_DIM,
 ) -> np.ndarray:
-    """23-dim feature vector for a single planet."""
+    """Feature vector for a single planet."""
     is_self = float(p.owner == player)
     is_enemy = float(p.owner != player and p.owner != -1)
     is_neutral = float(p.owner == -1)
@@ -113,14 +149,20 @@ def _planet_features(
     # "How many ships do I need to capture this?" - rough lower bound.
     ships_to_cap = ships + 1.0 if not is_self else 0.0
     incoming = incoming or {}
-    self_ships = float(incoming.get("self_ships", 0.0))
-    self_eta = float(incoming.get("self_eta_min", 0.0))
-    enemy_ships = list(incoming.get("enemy_ships", [0.0] * MAX_ENEMY_INCOMING_SLOTS))
-    enemy_eta = list(incoming.get("enemy_eta_min", [0.0] * MAX_ENEMY_INCOMING_SLOTS))
-    enemy_ships = (enemy_ships + [0.0] * MAX_ENEMY_INCOMING_SLOTS)[:MAX_ENEMY_INCOMING_SLOTS]
-    enemy_eta = (enemy_eta + [0.0] * MAX_ENEMY_INCOMING_SLOTS)[:MAX_ENEMY_INCOMING_SLOTS]
+    self_buckets = list(incoming.get("self_buckets", [0.0] * len(INCOMING_ETA_BUCKETS)))
+    enemy_buckets = list(incoming.get("enemy_buckets", [0.0] * len(INCOMING_ETA_BUCKETS)))
+    self_buckets = (self_buckets + [0.0] * len(INCOMING_ETA_BUCKETS))[:len(INCOMING_ETA_BUCKETS)]
+    enemy_buckets = (enemy_buckets + [0.0] * len(INCOMING_ETA_BUCKETS))[:len(INCOMING_ETA_BUCKETS)]
+    self_total = float(incoming.get("self_total", sum(self_buckets)))
+    enemy_total = float(incoming.get("enemy_total", sum(enemy_buckets)))
+    self_min_eta = float(incoming.get("self_min_eta", 0.0))
+    enemy_min_eta = float(incoming.get("enemy_min_eta", 0.0))
+    enemy_soonest_ships = float(incoming.get("enemy_soonest_ships", 0.0))
+    enemy_largest_ships = float(incoming.get("enemy_largest_ships", 0.0))
+    enemy_largest_eta = float(incoming.get("enemy_largest_eta", 0.0))
+    net_threat = enemy_total - ships - self_total if is_self else enemy_total - self_total
 
-    return np.asarray([
+    feats = np.asarray([
         is_self,
         is_enemy,
         is_neutral,
@@ -136,15 +178,24 @@ def _planet_features(
         omega_dt,
         ships_to_cap / 100.0,
         log_ships,
-        self_ships / 500.0,
-        min(self_eta, 50.0) / 50.0 if self_eta > 0.0 else 0.0,
-        enemy_ships[0] / 500.0,
-        min(enemy_eta[0], 50.0) / 50.0 if enemy_eta[0] > 0.0 else 0.0,
-        enemy_ships[1] / 500.0,
-        min(enemy_eta[1], 50.0) / 50.0 if enemy_eta[1] > 0.0 else 0.0,
-        enemy_ships[2] / 500.0,
-        min(enemy_eta[2], 50.0) / 50.0 if enemy_eta[2] > 0.0 else 0.0,
+        self_buckets[0] / 500.0,
+        self_buckets[1] / 500.0,
+        self_buckets[2] / 500.0,
+        self_buckets[3] / 500.0,
+        enemy_buckets[0] / 500.0,
+        enemy_buckets[1] / 500.0,
+        enemy_buckets[2] / 500.0,
+        enemy_buckets[3] / 500.0,
+        self_total / 500.0,
+        enemy_total / 500.0,
+        min(self_min_eta, 50.0) / 50.0 if self_min_eta > 0.0 else 0.0,
+        min(enemy_min_eta, 50.0) / 50.0 if enemy_min_eta > 0.0 else 0.0,
+        enemy_soonest_ships / 500.0,
+        enemy_largest_ships / 500.0,
+        min(enemy_largest_eta, 50.0) / 50.0 if enemy_largest_eta > 0.0 else 0.0,
+        net_threat / 500.0,
     ], dtype=np.float32)
+    return feats[:planet_feature_dim]
 
 
 def _fleet_features(
@@ -181,6 +232,13 @@ def _fleet_features(
         eta_norm,
         has_pred,
     ], dtype=np.float32)
+
+
+def _incoming_bucket_idx(eta: float) -> int:
+    for i, upper in enumerate(INCOMING_ETA_BUCKETS):
+        if eta <= upper:
+            return i
+    return len(INCOMING_ETA_BUCKETS) - 1
 
 
 def _global_features(
@@ -231,6 +289,7 @@ def build_observation(
     turn: Optional[int] = None,
     p_max: int = P_MAX_DEFAULT,
     f_max: int = F_MAX_DEFAULT,
+    planet_feature_dim: int = PLANET_FEATURE_DIM,
     min_ships_to_launch: int = 1,
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     predict_targets: bool = True,
@@ -255,7 +314,7 @@ def build_observation(
         Observation with all arrays allocated to fixed shapes.
     """
     planets = parse_planets(env_obs)
-    fleets = parse_fleets(env_obs)
+    all_fleets = parse_fleets(env_obs)
     if turn is None:
         turn = int(env_obs.get("step", 0) if isinstance(env_obs, dict) else getattr(env_obs, "step", 0) or 0)
 
@@ -266,35 +325,58 @@ def build_observation(
             f"Observation has {len(planets)} planets but p_max={p_max}. "
             f"Bump P_MAX_DEFAULT or pass a larger p_max."
         )
-    if len(fleets) > f_max:
-        # Fleet truncation is annoying but recoverable; warn via meta.
-        fleets = fleets[:f_max]
-
     # Predict fleet targets (needed for fleet features and threat counting).
-    if predict_targets and fleets:
-        preds = predict_all_fleet_targets(fleets, planets, angular_velocity)
+    if predict_targets and all_fleets:
+        preds = predict_all_fleet_targets(all_fleets, planets, angular_velocity)
     else:
         preds = {}
 
-    enemy_owners = sorted({f.owner for f in fleets if f.owner not in (player, -1)})
+    my_ids = {p.id for p in planets if p.owner == player}
+    if len(all_fleets) > f_max:
+        def fleet_priority(f):
+            pred = preds.get(f.id)
+            target_id = pred.get("target_id") if pred else None
+            eta = float(pred.get("eta", 999.0)) if pred else 999.0
+            incoming_to_mine = target_id in my_ids
+            mine = f.owner == player
+            enemy = f.owner not in (player, -1)
+            return (
+                0 if incoming_to_mine and enemy else
+                1 if incoming_to_mine and mine else
+                2 if enemy else
+                3 if mine else
+                4,
+                eta,
+                -f.ships,
+                f.id,
+            )
+        fleets = sorted(all_fleets, key=fleet_priority)[:f_max]
+    else:
+        fleets = all_fleets
+
+    enemy_owners = sorted({f.owner for f in all_fleets if f.owner not in (player, -1)})
     enemy_owner_to_slot = {
         owner: i for i, owner in enumerate(enemy_owners[:MAX_ENEMY_INCOMING_SLOTS])
     }
     incoming_by_planet: dict[int, dict[str, Any]] = {
         p.id: {
-            "self_ships": 0.0,
-            "self_eta_min": 0.0,
-            "enemy_ships": [0.0] * MAX_ENEMY_INCOMING_SLOTS,
-            "enemy_eta_min": [0.0] * MAX_ENEMY_INCOMING_SLOTS,
+            "self_buckets": [0.0] * len(INCOMING_ETA_BUCKETS),
+            "enemy_buckets": [0.0] * len(INCOMING_ETA_BUCKETS),
+            "self_total": 0.0,
+            "enemy_total": 0.0,
+            "self_min_eta": 0.0,
+            "enemy_min_eta": 0.0,
+            "enemy_soonest_ships": 0.0,
+            "enemy_largest_ships": 0.0,
+            "enemy_largest_eta": 0.0,
         }
         for p in planets
     }
 
     # Threat aggregation for global features.
-    my_ids = {p.id for p in planets if p.owner == player}
     incoming_other = 0  # enemy ships en route to my planets
     incoming_self = 0   # friendly ships en route to my planets
-    for f in fleets:
+    for f in all_fleets:
         pred = preds.get(f.id)
         if pred is None:
             continue
@@ -302,15 +384,21 @@ def build_observation(
         eta = float(pred["eta"])
         planet_incoming = incoming_by_planet.get(target_id)
         if planet_incoming is not None:
+            bucket = _incoming_bucket_idx(eta)
             if f.owner == player:
-                planet_incoming["self_ships"] += f.ships
-                old_eta = float(planet_incoming["self_eta_min"])
-                planet_incoming["self_eta_min"] = eta if old_eta <= 0.0 else min(old_eta, eta)
-            elif f.owner != -1 and f.owner in enemy_owner_to_slot:
-                slot = enemy_owner_to_slot[f.owner]
-                planet_incoming["enemy_ships"][slot] += f.ships
-                old_eta = float(planet_incoming["enemy_eta_min"][slot])
-                planet_incoming["enemy_eta_min"][slot] = eta if old_eta <= 0.0 else min(old_eta, eta)
+                planet_incoming["self_buckets"][bucket] += f.ships
+                planet_incoming["self_total"] += f.ships
+                if planet_incoming["self_min_eta"] == 0.0 or eta < planet_incoming["self_min_eta"]:
+                    planet_incoming["self_min_eta"] = eta
+            elif f.owner != -1:
+                planet_incoming["enemy_buckets"][bucket] += f.ships
+                planet_incoming["enemy_total"] += f.ships
+                if planet_incoming["enemy_min_eta"] == 0.0 or eta < planet_incoming["enemy_min_eta"]:
+                    planet_incoming["enemy_min_eta"] = eta
+                    planet_incoming["enemy_soonest_ships"] = f.ships
+                if f.ships > planet_incoming["enemy_largest_ships"]:
+                    planet_incoming["enemy_largest_ships"] = f.ships
+                    planet_incoming["enemy_largest_eta"] = eta
         if target_id not in my_ids:
             continue
         if f.owner == player:
@@ -319,7 +407,7 @@ def build_observation(
             incoming_other += f.ships
 
     # ------- Planet tensor (padded) -------
-    planet_feats = np.zeros((p_max, PLANET_FEATURE_DIM), dtype=np.float32)
+    planet_feats = np.zeros((p_max, planet_feature_dim), dtype=np.float32)
     planet_mask = np.zeros(p_max, dtype=bool)
     source_mask = np.zeros(p_max, dtype=bool)
     planet_ids = np.full(p_max, -1, dtype=np.int32)
@@ -327,7 +415,8 @@ def build_observation(
 
     for i, p in enumerate(planets):
         planet_feats[i] = _planet_features(
-            p, player, angular_velocity, incoming=incoming_by_planet.get(p.id)
+            p, player, angular_velocity, incoming=incoming_by_planet.get(p.id),
+            planet_feature_dim=planet_feature_dim,
         )
         planet_mask[i] = True
         planet_ids[i] = p.id
@@ -349,7 +438,7 @@ def build_observation(
 
     # ------- Global features -------
     global_feats = _global_features(
-        planets, fleets, player, angular_velocity, turn,
+        planets, all_fleets, player, angular_velocity, turn,
         incoming_self=incoming_self, incoming_other=incoming_other,
     )
 

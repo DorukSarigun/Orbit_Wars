@@ -73,6 +73,7 @@ class OrbitWarsQNet(nn.Module):
         super().__init__()
         self.p_max = p_max
         self.f_max = f_max
+        self.planet_dim = planet_dim
         self.n_ship_bins = n_ship_bins
         self.d_model = d_model
         self.n_heads = n_heads

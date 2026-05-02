@@ -10,7 +10,7 @@ Modules
 - watch   : load a checkpoint and play/render one self-play game
 """
 
-from .rewards import RewardConfig, compute_step_reward
+from .rewards import REWARD_SYSTEMS, RewardConfig, build_reward_config, compute_step_reward
 from .buffer import RolloutBuffer
 from .rollout import collect_episode, EpisodeStats
 from .ppo import ppo_update, PPOConfig

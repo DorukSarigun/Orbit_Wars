@@ -24,8 +24,14 @@ __pycache__/
 
 # RL training artifacts
 checkpoints/
+checkpoints_*/
 checkpoints_dqn/
 checkpoints_duel/
 nb_ckpt_*/
 *.pt
 !docs/**/*.pt
+logs/
+replays/
+replay*.html
+.codex
+.codex/
