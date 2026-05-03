@@ -78,11 +78,34 @@ class DefenseTracker:
             expected_ships = float(prev.ships + max(0, prev.production))
             absorbed = min(arriving, max(0.0, expected_ships - float(curr.ships)))
             if absorbed > 0.0:
-                hold = max(holds, key=lambda h: h.hold_turn)
-                self._resolved.append((
-                    hold.buffer_idx,
-                    DefenseOutcome(True, ships_absorbed=absorbed, planet_production=float(curr.production)),
-                ))
+                # Split the absorbed credit across ALL holds in the window
+                # proportional to ships_held * recency. Recency weighting
+                # gives newer holds slightly more credit (decay = 0.9^delay)
+                # since they represent the latest decision to stay put;
+                # older holds still contribute but are less directly
+                # responsible for the successful absorption.
+                total_w = 0.0
+                weights = []
+                for h in holds:
+                    delay = max(0, turn - h.hold_turn)
+                    w = float(max(0, h.ships_held)) * (0.9 ** delay)
+                    weights.append(w)
+                    total_w += w
+                if total_w <= 0.0:
+                    # Degenerate: fall back to equal split across holds.
+                    weights = [1.0 for _ in holds]
+                    total_w = float(len(holds))
+                planet_prod = float(curr.production)
+                for h, w in zip(holds, weights):
+                    share = w / total_w
+                    self._resolved.append((
+                        h.buffer_idx,
+                        DefenseOutcome(
+                            True,
+                            ships_absorbed=absorbed * share,
+                            planet_production=planet_prod,
+                        ),
+                    ))
                 self._pending.pop(planet_id, None)
             else:
                 self._pending[planet_id] = holds

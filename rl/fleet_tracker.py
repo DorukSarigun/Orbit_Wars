@@ -24,6 +24,7 @@ class FleetLaunch:
     launch_tgt_ships: int = 0
     last_tgt_owner: int = -2
     last_tgt_ships: int = 0
+    my_total_ships_at_launch: int = 0
 
 
 @dataclass
@@ -39,6 +40,7 @@ class FleetOutcome:
     arrival_turn: int = 0
     enemy_ships_killed: float = 0.0
     own_waste: float = 0.0
+    my_total_ships_at_launch: int = 0
 
 
 class FleetTracker:
@@ -50,7 +52,8 @@ class FleetTracker:
     def register_launch(self, *, buffer_idx: int, launch_turn: int, player: int,
                         src_planet_id: int, tgt_planet_id: int, ships_sent: int,
                         angle: float, est_distance: float,
-                        launch_tgt_owner: int = -2, launch_tgt_ships: int = 0) -> str:
+                        launch_tgt_owner: int = -2, launch_tgt_ships: int = 0,
+                        my_total_ships_at_launch: int = 0) -> str:
         key = (
             f"p{player}_t{launch_turn}_src{src_planet_id}_tgt{tgt_planet_id}"
             f"_s{ships_sent}_a{angle:.4f}_idx{buffer_idx}"
@@ -59,7 +62,8 @@ class FleetTracker:
         fl = FleetLaunch(key, buffer_idx, launch_turn, player, src_planet_id,
                          tgt_planet_id, ships_sent, angle, launch_turn + eta,
                          launch_tgt_owner=launch_tgt_owner,
-                         launch_tgt_ships=launch_tgt_ships)
+                         launch_tgt_ships=launch_tgt_ships,
+                         my_total_ships_at_launch=int(my_total_ships_at_launch))
         self._pending[key] = fl
         sig = (player, src_planet_id, ships_sent, angle)
         self._fleet_sig_map[sig] = key
@@ -76,7 +80,8 @@ class FleetTracker:
                 sig = (f.owner, f.from_planet_id, f.ships, f.angle)
                 current_sigs.setdefault(sig, []).append(f)
         used_fleet_ids = set()
-        to_resolve = []
+        to_resolve_keys = []
+        to_resolve_fleets = []
         for key, fl in list(self._pending.items()):
             if fl.player != player:
                 continue
@@ -97,10 +102,25 @@ class FleetTracker:
                     fl.last_tgt_owner = int(tgt.owner)
                     fl.last_tgt_ships = int(tgt.ships)
                 continue
-            outcome = self._resolve(fl, planets, turn)
+            to_resolve_keys.append(key)
+            to_resolve_fleets.append(fl)
+
+        # Cross-fleet attribution: same-turn arrivals to the same target
+        # share the kill/waste budget proportionally to ships_sent. This
+        # avoids double-counting enemy_killed when multiple fleets combine
+        # to capture a single planet.
+        per_tgt_totals: dict[int, int] = {}
+        for fl in to_resolve_fleets:
+            per_tgt_totals[fl.tgt_planet_id] = (
+                per_tgt_totals.get(fl.tgt_planet_id, 0) + int(fl.ships_sent)
+            )
+        for fl in to_resolve_fleets:
+            total_sent = per_tgt_totals.get(fl.tgt_planet_id, fl.ships_sent)
+            outcome = self._resolve(fl, planets, turn,
+                                    total_ships_sent_same_turn=total_sent)
             self._resolved.setdefault(player, deque()).append((fl.buffer_idx, outcome))
-            to_resolve.append(key)
-        for key in to_resolve:
+
+        for key in to_resolve_keys:
             fl = self._pending.pop(key)
             sig = (fl.player, fl.src_planet_id, fl.ships_sent, fl.angle)
             self._fleet_sig_map.pop(sig, None)
@@ -111,11 +131,30 @@ class FleetTracker:
             while q:
                 yield q.popleft()
 
-    def _resolve(self, fl: FleetLaunch, planets: dict[int, Planet], turn: int) -> FleetOutcome:
+    def _resolve(self, fl: FleetLaunch, planets: dict[int, Planet], turn: int,
+                 *, total_ships_sent_same_turn: Optional[int] = None) -> FleetOutcome:
+        """Produce a per-fleet outcome.
+
+        When multiple fleets from the same player arrive at the same target
+        in the same turn, `total_ships_sent_same_turn` passes the aggregate
+        so that enemy_ships_killed and own_waste can be split proportionally
+        to ships_sent. A single-fleet arrival uses share=1.0 and reproduces
+        the legacy semantics exactly.
+        """
+        empire = int(fl.my_total_ships_at_launch)
+        total_sent = (
+            int(total_ships_sent_same_turn)
+            if total_ships_sent_same_turn is not None
+            else int(fl.ships_sent)
+        )
+        share = (fl.ships_sent / total_sent) if total_sent > 0 else 1.0
+
         tgt = planets.get(fl.tgt_planet_id)
         if tgt is None:
             # Target despawned (e.g. comet) or fleet lost mid-flight.
-            return FleetOutcome(False, False, True, False, own_waste=fl.ships_sent)
+            return FleetOutcome(False, False, True, False,
+                                own_waste=fl.ships_sent,
+                                my_total_ships_at_launch=empire)
         # Capture iff ownership flipped FROM not-mine TO mine.
         prev_owner = fl.last_tgt_owner if fl.last_tgt_owner != -2 else fl.launch_tgt_owner
         prev_ships = fl.last_tgt_ships if fl.last_tgt_owner != -2 else fl.launch_tgt_ships
@@ -124,10 +163,16 @@ class FleetTracker:
         if was_mine and is_mine_now:
             # Reinforced own planet: no capture, no kill. This is the
             # "self-pinging" exploit we explicitly do NOT reward.
-            return FleetOutcome(False, False, False, True, own_waste=fl.ships_sent)
+            return FleetOutcome(False, False, False, True,
+                                own_waste=fl.ships_sent,
+                                my_total_ships_at_launch=empire)
         if (not was_mine) and is_mine_now:
-            enemy_killed = prev_ships if prev_owner not in (-1, fl.player) else 0
-            own_waste = max(0, fl.ships_sent - int(tgt.ships))
+            # CAPTURED: enemy_killed and own_waste are global quantities
+            # (total kills = prev_ships; total waste absorbed by garrison =
+            # prev_ships as well). Split proportionally across arriving
+            # fleets.
+            total_enemy_killed = prev_ships if prev_owner not in (-1, fl.player) else 0
+            total_waste = max(0, min(total_sent, prev_ships))
             return FleetOutcome(
                 True,
                 False,
@@ -137,18 +182,24 @@ class FleetTracker:
                 planet_production=tgt.production,
                 planet_radius=tgt.radius,
                 arrival_turn=turn,
-                enemy_ships_killed=enemy_killed,
-                own_waste=own_waste,
+                enemy_ships_killed=float(total_enemy_killed) * share,
+                own_waste=float(total_waste) * share,
+                my_total_ships_at_launch=empire,
             )
         # Arrived but didn't capture: we hit defended/neutral and bounced.
-        killed = min(fl.ships_sent, max(0, prev_ships - int(tgt.ships)))
+        # Total damage absorbed by target this turn.
+        total_damage = min(total_sent, max(0, prev_ships - int(tgt.ships)))
         if prev_owner == -1:
+            # Failed neutral attack: no kill credit (killing neutrals does
+            # not count as "enemy_killed"). Fleet is fully lost.
             return FleetOutcome(False, False, False, False,
                                 failed_neutral_attack=True,
-                                own_waste=fl.ships_sent)
+                                own_waste=fl.ships_sent,
+                                my_total_ships_at_launch=empire)
         return FleetOutcome(False, True, False, False,
-                            enemy_ships_killed=killed,
-                            own_waste=fl.ships_sent)
+                            enemy_ships_killed=float(total_damage) * share,
+                            own_waste=fl.ships_sent,
+                            my_total_ships_at_launch=empire)
 
 
 def compute_fleet_reward(outcome: FleetOutcome, *, capture_weight: float = 0.05,
@@ -183,10 +234,31 @@ def compute_fleet_reward(outcome: FleetOutcome, *, capture_weight: float = 0.05,
     return 0.0
 
 
-def compute_production_simple_fleet_combat_reward(outcome: FleetOutcome) -> float:
+def compute_production_simple_fleet_combat_reward(
+    outcome: FleetOutcome,
+    *,
+    fallback_denominator: float = 100.0,
+    reward_scale: float = 0.001,
+) -> float:
+    """Empire-relative combat reward.
+
+    The signal is normalized by the launching player's total empire ship
+    count *at launch time* so that:
+      - A 20-ship loss out of 200 is small (-0.1).
+      - The same 20-ship loss out of 50 is big (-0.4).
+
+    This makes exploration cheap for big empires (where they can afford
+    to take risks) and discourages reckless launches when ships are
+    scarce. The kill bonus uses the same denominator for symmetry.
+    """
     if outcome.self_reinforce:
         return 0.0
-    reward = -float(outcome.own_waste)
+    denom = float(outcome.my_total_ships_at_launch)
+    if denom <= 0.0:
+        denom = float(fallback_denominator)
+    reward = 0.0
     if outcome.captured_from_enemy or outcome.killed_enemy_ships:
-        reward += float(outcome.enemy_ships_killed)
-    return reward
+        reward += float(outcome.enemy_ships_killed) / denom
+    elif outcome.destroyed_enroute:
+        reward -= float(outcome.own_waste) / denom
+    return reward * float(reward_scale)

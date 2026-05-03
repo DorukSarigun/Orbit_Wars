@@ -503,7 +503,7 @@ def build_observation(
 DEFAULT_SHIP_BINS = (0.1, 0.25, 0.5, 0.75, 1.0)
 
 
-def decode_action(
+def decode_action_with_launch(
     obs: Observation,
     src_slot: int,
     tgt_slot: int,
@@ -513,18 +513,7 @@ def decode_action(
     planets: Optional[list[Planet]] = None,
     angular_velocity: float = 0.0,
     no_op: bool = False,
-) -> Optional[list]:
-    """Convert a (src_slot, tgt_slot, ship_bin) policy choice into the
-    env's action format `[from_id, angle, ships]`.
-
-    Returns None if the action is a no-op or invalid (e.g., target == source,
-    no valid trajectory). The actual launch geometry is resolved by
-    `navigation.compute_launch`; the caller passes the parsed planets to
-    avoid re-parsing.
-
-    The model picks slots (0..p_max-1); we map them back to env planet ids
-    via `obs.planet_ids`.
-    """
+) -> Optional[tuple[list, dict]]:
     if no_op:
         return None
     src_id = int(obs.planet_ids[src_slot])
@@ -554,4 +543,41 @@ def decode_action(
     launch = compute_launch(src, tgt, ships, planets, angular_velocity)
     if launch is None:
         return None
-    return [src.id, launch["angle"], launch["ships"]]
+    return [src.id, launch["angle"], launch["ships"]], launch
+
+
+def decode_action(
+    obs: Observation,
+    src_slot: int,
+    tgt_slot: int,
+    ship_bin: int,
+    *,
+    ship_bins: tuple = DEFAULT_SHIP_BINS,
+    planets: Optional[list[Planet]] = None,
+    angular_velocity: float = 0.0,
+    no_op: bool = False,
+) -> Optional[list]:
+    """Convert a (src_slot, tgt_slot, ship_bin) policy choice into the
+    env's action format `[from_id, angle, ships]`.
+
+    Returns None if the action is a no-op or invalid (e.g., target == source,
+    no valid trajectory). The actual launch geometry is resolved by
+    `navigation.compute_launch`; the caller passes the parsed planets to
+    avoid re-parsing.
+
+    The model picks slots (0..p_max-1); we map them back to env planet ids
+    via `obs.planet_ids`.
+    """
+    decoded = decode_action_with_launch(
+        obs,
+        src_slot,
+        tgt_slot,
+        ship_bin,
+        ship_bins=ship_bins,
+        planets=planets,
+        angular_velocity=angular_velocity,
+        no_op=no_op,
+    )
+    if decoded is None:
+        return None
+    return decoded[0]

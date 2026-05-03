@@ -25,7 +25,7 @@ class PPOConfig:
     epochs: int = 4
     batch_size: int = 256
     value_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.05
     max_grad_norm: float = 0.5
 
 

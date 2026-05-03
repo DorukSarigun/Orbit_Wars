@@ -24,7 +24,7 @@ from kaggle_environments import make
 from feature_extraction import parse_planets, fleet_speed
 from obs_builder import (
     build_observation,
-    decode_action,
+    decode_action_with_launch,
     INCOMING_ETA_BUCKETS,
     PF_IDX_SHIPS,
     PF_IDX_INCOMING_SELF_B0,
@@ -40,7 +40,6 @@ from .planet_loss_tracker import PlanetLossTracker, compute_planet_loss_launch_p
 from .production_reward_tracker import (
     ProductionRewardTracker,
     compute_production_capture_reward,
-    compute_production_planet_loss_penalty,
 )
 
 
@@ -52,10 +51,19 @@ def _incoming_bucket_idx(eta: float) -> int:
 
 
 def _compute_airborne_cost(*, ships_sent: int, est_distance: float, weight: float,
-                           speed: Optional[float] = None) -> float:
+                           speed: Optional[float] = None,
+                           risk_multiplier: float = 1.0) -> float:
+    """Time-cost penalty for keeping ships airborne.
+
+    `risk_multiplier` scales the cost up for launches from threatened
+    planets (and especially for launches that leave a threatened planet
+    near-defenseless). A safe launch uses 1.0; a risky one can grow up
+    to ~5x.
+    """
     speed = fleet_speed(ships_sent) if speed is None else speed
     eta = est_distance / max(speed, 1e-6)
-    return -float(weight) * int(ships_sent) * eta
+    base = float(weight) * int(ships_sent) * eta
+    return -base * float(max(risk_multiplier, 0.0))
 
 
 def _planet_under_enemy_attack(obs, slot: int) -> bool:
@@ -65,6 +73,52 @@ def _planet_under_enemy_attack(obs, slot: int) -> bool:
             PF_IDX_INCOMING_ENEMY_B0:PF_IDX_INCOMING_ENEMY_B0 + len(INCOMING_ETA_BUCKETS),
         ].sum() > 0.0
     )
+
+
+def _enemy_incoming_ships(obs, slot: int) -> float:
+    return float(
+        obs.planet_feats[
+            slot,
+            PF_IDX_INCOMING_ENEMY_B0:PF_IDX_INCOMING_ENEMY_B0 + len(INCOMING_ETA_BUCKETS),
+        ].sum()
+    ) * 500.0
+
+
+def _source_threat_intensity(obs, slot: int, ships_remaining_after_launch: int) -> float:
+    """Approximate threat-to-remaining ratio for a source planet.
+
+    Enemy incoming ETA buckets store ships/500.0 (see rollout's
+    self-bucket update), so multiplying the bucket sum by 500 gives an
+    approximate raw enemy ship count en route to this planet. Dividing
+    by `ships_remaining_after_launch` produces a threat intensity in
+    units of "incoming enemy ships per defender". 0 means safe.
+    """
+    raw_enemy = _enemy_incoming_ships(obs, slot)
+    if raw_enemy <= 0.0:
+        return 0.0
+    denom = float(max(int(ships_remaining_after_launch), 1))
+    return raw_enemy / denom
+
+
+def _compute_source_defense_deficit_penalty(*, enemy_incoming: float,
+                                            ships_remaining_after_launch: int,
+                                            weight: float = 1.0) -> float:
+    deficit = max(0.0, float(enemy_incoming) - float(max(0, int(ships_remaining_after_launch))))
+    return -float(weight) * deficit
+
+
+def _airborne_risk_multiplier(threat_intensity: float, *,
+                              base_threat_mult: float = 2.0,
+                              cap: float = 3.0) -> float:
+    """Map threat_intensity to a risk multiplier in [1, base+cap].
+
+    threat_intensity = 0   -> 1.0   (safe)
+    threat_intensity = 1   -> ~3.0  (incoming ~= remaining)
+    threat_intensity >= 3  -> 5.0   (overrun risk)
+    """
+    if threat_intensity <= 0.0:
+        return 1.0
+    return 1.0 + base_threat_mult * min(float(threat_intensity), float(cap))
 
 
 @dataclass
@@ -104,6 +158,7 @@ def _act_for_player(
                             p_max=policy.p_max, f_max=policy.f_max,
                             planet_feature_dim=policy.planet_dim)
     parsed = parse_planets(env_obs)
+    my_total_ships = sum(int(p.ships) for p in parsed if p.owner == player and not p.is_comet)
     env_action = []
     decisions = []
     launch_count = 0
@@ -135,10 +190,12 @@ def _act_for_player(
         tgt_slot = int(action["tgt"][0])
         ship_bin = int(action["ship_bin"][0])
         is_noop = bool(action["is_noop"][0])
-        move = decode_action(
+        decoded = decode_action_with_launch(
             obs_decision, src_slot, tgt_slot, ship_bin,
             planets=parsed, angular_velocity=angular_velocity, no_op=is_noop,
         )
+        move = None if decoded is None else decoded[0]
+        launch_info = None if decoded is None else decoded[1]
         if move is not None:
             env_action.append(move)
             launch_count += 1
@@ -150,12 +207,21 @@ def _act_for_player(
             tgt_planet_id = int(obs_decision.planet_ids[tgt_slot])
             src_planet = next((p for p in parsed if p.id == src_planet_id), None)
             tgt_planet = next((p for p in parsed if p.id == tgt_planet_id), None)
+            speed = fleet_speed(int(sent_ships))
             distance = 0.0
-            if src_planet and tgt_planet:
+            eta = float(launch_info["eta"]) if launch_info is not None else 0.0
+            if eta > 0.0:
+                distance = eta * max(speed, 1e-6)
+            elif src_planet and tgt_planet:
                 distance = math.hypot(src_planet.x - tgt_planet.x, src_planet.y - tgt_planet.y)
-            eta = distance / max(fleet_speed(int(sent_ships)), 1e-6)
+                eta = distance / max(speed, 1e-6)
             bucket = _incoming_bucket_idx(eta)
             obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 500.0
+            # Source-planet threat assessment (used for risk-aware airborne).
+            src_ships_pre = int(round(float(obs_decision.planet_feats[src_slot, PF_IDX_SHIPS]) * 100.0))
+            src_ships_remaining = max(0, src_ships_pre - int(sent_ships))
+            source_enemy_incoming = _enemy_incoming_ships(obs_decision, src_slot)
+            source_threat = _source_threat_intensity(obs_decision, src_slot, src_ships_remaining)
             # Prepare fleet tracking metadata for later reward assignment.
             fleet_meta = {
                 "launch_turn": current_turn,
@@ -169,28 +235,11 @@ def _act_for_player(
                 "launch_tgt_owner": int(tgt_planet.owner) if tgt_planet else -2,
                 "launch_tgt_ships": int(tgt_planet.ships) if tgt_planet else 0,
                 "source_had_enemy_incoming": _planet_under_enemy_attack(obs_decision, src_slot),
-                "defense_miss_candidates": [],
+                "source_enemy_incoming": float(source_enemy_incoming),
+                "source_ships_remaining_after_launch": int(src_ships_remaining),
+                "source_threat_intensity": float(source_threat),
+                "my_total_ships_at_launch": int(my_total_ships),
             }
-            for threatened_slot, planet_id in enumerate(obs_decision.planet_ids):
-                if planet_id < 0 or threatened_slot >= len(obs_decision.planet_mask):
-                    continue
-                if not obs_decision.planet_mask[threatened_slot]:
-                    continue
-                threatened_planet = next((p for p in parsed if p.id == int(planet_id)), None)
-                if threatened_planet is None or threatened_planet.owner != player:
-                    continue
-                if not _planet_under_enemy_attack(obs_decision, threatened_slot):
-                    continue
-                if int(planet_id) != src_planet_id and tgt_planet_id == int(planet_id):
-                    continue
-                defense_distance = 0.0
-                if src_planet:
-                    defense_distance = math.hypot(src_planet.x - threatened_planet.x, src_planet.y - threatened_planet.y)
-                defense_eta = defense_distance / max(fleet_speed(int(sent_ships)), 1e-6)
-                fleet_meta["defense_miss_candidates"].append({
-                    "threatened_planet_id": int(planet_id),
-                    "est_defense_arrival_turn": current_turn + defense_eta,
-                })
         else:
             fleet_meta = None
             if not is_noop:
@@ -278,7 +327,10 @@ def collect_episode(
             fleet_trackers[p].observe_turn(t, new_obs[p], p)
             for buffer_idx, outcome in fleet_trackers[p].pop_resolved(p):
                 if reward_cfg.reward_system == "production_simple":
-                    fleet_reward = compute_production_simple_fleet_combat_reward(outcome)
+                    fleet_reward = compute_production_simple_fleet_combat_reward(
+                        outcome,
+                        reward_scale=reward_cfg.reward_scale,
+                    )
                 else:
                     fleet_reward = compute_fleet_reward(
                         outcome,
@@ -297,7 +349,13 @@ def collect_episode(
                 )
 
         terminal = any(s.status == "DONE" for s in new_state) or env.done or (t == max_steps - 1)
-        terminal_rewards = normalize_terminal_rewards([float(s.reward or 0.0) for s in new_state]) if terminal else [0.0 for _ in range(num_agents)]
+        terminal_rewards = (
+            normalize_terminal_rewards(
+                [float(s.reward or 0.0) for s in new_state],
+                draw_value=reward_cfg.draw_terminal_reward,
+            )
+            if terminal else [0.0 for _ in range(num_agents)]
+        )
         rewards = [
             compute_step_reward(
                 env_obs[p], new_obs[p], p,
@@ -343,12 +401,23 @@ def collect_episode(
                 # Register fleet launch for delayed reward tracking.
                 if launched and fleet_meta is not None:
                     defense_trackers[p].cancel_planet(fleet_meta["src_planet_id"])
+                    risk_mult = _airborne_risk_multiplier(
+                        fleet_meta["source_threat_intensity"],
+                    )
                     airborne_cost = _compute_airborne_cost(
                         ships_sent=fleet_meta["ships_sent"],
                         est_distance=fleet_meta["distance"],
                         weight=reward_cfg.fleet_airborne_weight,
-                    )
+                        risk_multiplier=risk_mult,
+                    ) * reward_cfg.reward_scale
                     buffer.add_reward(idx, airborne_cost)
+                    if reward_cfg.reward_system == "production_simple":
+                        defense_deficit_penalty = _compute_source_defense_deficit_penalty(
+                            enemy_incoming=fleet_meta["source_enemy_incoming"],
+                            ships_remaining_after_launch=fleet_meta["source_ships_remaining_after_launch"],
+                            weight=reward_cfg.planet_loss_weight,
+                        ) * reward_cfg.reward_scale
+                        buffer.add_reward(idx, defense_deficit_penalty)
                     fleet_trackers[p].register_launch(
                         buffer_idx=idx,
                         launch_turn=fleet_meta["launch_turn"],
@@ -360,6 +429,7 @@ def collect_episode(
                         est_distance=fleet_meta["distance"],
                         launch_tgt_owner=fleet_meta["launch_tgt_owner"],
                         launch_tgt_ships=fleet_meta["launch_tgt_ships"],
+                        my_total_ships_at_launch=fleet_meta["my_total_ships_at_launch"],
                     )
                     if reward_cfg.reward_system == "production_simple":
                         production_trackers[p].register_capture_launch(
@@ -371,15 +441,6 @@ def collect_episode(
                             est_arrival_turn=fleet_meta["launch_turn"] + fleet_meta["eta"],
                             launch_target_owner=fleet_meta["launch_tgt_owner"],
                         )
-                        for candidate in fleet_meta["defense_miss_candidates"]:
-                            production_trackers[p].register_defense_miss_candidate(
-                                buffer_idx=idx,
-                                launch_turn=fleet_meta["launch_turn"],
-                                player=fleet_meta["player"],
-                                threatened_planet_id=candidate["threatened_planet_id"],
-                                ships_sent=fleet_meta["ships_sent"],
-                                est_defense_arrival_turn=candidate["est_defense_arrival_turn"],
-                            )
                     else:
                         planet_loss_trackers[p].register_launch(
                             buffer_idx=idx,
@@ -421,14 +482,10 @@ def collect_episode(
                 for buffer_idx, outcome in production_trackers[p].pop_capture_resolved(p):
                     buffer.add_delayed_reward(
                         buffer_idx,
-                        compute_production_capture_reward(outcome),
-                        event_turn=t,
-                        discount=reward_cfg.delayed_reward_discount,
-                    )
-                for buffer_idx, outcome in production_trackers[p].pop_loss_resolved(p):
-                    buffer.add_delayed_reward(
-                        buffer_idx,
-                        compute_production_planet_loss_penalty(outcome),
+                        compute_production_capture_reward(
+                            outcome,
+                            reward_scale=reward_cfg.reward_scale,
+                        ),
                         event_turn=t,
                         discount=reward_cfg.delayed_reward_discount,
                     )

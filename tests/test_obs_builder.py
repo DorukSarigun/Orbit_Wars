@@ -23,6 +23,7 @@ from obs_builder import (
     Observation,
     build_observation,
     decode_action,
+    decode_action_with_launch,
 )
 
 
@@ -316,3 +317,18 @@ def test_decode_action_valid_returns_env_format():
     assert action[0] == 0  # source planet id
     assert isinstance(action[1], float)  # angle
     assert action[2] >= 1  # at least 1 ship
+
+
+def test_decode_action_with_launch_exposes_intercept_eta_for_moving_target():
+    obs = make_obs(planets=[
+        [0, 0, 80.0, 20.0, 2.0, 100, 2],
+        [1, -1, 80.0, 50.0, 2.0, 20, 1],
+    ])
+    o = build_observation(obs, player=0, angular_velocity=0.05)
+    from feature_extraction import fleet_speed, parse_planets
+    planets = parse_planets(obs)
+    decoded = decode_action_with_launch(o, 0, 1, 4, planets=planets, angular_velocity=0.05)
+    assert decoded is not None
+    action, launch = decoded
+    direct_eta = math.hypot(80.0 - 80.0, 20.0 - 50.0) / fleet_speed(action[2])
+    assert launch["eta"] > direct_eta + 1.0

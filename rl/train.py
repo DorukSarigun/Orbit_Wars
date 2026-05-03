@@ -54,6 +54,8 @@ class TrainConfig:
     n_heads: int = 4
     n_layers: int = 4
     model_variant: str = "planet_only"
+    save_game_batches: bool = False
+    batch_save_dir: str = "checkpoints/game_batches"
 
 
 def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
@@ -85,6 +87,28 @@ def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int
             "n_ship_bins": policy.n_ship_bins,
             "model_variant": getattr(policy, "model_variant", "full"),
         },
+    }, path)
+
+
+def _save_game_batch(buffer: RolloutBuffer, start_idx: int, end_idx: int, path: Path, *,
+                     iteration: int, episode: int, seed: int, stats,
+                     train_cfg: TrainConfig, ppo_cfg: PPOConfig,
+                     reward_cfg: RewardConfig) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    indices = list(range(int(start_idx), int(end_idx)))
+    batch = buffer.batch_from_indices(indices, normalize_advantages=False)
+    torch.save({
+        "iteration": int(iteration),
+        "episode": int(episode),
+        "seed": int(seed),
+        "transition_start": int(start_idx),
+        "transition_end": int(end_idx),
+        "num_transitions": len(indices),
+        "episode_stats": asdict(stats),
+        "train_cfg": asdict(train_cfg),
+        "ppo_cfg": asdict(ppo_cfg),
+        "reward_cfg": asdict(reward_cfg),
+        "batch": batch,
     }, path)
 
 
@@ -150,6 +174,7 @@ def train(
         ep_stats_list = []
         for ep in range(train_cfg.episodes_per_iter):
             seed = train_cfg.seed * 100000 + it * 1000 + ep
+            start_idx = len(buffer)
             stats = collect_episode(
                 policy, buffer,
                 max_steps=train_cfg.max_episode_steps,
@@ -158,12 +183,32 @@ def train(
                 device=device,
                 seed=seed,
             )
-            ep_stats_list.append(stats)
+            end_idx = len(buffer)
+            ep_stats_list.append((ep, start_idx, end_idx, seed, stats))
 
         # Bootstrap value for GAE: 0 since each episode ends terminally.
         # (collect_episode already sets done=True at the last stored step.)
         buffer.compute_gae(last_value=0.0,
                            gamma=train_cfg.gamma, lam=train_cfg.gae_lambda)
+        if train_cfg.save_game_batches:
+            for ep, start_idx, end_idx, seed, stats in ep_stats_list:
+                batch_path = (
+                    Path(train_cfg.batch_save_dir)
+                    / f"iter{it:05d}_game{ep:03d}_seed{seed}.pt"
+                )
+                _save_game_batch(
+                    buffer,
+                    start_idx,
+                    end_idx,
+                    batch_path,
+                    iteration=it,
+                    episode=ep,
+                    seed=seed,
+                    stats=stats,
+                    train_cfg=train_cfg,
+                    ppo_cfg=ppo_cfg,
+                    reward_cfg=reward_cfg,
+                )
         # Snapshot weights before PPO so we can compute per-module update norms.
         snap = WeightSnapshot(policy)
         ppo_stats = ppo_update(policy, buffer, optimizer, ppo_cfg, device=device)
@@ -173,16 +218,17 @@ def train(
         update_ratios = snap.compute_update_ratios(policy)
         current_lr = optimizer.param_groups[0]["lr"]
 
+        stats_only = [item[4] for item in ep_stats_list]
         wins_by_player = {
-            f"p{p}": sum(1 for s in ep_stats_list if s.winner == p)
+            f"p{p}": sum(1 for s in stats_only if s.winner == p)
             for p in range(train_cfg.num_agents)
         }
         wins_p0 = wins_by_player.get("p0", 0)
         wins_p1 = wins_by_player.get("p1", 0)
-        draws = sum(1 for s in ep_stats_list if s.winner == -1)
-        avg_len = sum(s.length for s in ep_stats_list) / len(ep_stats_list)
+        draws = sum(1 for s in stats_only if s.winner == -1)
+        avg_len = sum(s.length for s in stats_only) / len(stats_only)
         avg_launches = sum(sum(s.n_launches) / max(1, len(s.n_launches))
-                           for s in ep_stats_list) / len(ep_stats_list)
+                           for s in stats_only) / len(stats_only)
         elapsed = time.time() - t0
 
         log = {
@@ -263,12 +309,15 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--model-variant", choices=("full", "planet_only"), default="planet_only")
+    p.add_argument("--save-game-batches", action="store_true",
+                   help="Save one .pt rollout/training batch per self-play game after GAE")
+    p.add_argument("--batch-save-dir", default="checkpoints/game_batches")
     p.add_argument("--clip-range", type=float, default=0.2)
     p.add_argument("--ppo-epochs", type=int, default=4, dest="epochs",
                    help="Number of optimization epochs over each rollout buffer "
                         "(inner PPO update; not the outer training-epoch count)")
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--entropy-coef", type=float, default=0.01)
+    p.add_argument("--entropy-coef", type=float, default=0.05)
     p.add_argument("--reward-system", choices=REWARD_SYSTEMS, default="current",
                    help="Reward preset to start from; individual reward flags override it.")
     p.add_argument("--capture-value-weight", type=float, default=None,
@@ -301,6 +350,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--delayed-reward-discount", type=float, default=None,
                    help="Multiplier per delayed-credit step: reward *= discount ** delay")
     p.add_argument("--invalid-action-penalty", type=float, default=None)
+    p.add_argument("--reward-scale", type=float, default=None)
+    p.add_argument("--draw-terminal-reward", type=float, default=None)
     p.add_argument("--eligibility-trace-horizon", type=int, default=None,
                    help="Deprecated; step rewards are no longer distributed backward.")
     p.add_argument("--eligibility-trace-decay", type=float, default=None,
@@ -327,6 +378,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         device=args.device,
         d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
         model_variant=args.model_variant,
+        save_game_batches=args.save_game_batches,
+        batch_save_dir=args.batch_save_dir,
     )
     ppo_cfg = PPOConfig(
         clip_range=args.clip_range,
@@ -356,6 +409,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         defense_arrival_window=args.defense_arrival_window,
         delayed_reward_discount=args.delayed_reward_discount,
         invalid_action_penalty=args.invalid_action_penalty,
+        reward_scale=args.reward_scale,
+        draw_terminal_reward=args.draw_terminal_reward,
         eligibility_trace_horizon=args.eligibility_trace_horizon,
         eligibility_trace_decay=args.eligibility_trace_decay,
         noop_trace_weight=args.noop_trace_weight,

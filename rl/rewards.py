@@ -87,6 +87,8 @@ class RewardConfig:
     defense_arrival_window: float = 1.5
     delayed_reward_discount: float = 1.0
     invalid_action_penalty: float = 0.01
+    reward_scale: float = 1.0
+    draw_terminal_reward: float = 0.0
     step_cost: float = 0.0              # tiny per-step alive cost (typically 0 or negative)
     # Deprecated compatibility knobs. Step-level shaping is no longer spread
     # backward over recent actions; rollout assigns it only to the transitions
@@ -131,14 +133,18 @@ def build_reward_config(reward_system: str = "current", **overrides) -> RewardCo
             denial_value_weight=0.0,
             ship_diff_weight=0.0,
             ship_loss_weight=0.0,
-            fleet_airborne_weight=0.01,
+            # NOTE: airborne is risk-aware in rollout and intentionally
+            # uses an unnormalized base weight in production_simple.
+            fleet_airborne_weight=1.0,
             fleet_capture_weight=0.0,
             fleet_kill_weight=1.0,
             fleet_waste_weight=1.0,
             enemy_capture_radius_weight=0.0,
             planet_loss_weight=1.0,
             defense_hold_weight=0.0,
-            delayed_reward_discount=0.995,
+            delayed_reward_discount=1.0,
+            reward_scale=0.001,
+            draw_terminal_reward=-1.0,
             planet_diff_weight=0.0,
         )
     else:
@@ -212,13 +218,13 @@ def _current_turn(env_obs) -> int:
     return int(getattr(env_obs, "step", 0) or 0)
 
 
-def normalize_terminal_rewards(raw_rewards: list[float]) -> list[float]:
+def normalize_terminal_rewards(raw_rewards: list[float], *, draw_value: float = 0.0) -> list[float]:
     if not raw_rewards:
         return []
     best_reward = max(raw_rewards)
     winners = [i for i, r in enumerate(raw_rewards) if r == best_reward]
     if len(winners) != 1 or best_reward <= 0:
-        return [0.0 for _ in raw_rewards]
+        return [float(draw_value) for _ in raw_rewards]
     winner = winners[0]
     return [1.0 if i == winner else -1.0 for i in range(len(raw_rewards))]
 

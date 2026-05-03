@@ -13,7 +13,7 @@ side), which doubles the data collected per environment step.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import numpy as np
 import torch
@@ -136,6 +136,15 @@ class RolloutBuffer:
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                          for k, v in batch.items()}
             yield batch
+
+    def batch_from_indices(self, indices: Sequence[int] | np.ndarray, *,
+                           normalize_advantages: bool = True) -> dict:
+        assert self._advantages is not None, "Call compute_gae() first"
+        idx = np.asarray(indices, dtype=np.int64)
+        adv = self._advantages.copy()
+        if normalize_advantages:
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        return self._stack(idx, adv)
 
     # ----------------------------------------------------------- helpers
     def _stack(self, idx: np.ndarray, adv_norm: np.ndarray) -> dict:
