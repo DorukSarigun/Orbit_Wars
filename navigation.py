@@ -113,16 +113,17 @@ def find_intercepts(
     speed = fleet_speed(ships, max_speed)
     if speed <= 0.0:
         return []
+    spawn_offset = src.radius + 0.1
 
     # ---- Static target: single closed-form solution ----
     if target.is_static:
         d = math.hypot(target.x - src.x, target.y - src.y)
-        return [(d / speed, target.x, target.y)]
+        return [(max(0.0, (d - spawn_offset) / speed), target.x, target.y)]
 
     # ---- Moving target: scan f(t) for sign changes, bisect each ----
     def f(t: float) -> float:
         tx, ty = target.position_at(t, angular_velocity=angular_velocity)
-        return math.hypot(tx - src.x, ty - src.y) - speed * t
+        return math.hypot(tx - src.x, ty - src.y) - spawn_offset - speed * t
 
     results: list[tuple[float, float, float]] = []
 
@@ -210,13 +211,11 @@ def path_collision(
         t_next = min(t + sample_step, t_arrival)
         nx, ny = fleet_pos(t_next)
         for p in other_planets:
-            if p.id == src.id:
-                continue
             threshold = p.radius + extra_margin
             # (1) Fleet movement check: planet at START of interval
             #     (= end of previous turn = before this turn's rotation).
             px0, py0 = p.position_at(t, angular_velocity=angular_velocity)
-            if segment_min_dist_to_point(fx, fy, nx, ny, px0, py0) < threshold:
+            if p.id != src.id and segment_min_dist_to_point(fx, fy, nx, ny, px0, py0) < threshold:
                 return p.id
             # (2) Planet sweep check: planet rotates from pos0 to pos1 while
             #     fleet sits at its new position.
@@ -276,9 +275,8 @@ def compute_launch(
     if speed <= 0.0:
         return None
 
-    # We exclude src itself (we spawn outside its radius) and target
-    # (we WANT to hit target). Keep everything else as a potential blocker.
-    other = [p for p in planets if p.id != src.id and p.id != target.id]
+    # Exclude target because reaching it is the goal; keep source so planet sweep can block launches.
+    other = [p for p in planets if p.id != target.id]
 
     candidates = find_intercepts(
         src, target, ships, angular_velocity,
@@ -359,6 +357,7 @@ def find_intercepts_from(
     *,
     t_offset: float = 0.0,
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
+    launch_offset: float = 0.0,
     t_max: float = 500.0,
     coarse_step: float = 0.5,
     bisect_iters: int = 40,
@@ -378,11 +377,11 @@ def find_intercepts_from(
     # Static targets: closed form, regardless of t_offset.
     if target.is_static:
         d = math.hypot(target.x - src_x, target.y - src_y)
-        return [(d / speed, target.x, target.y)]
+        return [(max(0.0, (d - launch_offset) / speed), target.x, target.y)]
 
     def f(t: float) -> float:
         tx, ty = target.position_at(t_offset + t, angular_velocity=angular_velocity)
-        return math.hypot(tx - src_x, ty - src_y) - speed * t
+        return math.hypot(tx - src_x, ty - src_y) - launch_offset - speed * t
 
     results: list[tuple[float, float, float]] = []
     t_prev, f_prev = 0.0, f(0.0)
@@ -427,6 +426,7 @@ def path_collision_from(
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     sample_step: float = 1.0,
     extra_margin: float = 0.1,
+    ignore_movement_planet_id: Optional[int] = None,
 ) -> Optional[int]:
     """Generalized path_collision: launch from arbitrary (src_x, src_y) at
     absolute time t_offset; check planet positions at (t_offset + t)."""
@@ -451,7 +451,7 @@ def path_collision_from(
             # (1) Fleet movement check: planet at START of interval.
             px0, py0 = p.position_at(t_offset + t,
                                      angular_velocity=angular_velocity)
-            if segment_min_dist_to_point(fx, fy, nx, ny, px0, py0) < threshold:
+            if p.id != ignore_movement_planet_id and segment_min_dist_to_point(fx, fy, nx, ny, px0, py0) < threshold:
                 return p.id
             # (2) Planet sweep check: planet moves, fleet sits at new pos.
             px1, py1 = p.position_at(t_offset + t_next,
@@ -491,11 +491,13 @@ def compute_launch_at(
         return None
 
     sx_launch, sy_launch = src.position_at(t_offset, angular_velocity=angular_velocity)
-    other = [p for p in planets if p.id != src.id and p.id != target.id]
+    # Exclude target because reaching it is the goal; keep source so planet sweep can block launches.
+    other = [p for p in planets if p.id != target.id]
 
     candidates = find_intercepts_from(
         sx_launch, sy_launch, target, ships, angular_velocity,
-        t_offset=t_offset, max_speed=max_speed, t_max=t_max,
+        t_offset=t_offset, max_speed=max_speed, launch_offset=src.radius + 0.1,
+        t_max=t_max,
         max_results=max_candidates,
     )
 
@@ -516,6 +518,7 @@ def compute_launch_at(
             other, angular_velocity,
             t_offset=t_offset, max_speed=max_speed,
             extra_margin=planet_margin,
+            ignore_movement_planet_id=src.id,
         )
         if blocker is not None:
             continue

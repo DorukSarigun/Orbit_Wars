@@ -165,7 +165,7 @@ class TestFindInterceptsStatic:
         cands = find_intercepts(src, tgt, ships, angular_velocity=0.0)
         assert len(cands) == 1
         t_star, ix, iy = cands[0]
-        assert t_star == pytest.approx(30.0 / v)
+        assert t_star == pytest.approx((30.0 - src.radius - 0.1) / v)
         assert (ix, iy) == (40.0, 10.0)
 
     def test_zero_ships_empty(self):
@@ -190,7 +190,7 @@ class TestFindInterceptsRotating:
         cands = find_intercepts(src, tgt, ships, omega, max_results=4)
         assert len(cands) >= 1
         t_star, ix, iy = cands[0]
-        d = math.hypot(ix - src.x, iy - src.y)
+        d = math.hypot(ix - src.x, iy - src.y) - src.radius - 0.1
         assert d == pytest.approx(v * t_star, rel=1e-3)
 
     def test_candidates_ascending(self):
@@ -211,7 +211,7 @@ class TestFindInterceptsRotating:
         # May find 0 or 1; we just assert the answer (if any) is sane
         for t_star, ix, iy in cands:
             v = fleet_speed(1)
-            d = math.hypot(ix - src.x, iy - src.y)
+            d = math.hypot(ix - src.x, iy - src.y) - src.radius - 0.1
             assert d == pytest.approx(v * t_star, rel=1e-3)
 
 
@@ -226,8 +226,10 @@ class TestFindInterceptsFrom:
         omega = 0.03
 
         a = find_intercepts(src, tgt, ships, omega, max_results=3)
-        b = find_intercepts_from(src.x, src.y, tgt, ships, omega,
-                                 t_offset=0.0, max_results=3)
+        b = find_intercepts_from(
+            src.x, src.y, tgt, ships, omega,
+            t_offset=0.0, launch_offset=src.radius + 0.1, max_results=3,
+        )
         assert len(a) == len(b)
         for (ta, xa, ya), (tb, xb, yb) in zip(a, b):
             assert ta == pytest.approx(tb, rel=1e-4)
@@ -318,6 +320,14 @@ class TestPathCollision:
         # THE fix: this MUST now return 15 (previously silently passed).
         assert blocker_id == 15
 
+    def test_rotating_source_sweep_can_block_own_launch(self):
+        src = make_rotating(0, r=30, theta0=0.0, radius=2.0)
+        blocker_id = path_collision(
+            src, angle=math.pi / 2, ships=1, t_arrival=1.0,
+            other_planets=[src], angular_velocity=0.1, extra_margin=0.0,
+        )
+        assert blocker_id == src.id
+
 
 # =============================================================================
 # compute_launch (top-level)
@@ -353,7 +363,7 @@ class TestComputeLaunch:
         ships = 30
         result = compute_launch(src, tgt, ships, [src, tgt], 0.0)
         assert result is not None
-        d = 70.0
+        d = 70.0 - src.radius - 0.1
         assert result["eta"] == pytest.approx(d / fleet_speed(ships), rel=1e-3)
 
 
