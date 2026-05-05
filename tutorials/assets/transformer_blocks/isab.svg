@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="360" viewBox="0 0 1100 360" role="img" aria-labelledby="title desc">
+  <title id="title">ISAB Induced Self-Attention Block</title>
+  <desc id="desc">ISAB uses inducing points to summarize a large set and then lets each element read that summary.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.4; rx: 12; }
+      .set { fill: #dbeafe; stroke: #2563eb; stroke-width: 1.4; rx: 10; }
+      .ind { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.4; rx: 10; }
+      .block { fill: #fef3c7; stroke: #d97706; stroke-width: 1.4; rx: 12; }
+      .out { fill: #f3e8ff; stroke: #7e22ce; stroke-width: 1.4; rx: 10; }
+      .txt { font: 600 17px Arial, sans-serif; fill: #0f172a; }
+      .small { font: 14px Arial, sans-serif; fill: #334155; }
+      .math { font: 15px "DejaVu Sans Mono", Consolas, monospace; fill: #1e293b; }
+      .arrow { stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect class="bg" width="1100" height="360"/>
+  <rect class="panel" x="24" y="24" width="1052" height="312"/>
+
+  <text class="txt" x="50" y="60">ISAB: Induced Self-Attention Block</text>
+  <text class="small" x="50" y="86">Büyük setlerde full pairwise attention yerine inducing bottleneck kullanır.</text>
+
+  <rect class="set" x="58" y="152" width="128" height="70"/>
+  <text class="txt" x="103" y="180">X</text>
+  <text class="small" x="76" y="202">n set elemanı</text>
+
+  <rect class="ind" x="58" y="252" width="128" height="54"/>
+  <text class="txt" x="106" y="278">I</text>
+  <text class="small" x="75" y="297">m inducing</text>
+
+  <rect class="block" x="270" y="214" width="185" height="82"/>
+  <text class="txt" x="303" y="244">MAB(I, X)</text>
+  <text class="small" x="300" y="270">setten m özet çıkar</text>
+  <line class="arrow" x1="186" y1="187" x2="270" y2="236"/>
+  <line class="arrow" x1="186" y1="279" x2="270" y2="266"/>
+
+  <rect class="ind" x="520" y="226" width="130" height="58"/>
+  <text class="txt" x="576" y="252">H</text>
+  <text class="small" x="547" y="273">m özet token</text>
+  <line class="arrow" x1="455" y1="255" x2="520" y2="255"/>
+
+  <rect class="block" x="715" y="140" width="190" height="88"/>
+  <text class="txt" x="747" y="171">MAB(X, H)</text>
+  <text class="small" x="743" y="199">her eleman özeti okur</text>
+  <line class="arrow" x1="186" y1="187" x2="715" y2="172"/>
+  <line class="arrow" x1="650" y1="255" x2="715" y2="206"/>
+
+  <rect class="out" x="950" y="154" width="100" height="62"/>
+  <text class="txt" x="982" y="181">Z</text>
+  <text class="small" x="969" y="202">n çıktı</text>
+  <line class="arrow" x1="905" y1="184" x2="950" y2="184"/>
+
+  <text class="math" x="272" y="112">Full SAB: O(n^2 d)</text>
+  <text class="math" x="272" y="134">ISAB: yaklaşık O(n m d), m &lt;&lt; n</text>
+  <text class="small" x="50" y="324">Bedel: ilişki bilgisi H özetleri üzerinden taşınır; kazanç: büyük setlerde maliyet düşer.</text>
+</svg>

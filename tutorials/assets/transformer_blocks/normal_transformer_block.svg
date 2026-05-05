@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="330" viewBox="0 0 1100 330" role="img" aria-labelledby="title desc">
+  <title id="title">Normal Transformer Block</title>
+  <desc id="desc">Sequence transformer block with positional encoding, self-attention, feed-forward network, residual connections and masks.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.4; rx: 12; }
+      .box { fill: #e0f2fe; stroke: #0284c7; stroke-width: 1.4; rx: 10; }
+      .warn { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.4; rx: 10; }
+      .op { fill: #fef3c7; stroke: #d97706; stroke-width: 1.4; rx: 10; }
+      .txt { font: 600 17px Arial, sans-serif; fill: #0f172a; }
+      .small { font: 14px Arial, sans-serif; fill: #334155; }
+      .math { font: 15px "DejaVu Sans Mono", Consolas, monospace; fill: #1e293b; }
+      .arrow { stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .res { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 6 5; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect class="bg" width="1100" height="330"/>
+  <rect class="panel" x="24" y="24" width="1052" height="282"/>
+
+  <text class="txt" x="50" y="60">Normal / sekans Transformer bloğu</text>
+  <text class="small" x="50" y="86">Pozisyon bilgisi sırayı modele anlamlı sinyal olarak verir.</text>
+
+  <rect class="box" x="48" y="130" width="125" height="60"/>
+  <text class="txt" x="83" y="156">Token</text>
+  <text class="math" x="88" y="177">X</text>
+
+  <rect class="warn" x="48" y="220" width="125" height="54"/>
+  <text class="txt" x="71" y="244">Pozisyon</text>
+  <text class="math" x="78" y="264">E_pos</text>
+
+  <rect class="op" x="215" y="150" width="95" height="54"/>
+  <text class="txt" x="251" y="183">+</text>
+  <line class="arrow" x1="173" y1="160" x2="215" y2="170"/>
+  <line class="arrow" x1="173" y1="247" x2="215" y2="190"/>
+
+  <rect class="box" x="352" y="150" width="120" height="54"/>
+  <text class="txt" x="380" y="174">LayerNorm</text>
+  <line class="arrow" x1="310" y1="177" x2="352" y2="177"/>
+
+  <rect class="box" x="514" y="135" width="150" height="84"/>
+  <text class="txt" x="556" y="163">Self-Attn</text>
+  <text class="small" x="539" y="188">Q,K,V aynı diziden</text>
+  <text class="math" x="546" y="207">+ seq/mask</text>
+  <line class="arrow" x1="472" y1="177" x2="514" y2="177"/>
+
+  <rect class="op" x="706" y="150" width="90" height="54"/>
+  <text class="txt" x="739" y="183">+</text>
+  <line class="arrow" x1="664" y1="177" x2="706" y2="177"/>
+  <path class="res" d="M310 142 C390 92, 610 92, 750 142"/>
+
+  <rect class="box" x="838" y="150" width="95" height="54"/>
+  <text class="txt" x="867" y="174">FFN</text>
+  <text class="small" x="850" y="193">token-wise</text>
+  <line class="arrow" x1="796" y1="177" x2="838" y2="177"/>
+
+  <rect class="op" x="973" y="150" width="70" height="54"/>
+  <text class="txt" x="997" y="183">+</text>
+  <line class="arrow" x1="933" y1="177" x2="973" y2="177"/>
+  <path class="res" d="M796 214 C850 266, 940 266, 1007 214"/>
+
+  <text class="small" x="352" y="252">Sıra anlamlıysa doğru tercih</text>
+  <text class="small" x="352" y="275">Set verisinde absolute slot pozisyonu equivariance'ı kırar.</text>
+</svg>
