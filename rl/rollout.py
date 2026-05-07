@@ -21,7 +21,7 @@ from typing import Optional
 import torch
 from kaggle_environments import make
 
-from feature_extraction import parse_planets, fleet_speed
+from feature_extraction import parse_planets, parse_fleets, fleet_speed
 from obs_builder import (
     build_observation,
     decode_action_with_launch,
@@ -152,13 +152,23 @@ def _act_for_player(
     *,
     device: torch.device,
     current_turn: int = 0,
+    max_turns: int = 500,
 ) -> tuple:
     angular_velocity = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=angular_velocity,
                             p_max=policy.p_max, f_max=policy.f_max,
-                            planet_feature_dim=policy.planet_dim)
+                            planet_feature_dim=policy.planet_dim,
+                            max_turns=max_turns)
     parsed = parse_planets(env_obs)
+    parsed_fleets = parse_fleets(env_obs)
     my_total_ships = sum(int(p.ships) for p in parsed if p.owner == player and not p.is_comet)
+    my_total_ships += sum(int(f.ships) for f in parsed_fleets if f.owner == player)
+    enemy_total_ships = sum(
+        int(p.ships)
+        for p in parsed
+        if p.owner not in (player, -1) and not p.is_comet
+    )
+    enemy_total_ships += sum(int(f.ships) for f in parsed_fleets if f.owner not in (player, -1))
     env_action = []
     decisions = []
     launch_count = 0
@@ -239,6 +249,7 @@ def _act_for_player(
                 "source_ships_remaining_after_launch": int(src_ships_remaining),
                 "source_threat_intensity": float(source_threat),
                 "my_total_ships_at_launch": int(my_total_ships),
+                "enemy_total_ships_at_launch": int(enemy_total_ships),
             }
         else:
             fleet_meta = None
@@ -309,7 +320,8 @@ def collect_episode(
         # Both players act on the same underlying state but with their
         # own perspective (different feature normalization in obs_builder).
         acted = [
-            _act_for_player(policy, env_obs[p], p, device=device, current_turn=t)
+            _act_for_player(policy, env_obs[p], p, device=device, current_turn=t,
+                        max_turns=reward_cfg.max_turns)
             for p in range(num_agents)
         ]
         env_actions = []
@@ -329,6 +341,7 @@ def collect_episode(
                 if reward_cfg.reward_system == "production_simple":
                     fleet_reward = compute_production_simple_fleet_combat_reward(
                         outcome,
+                        kill_weight=reward_cfg.fleet_kill_weight,
                         reward_scale=reward_cfg.reward_scale,
                     )
                 else:
@@ -430,6 +443,7 @@ def collect_episode(
                         launch_tgt_owner=fleet_meta["launch_tgt_owner"],
                         launch_tgt_ships=fleet_meta["launch_tgt_ships"],
                         my_total_ships_at_launch=fleet_meta["my_total_ships_at_launch"],
+                        enemy_total_ships_at_launch=fleet_meta["enemy_total_ships_at_launch"],
                     )
                     if reward_cfg.reward_system == "production_simple":
                         production_trackers[p].register_capture_launch(

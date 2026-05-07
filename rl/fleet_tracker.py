@@ -25,6 +25,7 @@ class FleetLaunch:
     last_tgt_owner: int = -2
     last_tgt_ships: int = 0
     my_total_ships_at_launch: int = 0
+    enemy_total_ships_at_launch: int = 0
 
 
 @dataclass
@@ -41,6 +42,7 @@ class FleetOutcome:
     enemy_ships_killed: float = 0.0
     own_waste: float = 0.0
     my_total_ships_at_launch: int = 0
+    enemy_total_ships_at_launch: int = 0
 
 
 class FleetTracker:
@@ -53,7 +55,8 @@ class FleetTracker:
                         src_planet_id: int, tgt_planet_id: int, ships_sent: int,
                         angle: float, est_distance: float,
                         launch_tgt_owner: int = -2, launch_tgt_ships: int = 0,
-                        my_total_ships_at_launch: int = 0) -> str:
+                        my_total_ships_at_launch: int = 0,
+                        enemy_total_ships_at_launch: int = 0) -> str:
         key = (
             f"p{player}_t{launch_turn}_src{src_planet_id}_tgt{tgt_planet_id}"
             f"_s{ships_sent}_a{angle:.4f}_idx{buffer_idx}"
@@ -63,7 +66,8 @@ class FleetTracker:
                          tgt_planet_id, ships_sent, angle, launch_turn + eta,
                          launch_tgt_owner=launch_tgt_owner,
                          launch_tgt_ships=launch_tgt_ships,
-                         my_total_ships_at_launch=int(my_total_ships_at_launch))
+                         my_total_ships_at_launch=int(my_total_ships_at_launch),
+                         enemy_total_ships_at_launch=int(enemy_total_ships_at_launch))
         self._pending[key] = fl
         sig = (player, src_planet_id, ships_sent, angle)
         self._fleet_sig_map[sig] = key
@@ -142,6 +146,7 @@ class FleetTracker:
         the legacy semantics exactly.
         """
         empire = int(fl.my_total_ships_at_launch)
+        enemy_empire = int(fl.enemy_total_ships_at_launch)
         total_sent = (
             int(total_ships_sent_same_turn)
             if total_ships_sent_same_turn is not None
@@ -154,7 +159,8 @@ class FleetTracker:
             # Target despawned (e.g. comet) or fleet lost mid-flight.
             return FleetOutcome(False, False, True, False,
                                 own_waste=fl.ships_sent,
-                                my_total_ships_at_launch=empire)
+                                my_total_ships_at_launch=empire,
+                                enemy_total_ships_at_launch=enemy_empire)
         # Capture iff ownership flipped FROM not-mine TO mine.
         prev_owner = fl.last_tgt_owner if fl.last_tgt_owner != -2 else fl.launch_tgt_owner
         prev_ships = fl.last_tgt_ships if fl.last_tgt_owner != -2 else fl.launch_tgt_ships
@@ -165,7 +171,8 @@ class FleetTracker:
             # "self-pinging" exploit we explicitly do NOT reward.
             return FleetOutcome(False, False, False, True,
                                 own_waste=fl.ships_sent,
-                                my_total_ships_at_launch=empire)
+                                my_total_ships_at_launch=empire,
+                                enemy_total_ships_at_launch=enemy_empire)
         if (not was_mine) and is_mine_now:
             # CAPTURED: enemy_killed and own_waste are global quantities
             # (total kills = prev_ships; total waste absorbed by garrison =
@@ -185,6 +192,7 @@ class FleetTracker:
                 enemy_ships_killed=float(total_enemy_killed) * share,
                 own_waste=float(total_waste) * share,
                 my_total_ships_at_launch=empire,
+                enemy_total_ships_at_launch=enemy_empire,
             )
         # Arrived but didn't capture: we hit defended/neutral and bounced.
         # Total damage absorbed by target this turn.
@@ -195,11 +203,13 @@ class FleetTracker:
             return FleetOutcome(False, False, False, False,
                                 failed_neutral_attack=True,
                                 own_waste=fl.ships_sent,
-                                my_total_ships_at_launch=empire)
+                                my_total_ships_at_launch=empire,
+                                enemy_total_ships_at_launch=enemy_empire)
         return FleetOutcome(False, True, False, False,
                             enemy_ships_killed=float(total_damage) * share,
                             own_waste=fl.ships_sent,
-                            my_total_ships_at_launch=empire)
+                            my_total_ships_at_launch=empire,
+                            enemy_total_ships_at_launch=enemy_empire)
 
 
 def compute_fleet_reward(outcome: FleetOutcome, *, capture_weight: float = 0.05,
@@ -234,10 +244,21 @@ def compute_fleet_reward(outcome: FleetOutcome, *, capture_weight: float = 0.05,
     return 0.0
 
 
+def _combat_strength_factor(*, my_total_ships: int, enemy_total_ships: int,
+                            min_factor: float = -1.0,
+                            max_factor: float = 2.0) -> float:
+    enemy = float(enemy_total_ships)
+    mine = float(my_total_ships)
+    if enemy <= 0.0:
+        return 1.0 if mine > 0.0 else 0.0
+    return max(float(min_factor), min(float(max_factor), mine / enemy - 1.0))
+
+
 def compute_production_simple_fleet_combat_reward(
     outcome: FleetOutcome,
     *,
     fallback_denominator: float = 100.0,
+    kill_weight: float = 1.0,
     reward_scale: float = 0.001,
 ) -> float:
     """Empire-relative combat reward.
@@ -258,7 +279,11 @@ def compute_production_simple_fleet_combat_reward(
         denom = float(fallback_denominator)
     reward = 0.0
     if outcome.captured_from_enemy or outcome.killed_enemy_ships:
-        reward += float(outcome.enemy_ships_killed) / denom
+        strength_factor = _combat_strength_factor(
+            my_total_ships=outcome.my_total_ships_at_launch,
+            enemy_total_ships=outcome.enemy_total_ships_at_launch,
+        )
+        reward += float(kill_weight) * float(outcome.enemy_ships_killed) / denom * strength_factor
     elif outcome.destroyed_enroute:
         reward -= float(outcome.own_waste) / denom
     return reward * float(reward_scale)

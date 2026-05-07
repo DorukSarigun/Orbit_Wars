@@ -37,6 +37,7 @@ from feature_extraction import (
     Fleet,
     SUN_X,
     SUN_Y,
+    SUN_RADIUS,
     fleet_speed,
     parse_planets,
     parse_fleets,
@@ -53,7 +54,7 @@ F_MAX_DEFAULT = 64   # no env hard cap on in-flight fleets; 64 is a safe
                      # ceiling for both players' typical/peak load.
 
 MAX_ENEMY_INCOMING_SLOTS = 3
-PLANET_FEATURE_DIM = 31
+PLANET_FEATURE_DIM = 33
 INCOMING_ETA_BUCKETS = (5.0, 15.0, 30.0, float("inf"))
 
 # Planet feature index constants (derived from _planet_features order).
@@ -89,9 +90,11 @@ PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS = 27
 PF_IDX_INCOMING_ENEMY_LARGEST_SHIPS = 28
 PF_IDX_INCOMING_ENEMY_LARGEST_ETA = 29
 PF_IDX_INCOMING_NET_THREAT = 30
+PF_IDX_CAPTURE_VALUE = 31
+PF_IDX_DEFENSE_DEFICIT = 32
 FLEET_FEATURE_DIM = 11
-GLOBAL_FEATURE_DIM = 12
-EDGE_FEATURE_DIM = 5  # (dist_norm, dx_norm, dy_norm, sin(dphi_sun), cos(dphi_sun))
+GLOBAL_FEATURE_DIM = 14
+EDGE_FEATURE_DIM = 6  # + crosses_sun
 # The last two channels encode the angular difference between the two tokens
 # as seen from the sun (the orbital center). For two planets that share the
 # same angular velocity this difference is *time-invariant*, so the model
@@ -129,6 +132,9 @@ def _planet_features(
     omega: float,
     incoming: Optional[dict[str, Any]] = None,
     planet_feature_dim: int = PLANET_FEATURE_DIM,
+    *,
+    turn: int = 0,
+    max_turns: int = 500,
 ) -> np.ndarray:
     """Feature vector for a single planet."""
     is_self = float(p.owner == player)
@@ -161,6 +167,8 @@ def _planet_features(
     enemy_largest_ships = float(incoming.get("enemy_largest_ships", 0.0))
     enemy_largest_eta = float(incoming.get("enemy_largest_eta", 0.0))
     net_threat = enemy_total - ships - self_total if is_self else enemy_total - self_total
+    capture_value = prod * max(0.0, (max_turns - turn) / max(1, max_turns)) if not is_self else 0.0
+    defense_deficit = max(0.0, enemy_total - ships - prod * max(0.0, enemy_min_eta)) if is_self else 0.0
 
     feats = np.asarray([
         is_self,
@@ -194,6 +202,8 @@ def _planet_features(
         enemy_largest_ships / 500.0,
         min(enemy_largest_eta, 50.0) / 50.0 if enemy_largest_eta > 0.0 else 0.0,
         net_threat / 500.0,
+        capture_value / 50.0,
+        defense_deficit / 500.0,
     ], dtype=np.float32)
     return feats[:planet_feature_dim]
 
@@ -249,6 +259,8 @@ def _global_features(
     turn: int,
     incoming_self: int,
     incoming_other: int,
+    *,
+    max_turns: int = 500,
 ) -> np.ndarray:
     """12-dim global state summary."""
     my_planets = [p for p in planets if p.owner == player]
@@ -262,6 +274,12 @@ def _global_features(
     my_prod = sum(p.production for p in my_planets)
     enemy_prod = sum(p.production for p in enemy_planets)
 
+    remaining = max(0, max_turns - turn)
+    my_capture_value = my_prod * remaining / max(1, max_turns)
+    my_air = sum(f.ships for f in fleets if f.owner == player)
+    enemy_air = sum(f.ships for f in fleets if f.owner != player and f.owner != -1)
+    air_advantage = (my_air - enemy_air) / 500.0
+
     return np.asarray([
         turn / 200.0,
         omega,
@@ -273,8 +291,10 @@ def _global_features(
         my_prod / 50.0,
         enemy_prod / 50.0,
         len(fleets) / 25.0,
-        incoming_other / 500.0,  # enemy fleets heading to my planets
-        incoming_self / 500.0,   # friendly fleets heading to my planets
+        incoming_other / 500.0,
+        incoming_self / 500.0,
+        my_capture_value / 5000.0,
+        air_advantage,
     ], dtype=np.float32)
 
 
@@ -287,6 +307,7 @@ def build_observation(
     angular_velocity: float,
     *,
     turn: Optional[int] = None,
+    max_turns: int = 500,
     p_max: int = P_MAX_DEFAULT,
     f_max: int = F_MAX_DEFAULT,
     planet_feature_dim: int = PLANET_FEATURE_DIM,
@@ -417,6 +438,7 @@ def build_observation(
         planet_feats[i] = _planet_features(
             p, player, angular_velocity, incoming=incoming_by_planet.get(p.id),
             planet_feature_dim=planet_feature_dim,
+            turn=turn, max_turns=max_turns,
         )
         planet_mask[i] = True
         planet_ids[i] = p.id
@@ -440,6 +462,7 @@ def build_observation(
     global_feats = _global_features(
         planets, all_fleets, player, angular_velocity, turn,
         incoming_self=incoming_self, incoming_other=incoming_other,
+        max_turns=max_turns,
     )
 
     # ------- Edge bias (T x T x EDGE_FEATURE_DIM) -------
@@ -469,6 +492,19 @@ def build_observation(
     edge_bias[..., 2] = diffs[..., 1] / BOARD_SIZE
     edge_bias[..., 3] = np.sin(dphi)
     edge_bias[..., 4] = np.cos(dphi)
+
+    # crosses_sun: True if straight segment passes within SUN_RADIUS+0.5 of sun
+    dx_edge = positions[None, :, 0] - positions[:, None, 0]  # (T, T)
+    dy_edge = positions[None, :, 1] - positions[:, None, 1]
+    denom = dx_edge * dx_edge + dy_edge * dy_edge
+    denom_safe = np.where(denom > 1e-12, denom, 1.0)
+    px_rel = SUN_X - positions[:, None, 0]
+    py_rel = SUN_Y - positions[:, None, 1]
+    t = np.clip((px_rel * dx_edge + py_rel * dy_edge) / denom_safe, 0.0, 1.0)
+    cx = positions[:, None, 0] + t * dx_edge
+    cy = positions[:, None, 1] + t * dy_edge
+    sun_dist = np.hypot(cx - SUN_X, cy - SUN_Y)
+    edge_bias[..., 5] = (sun_dist < (SUN_RADIUS + 0.5)).astype(np.float32)
 
     # Diagonal must remain exactly zero (token paired with itself carries
     # no edge signal). cos(0) would otherwise leak a constant 1.0 onto the

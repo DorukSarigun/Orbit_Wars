@@ -34,6 +34,7 @@ from rl.rollout import (
 )
 from rl.replay import ReplayBuffer, DQNTransition
 from rl.rewards import REWARD_SYSTEMS, RewardConfig, build_reward_config, compute_step_reward, normalize_terminal_rewards
+from rl.train import TrainConfig, _episode_num_agents, _parse_num_agent_choices
 from rl.metrics import (
     WeightSnapshot, grad_norms_by_module, weight_norms_by_module,
 )
@@ -414,6 +415,42 @@ class TestProductionSimpleFleetCombatReward:
             my_total_ships_at_launch=100,
         )
         assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(0.0002, abs=1e-6)
+
+    def test_enemy_kill_is_positive_when_empire_is_stronger(self):
+        outcome = FleetOutcome(
+            captured_planet=False,
+            killed_enemy_ships=True,
+            destroyed_enroute=False,
+            self_reinforce=False,
+            enemy_ships_killed=20.0,
+            my_total_ships_at_launch=200,
+            enemy_total_ships_at_launch=100,
+        )
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(0.0001, abs=1e-6)
+
+    def test_enemy_kill_is_negative_when_empire_is_weaker(self):
+        outcome = FleetOutcome(
+            captured_planet=False,
+            killed_enemy_ships=True,
+            destroyed_enroute=False,
+            self_reinforce=False,
+            enemy_ships_killed=20.0,
+            my_total_ships_at_launch=100,
+            enemy_total_ships_at_launch=200,
+        )
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(-0.0001, abs=1e-6)
+
+    def test_enemy_kill_is_neutral_when_empires_are_equal(self):
+        outcome = FleetOutcome(
+            captured_planet=False,
+            killed_enemy_ships=True,
+            destroyed_enroute=False,
+            self_reinforce=False,
+            enemy_ships_killed=20.0,
+            my_total_ships_at_launch=100,
+            enemy_total_ships_at_launch=100,
+        )
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(0.0, abs=1e-6)
 
     def test_self_reinforce_returns_zero(self):
         outcome = FleetOutcome(

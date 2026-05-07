@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -41,6 +42,8 @@ class TrainConfig:
     episodes_per_iter: int = 1
     max_episode_steps: int = 500
     num_agents: int = 2
+    random_num_agents: bool = False
+    num_agent_choices: tuple[int, ...] = (2, 4)
     gamma: float = 0.99
     gae_lambda: float = 0.95
     learning_rate: float = 3e-4
@@ -64,6 +67,26 @@ def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
     if variant == "full":
         return OrbitWarsPolicy(**kwargs)
     raise ValueError(f"Unknown model_variant={variant!r}")
+
+
+def _parse_num_agent_choices(raw: str) -> tuple[int, ...]:
+    try:
+        values = tuple(dict.fromkeys(int(part.strip()) for part in raw.split(",") if part.strip()))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--num-agent-choices must be comma-separated integers") from exc
+    if not values:
+        raise argparse.ArgumentTypeError("--num-agent-choices cannot be empty")
+    invalid = [v for v in values if v not in (2, 4)]
+    if invalid:
+        raise argparse.ArgumentTypeError("Orbit Wars training currently supports num_agents choices 2 and 4")
+    return values
+
+
+def _episode_num_agents(train_cfg: TrainConfig, seed: int) -> int:
+    if not train_cfg.random_num_agents:
+        return int(train_cfg.num_agents)
+    choices = tuple(train_cfg.num_agent_choices)
+    return int(random.Random(int(seed)).choice(choices))
 
 
 def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int,
@@ -174,11 +197,12 @@ def train(
         ep_stats_list = []
         for ep in range(train_cfg.episodes_per_iter):
             seed = train_cfg.seed * 100000 + it * 1000 + ep
+            episode_num_agents = _episode_num_agents(train_cfg, seed)
             start_idx = len(buffer)
             stats = collect_episode(
                 policy, buffer,
                 max_steps=train_cfg.max_episode_steps,
-                num_agents=train_cfg.num_agents,
+                num_agents=episode_num_agents,
                 reward_cfg=reward_cfg,
                 device=device,
                 seed=seed,
@@ -219,9 +243,15 @@ def train(
         current_lr = optimizer.param_groups[0]["lr"]
 
         stats_only = [item[4] for item in ep_stats_list]
+        max_agents_seen = max(len(s.n_launches) for s in stats_only)
+        episode_num_agents = [len(s.n_launches) for s in stats_only]
+        agent_count_hist = {
+            str(n): sum(1 for x in episode_num_agents if x == n)
+            for n in sorted(set(episode_num_agents))
+        }
         wins_by_player = {
             f"p{p}": sum(1 for s in stats_only if s.winner == p)
-            for p in range(train_cfg.num_agents)
+            for p in range(max_agents_seen)
         }
         wins_p0 = wins_by_player.get("p0", 0)
         wins_p1 = wins_by_player.get("p1", 0)
@@ -239,6 +269,8 @@ def train(
             "avg_launches_per_player": round(avg_launches, 1),
             "wins_p0": wins_p0, "wins_p1": wins_p1, "draws": draws,
             "wins_by_player": wins_by_player,
+            "agent_count_hist": agent_count_hist,
+            "episode_num_agents": episode_num_agents,
             "policy_loss": round(ppo_stats.policy_loss, 5),
             "value_loss": round(ppo_stats.value_loss, 5),
             "entropy": round(ppo_stats.entropy, 4),
@@ -257,11 +289,11 @@ def train(
         ur_vals = list(update_ratios.values())
         ur_mean = sum(ur_vals) / max(1, len(ur_vals))
         wins_str = " ".join(f"P{p}={wins_by_player.get(f'p{p}', 0)}"
-                            for p in range(train_cfg.num_agents))
+                            for p in range(max_agents_seen))
+        agents_str = ",".join(f"{n}p={c}" for n, c in agent_count_hist.items())
         print(f"[epoch {it:>4}/{train_cfg.iterations}] "
-              f"games={train_cfg.episodes_per_iter} "
-              f"len={log['avg_episode_length']:>5.1f} "
-              f"launch/p={log['avg_launches_per_player']:>4.1f} "
+              f"games={train_cfg.episodes_per_iter} agents={agents_str} "
+              f"len={avg_len:.1f} launch/p={avg_launches:.1f} "
               f"{wins_str} D={draws} | "
               f"polL={log['policy_loss']:+.4f} valL={log['value_loss']:.3f} "
               f"H={log['entropy']:.3f} KL={log['approx_kl']:.4f} "
@@ -297,6 +329,10 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Per-game turn cap (env's natural max is ~500)")
     p.add_argument("--num-agents", type=int, choices=(2, 4), default=2,
                    help="Number of self-play agents in each game")
+    p.add_argument("--random-num-agents", action="store_true",
+                   help="Randomly choose the agent count separately for each episode")
+    p.add_argument("--num-agent-choices", type=_parse_num_agent_choices, default=(2, 4),
+                   help="Comma-separated episode agent-count choices for --random-num-agents")
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -370,6 +406,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         episodes_per_iter=args.episodes_per_iter,
         max_episode_steps=args.max_episode_steps,
         num_agents=args.num_agents,
+        random_num_agents=args.random_num_agents,
+        num_agent_choices=args.num_agent_choices,
         gamma=args.gamma, gae_lambda=args.gae_lambda,
         learning_rate=args.lr, seed=args.seed,
         checkpoint_every=args.checkpoint_every,

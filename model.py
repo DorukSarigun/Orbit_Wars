@@ -131,6 +131,7 @@ class PolicyOutput:
     ship_logits: torch.Tensor      # (B, P_max, n_ship_bins)  per-source ship choice
     value: torch.Tensor            # (B,)
     tokens: torch.Tensor           # (B, T, d_model) for debugging/inspection
+    aux_owner_logits: Optional[torch.Tensor] = None  # (B, P_max, 3) optional auxiliary head
 
 
 class OrbitWarsPolicy(nn.Module):
@@ -358,8 +359,9 @@ class OrbitWarsPolicy(nn.Module):
         source_slot = source_slot.to(out.src_logits.device).long()
         B = out.src_logits.shape[0]
         src_raw = out.src_logits[:, : self.p_max]
+        noop_raw = out.src_logits[:, self.p_max].unsqueeze(-1).expand_as(src_raw)
         launch_logits = torch.stack(
-            [torch.zeros_like(src_raw), src_raw],
+            [noop_raw, src_raw],
             dim=-1,
         )
         launch_sel = launch_logits[torch.arange(B, device=src_raw.device), source_slot]
@@ -462,8 +464,9 @@ class OrbitWarsPolicy(nn.Module):
 
         B = out.src_logits.shape[0]
         src_raw = out.src_logits[:, : self.p_max]
+        noop_raw = out.src_logits[:, self.p_max].unsqueeze(-1).expand_as(src_raw)
         launch_logits = torch.stack(
-            [torch.zeros_like(src_raw), src_raw],
+            [noop_raw, src_raw],
             dim=-1,
         )
         launch_sel = launch_logits[torch.arange(B, device=src.device), src]
