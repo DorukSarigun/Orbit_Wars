@@ -43,6 +43,7 @@ from .production_reward_tracker import (
     compute_production_capture_reward,
     compute_production_neutral_gift_penalty,
 )
+from scripted_strategy import CaptureEfficiencyAgent, ScriptedConfig
 
 MAX_LAUNCHES_PER_PLAYER_TURN = 8
 MAX_PAIR_CANDIDATES = 64
@@ -531,14 +532,28 @@ def collect_episode(
     seed: Optional[int] = None,
     progress_cb=None,
     scripted_expansion: Optional[ScriptedExpansionConfig] = None,
+    opponent_indices: Optional[set[int]] = None,
+    scripted_opponent_cfg: Optional[ScriptedConfig] = None,
 ) -> EpisodeStats:
-    """Play one self-play game and append all transitions (both players)
-    into `buffer`. Returns episode-level statistics.
+    """Play one game and append PPO-side transitions into ``buffer``.
+
+    ``opponent_indices`` lists player slots controlled by the scripted
+    ``CaptureEfficiencyAgent`` (one shared instance per call).  Those
+    players act on the same env but no transitions, fleet/defense
+    trackers, or reward bookkeeping are applied for them: the buffer
+    only sees PPO-controlled players, keeping gradients clean.
+
+    Pure self-play behavior is preserved when ``opponent_indices`` is
+    None or empty.
     """
     if num_agents not in (2, 4):
         raise ValueError("Orbit Wars supports num_agents=2 or num_agents=4")
     device = device or torch.device("cpu")
     reward_cfg = reward_cfg or RewardConfig()
+    opponent_indices = set(opponent_indices) if opponent_indices else set()
+    scripted_agent: Optional[CaptureEfficiencyAgent] = (
+        CaptureEfficiencyAgent(scripted_opponent_cfg) if opponent_indices else None
+    )
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
@@ -570,28 +585,48 @@ def collect_episode(
     for t in range(max_steps):
         env_obs = [state[p]["observation"] for p in range(num_agents)]
         for p in range(num_agents):
+            if p in opponent_indices:
+                continue
             defense_trackers[p].prime(env_obs[p], p)
 
-        # Both players act on the same underlying state but with their
-        # own perspective (different feature normalization in obs_builder).
-        acted = [
-            _act_for_player(policy, env_obs[p], p, device=device, current_turn=t,
-                        max_turns=reward_cfg.max_turns,
-                        scripted_expansion=scripted_expansion)
-            for p in range(num_agents)
-        ]
+        # PPO players run the policy; opponent slots run the scripted bot
+        # and do NOT contribute transitions or trackers.
+        acted: list = []
+        for p in range(num_agents):
+            if p in opponent_indices:
+                scripted_actions = scripted_agent.act(
+                    env_obs[p], player=p,
+                    current_turn=t, max_turns=reward_cfg.max_turns,
+                )
+                acted.append(("scripted", scripted_actions, len(scripted_actions)))
+            else:
+                acted.append(("ppo", _act_for_player(
+                    policy, env_obs[p], p, device=device, current_turn=t,
+                    max_turns=reward_cfg.max_turns,
+                    scripted_expansion=scripted_expansion,
+                )))
         env_actions = []
         invalid_actions = [0 for _ in range(num_agents)]
-        for p, (_, em, _, launches, invalids) in enumerate(acted):
-            env_actions.append(em)
-            n_launches[p] += launches
-            invalid_actions[p] = invalids
+        for p, item in enumerate(acted):
+            kind = item[0]
+            if kind == "scripted":
+                _, em, launches = item
+                env_actions.append(em)
+                n_launches[p] += launches
+            else:
+                _, payload = item
+                _, em, _, launches, invalids = payload
+                env_actions.append(em)
+                n_launches[p] += launches
+                invalid_actions[p] = invalids
 
         new_state = env.step(env_actions)
         new_obs = [new_state[p]["observation"] for p in range(num_agents)]
 
         # Observe fleet arrivals and assign delayed rewards.
         for p in range(num_agents):
+            if p in opponent_indices:
+                continue
             fleet_trackers[p].observe_turn(t, new_obs[p], p)
             for buffer_idx, outcome in fleet_trackers[p].pop_resolved(p):
                 if reward_cfg.reward_system == "production_simple":
@@ -636,10 +671,16 @@ def collect_episode(
             for p in range(num_agents)
         ]
         for p, r in enumerate(rewards):
+            if p in opponent_indices:
+                continue
             cum_reward[p] += r - reward_cfg.invalid_action_penalty * invalid_actions[p]
-            last_value[p] = float(acted[p][2].value[0].item())
+            # acted[p] = ("ppo", (decisions, em, last_out, launches, invalids))
+            last_value[p] = float(acted[p][1][2].value[0].item())
 
-        for p, (decisions, _, _, _, _) in enumerate(acted):
+        for p, item in enumerate(acted):
+            if p in opponent_indices:
+                continue
+            decisions, _, _, _, _ = item[1]
             r = rewards[p]
             new_indices = []
             for obs, act, out, launched, invalid, fleet_meta in decisions:

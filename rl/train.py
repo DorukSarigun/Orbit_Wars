@@ -64,6 +64,11 @@ class TrainConfig:
     batch_save_dir: str = "checkpoints/game_batches"
     scripted_expansion_turns: int = 0
     scripted_expansion_nearest_k: int = 5
+    # Opponent dispatch:
+    #   "self_play"  -> all slots run the live policy (pure self-play).
+    #   "scripted"   -> slot 0 runs the live policy, all other slots run
+    #                   the CaptureEfficiencyAgent.
+    opponent: str = "self_play"
 
 
 def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
@@ -222,6 +227,10 @@ def train(
             seed = train_cfg.seed * 100000 + it * 1000 + ep
             episode_num_agents = _episode_num_agents(train_cfg, seed)
             start_idx = len(buffer)
+            opponent_indices: set[int] = (
+                set(range(1, episode_num_agents))
+                if train_cfg.opponent == "scripted" else set()
+            )
             stats = collect_episode(
                 policy, buffer,
                 max_steps=train_cfg.max_episode_steps,
@@ -236,6 +245,7 @@ def train(
                     )
                     if train_cfg.scripted_expansion_turns > 0 else None
                 ),
+                opponent_indices=opponent_indices,
             )
             end_idx = len(buffer)
             ep_stats_list.append((ep, start_idx, end_idx, seed, stats))
@@ -384,6 +394,9 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Force early neutral-expansion launches for this many turns")
     p.add_argument("--scripted-expansion-nearest-k", type=int, default=5,
                    help="Choose best production/ships neutral target among this many nearest planets")
+    p.add_argument("--opponent", choices=["self_play", "scripted"], default="self_play",
+                   help="self_play: all slots use the live policy. "
+                        "scripted: slot 0 is the policy, all others are CaptureEfficiencyAgent.")
     p.add_argument("--clip-range", type=float, default=0.2)
     p.add_argument("--ppo-epochs", type=int, default=4, dest="epochs",
                    help="Number of optimization epochs over each rollout buffer "
@@ -462,6 +475,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         batch_save_dir=args.batch_save_dir,
         scripted_expansion_turns=args.scripted_expansion_turns,
         scripted_expansion_nearest_k=args.scripted_expansion_nearest_k,
+        opponent=args.opponent,
     )
     ppo_cfg = PPOConfig(
         clip_range=args.clip_range,
