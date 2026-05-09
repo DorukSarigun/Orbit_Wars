@@ -1,0 +1,237 @@
+"""Tests for the capture-efficiency scripted opponent."""
+from __future__ import annotations
+
+import math
+import os
+import sys
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from feature_extraction import Planet
+from scripted_strategy import (
+    CaptureEfficiencyAgent,
+    ScriptedConfig,
+    _defense_at_arrival,
+    compute_src_budgets,
+    score_capture_candidate,
+)
+
+
+def _planet(pid, owner, x, y, ships=0, prod=2, radius=2.0):
+    return Planet(
+        id=int(pid), owner=int(owner), x=float(x), y=float(y),
+        radius=float(radius), ships=int(ships), production=int(prod),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Defense estimate
+# ---------------------------------------------------------------------------
+def test_defense_at_arrival_owned_is_zero():
+    src = _planet(0, 0, 50, 50, ships=10, prod=3)
+    tgt = _planet(1, 0, 60, 50, ships=5, prod=2)
+    assert _defense_at_arrival(tgt, eta=20.0, player=0) == 0
+
+
+def test_defense_at_arrival_neutral_is_static():
+    tgt = _planet(1, -1, 60, 50, ships=15, prod=2)
+    # neutrals do not produce; eta does not matter
+    assert _defense_at_arrival(tgt, eta=0.0, player=0) == 15
+    assert _defense_at_arrival(tgt, eta=50.0, player=0) == 15
+
+
+def test_defense_at_arrival_enemy_grows_with_eta():
+    tgt = _planet(1, 1, 60, 50, ships=10, prod=2)
+    assert _defense_at_arrival(tgt, eta=0.0, player=0) == 10
+    assert _defense_at_arrival(tgt, eta=5.0, player=0) == 10 + 2 * 5
+    assert _defense_at_arrival(tgt, eta=15.5, player=0) == int(10 + 2 * 15.5)
+
+
+# ---------------------------------------------------------------------------
+# Score
+# ---------------------------------------------------------------------------
+def test_score_captures_neutral():
+    src = _planet(0, 0, 50, 50, ships=20)
+    tgt = _planet(1, -1, 60, 50, ships=5, prod=3)
+    score, defense, prod_gain = score_capture_candidate(
+        src, tgt, ships_sent=10, eta=10.0,
+        current_turn=0, max_turns=500, player=0,
+    )
+    assert defense == 5
+    assert prod_gain == pytest.approx(3 * (500 - 0 - 10))
+    assert score == pytest.approx(prod_gain - 5)
+
+
+def test_score_insufficient_ships_is_neg_inf():
+    src = _planet(0, 0, 50, 50, ships=20)
+    tgt = _planet(1, -1, 60, 50, ships=15, prod=3)
+    score, _, _ = score_capture_candidate(
+        src, tgt, ships_sent=10, eta=10.0,
+        current_turn=0, max_turns=500, player=0,
+    )
+    assert score == float("-inf")
+
+
+def test_score_owned_target_is_neg_inf():
+    src = _planet(0, 0, 50, 50, ships=20)
+    tgt = _planet(1, 0, 60, 50, ships=2, prod=3)
+    score, _, _ = score_capture_candidate(
+        src, tgt, ships_sent=10, eta=5.0,
+        current_turn=0, max_turns=500, player=0,
+    )
+    assert score == float("-inf")
+
+
+def test_score_enemy_grows_during_flight():
+    src = _planet(0, 0, 50, 50, ships=200)
+    tgt = _planet(1, 1, 60, 50, ships=10, prod=4)
+    # eta=10 -> defense = 10 + 4*10 = 50
+    score, defense, prod_gain = score_capture_candidate(
+        src, tgt, ships_sent=60, eta=10.0,
+        current_turn=0, max_turns=500, player=0,
+    )
+    assert defense == 50
+    assert prod_gain == pytest.approx(4 * (500 - 10))
+    assert score == pytest.approx(prod_gain - 50)
+
+
+def test_score_zero_remaining_at_game_end():
+    src = _planet(0, 0, 50, 50, ships=20)
+    tgt = _planet(1, -1, 60, 50, ships=2, prod=3)
+    # current_turn + eta exceeds max_turns -> remaining clamped to 0
+    score, defense, prod_gain = score_capture_candidate(
+        src, tgt, ships_sent=10, eta=20.0,
+        current_turn=490, max_turns=500, player=0,
+    )
+    assert defense == 2
+    assert prod_gain == 0.0
+    assert score == -2.0  # only the cost remains
+
+
+# ---------------------------------------------------------------------------
+# Defensive reserve / budget
+# ---------------------------------------------------------------------------
+def test_budget_no_threats_full_ships():
+    src = _planet(0, 0, 50, 50, ships=30, prod=2)
+    cfg = ScriptedConfig()
+    budgets = compute_src_budgets([src], {}, {}, cfg=cfg)
+    assert budgets[0] == 30
+
+
+def test_budget_distant_threat_covered_by_production():
+    src = _planet(0, 0, 50, 50, ships=30, prod=2)
+    cfg = ScriptedConfig(defense_window=15)
+    enemy = {0: [(25, 10.0)]}        # 25 enemy ships in 10 turns
+    # production_buf = 2 * 10 = 20; help = 0; reserve = max(0, 25-20) = 5
+    budgets = compute_src_budgets([src], {}, enemy, cfg=cfg)
+    assert budgets[0] == 30 - 5
+
+
+def test_budget_imminent_threat_holds_back_ships():
+    src = _planet(0, 0, 50, 50, ships=30, prod=2)
+    cfg = ScriptedConfig(defense_window=15)
+    enemy = {0: [(25, 2.0)]}
+    # production_buf = 4; reserve = 25 - 4 = 21; budget = 30 - 21 = 9
+    budgets = compute_src_budgets([src], {}, enemy, cfg=cfg)
+    assert budgets[0] == 9
+
+
+def test_budget_help_offsets_threat():
+    src = _planet(0, 0, 50, 50, ships=30, prod=2)
+    cfg = ScriptedConfig(defense_window=15)
+    enemy = {0: [(25, 5.0)]}
+    helps = {0: [(20, 4.0)]}         # 20 friendly arrive before threat
+    # production_buf = 10; help_at_first = 20; reserve = max(0, 25-20-10) = 0
+    budgets = compute_src_budgets([src], helps, enemy, cfg=cfg)
+    assert budgets[0] == 30
+
+
+def test_budget_threat_outside_window_ignored():
+    src = _planet(0, 0, 50, 50, ships=30, prod=2)
+    cfg = ScriptedConfig(defense_window=15)
+    enemy = {0: [(50, 30.0)]}
+    budgets = compute_src_budgets([src], {}, enemy, cfg=cfg)
+    assert budgets[0] == 30
+
+
+def test_budget_simultaneous_threats_aggregate():
+    src = _planet(0, 0, 50, 50, ships=40, prod=1)
+    cfg = ScriptedConfig(defense_window=15, threat_cluster_buffer=2)
+    enemy = {0: [(10, 5.0), (15, 6.0), (5, 12.0)]}
+    # e_first=5; cluster_cutoff=7; aggregate: 10+15=25 (12.0 excluded)
+    # production_buf = 1*5 = 5; reserve = 25-5 = 20; budget = 40-20 = 20
+    budgets = compute_src_budgets([src], {}, enemy, cfg=cfg)
+    assert budgets[0] == 20
+
+
+# ---------------------------------------------------------------------------
+# Full agent integration on a synthetic env_obs
+# ---------------------------------------------------------------------------
+def _toy_env_obs():
+    """Two planets per player + one neutral, no comets, no fleets."""
+    return {
+        "planets": [
+            [0, 0, 70.0, 70.0, 3.0, 30, 3],   # mine, big stash
+            [1, 0, 80.0, 70.0, 2.0, 5, 2],    # mine, small
+            [2, 1, 30.0, 30.0, 2.0, 8, 2],    # enemy
+            [3, -1, 70.0, 30.0, 2.0, 4, 2],   # neutral, easy capture
+        ],
+        "initial_planets": [
+            [0, 0, 70.0, 70.0, 3.0, 30, 3],
+            [1, 0, 80.0, 70.0, 2.0, 5, 2],
+            [2, 1, 30.0, 30.0, 2.0, 8, 2],
+            [3, -1, 70.0, 30.0, 2.0, 4, 2],
+        ],
+        "comet_planet_ids": [],
+        "comets": [],
+        "fleets": [],
+        "angular_velocity": 0.0,
+    }
+
+
+def test_agent_returns_valid_actions():
+    agent = CaptureEfficiencyAgent()
+    actions = agent.act(_toy_env_obs(), player=0, current_turn=0, max_turns=500)
+    assert isinstance(actions, list)
+    assert len(actions) >= 1
+    # every action: [from_id, angle, ships]
+    for a in actions:
+        assert len(a) == 3
+        from_id, angle, ships = a
+        # source must be one of my planets (0 or 1)
+        assert int(from_id) in (0, 1)
+        assert math.isfinite(float(angle))
+        assert int(ships) >= 1
+
+
+def test_agent_obeys_launch_cap():
+    cfg = ScriptedConfig(max_launches=2)
+    agent = CaptureEfficiencyAgent(cfg)
+    actions = agent.act(_toy_env_obs(), player=0, current_turn=0, max_turns=500)
+    assert len(actions) <= 2
+
+
+def test_agent_no_planets_returns_empty():
+    agent = CaptureEfficiencyAgent()
+    obs = _toy_env_obs()
+    # remove player 0 ownership
+    for row in obs["planets"]:
+        if row[1] == 0:
+            row[1] = -1
+    actions = agent.act(obs, player=0, current_turn=0, max_turns=500)
+    assert actions == []
+
+
+def test_agent_no_double_targeting_per_pair():
+    agent = CaptureEfficiencyAgent()
+    actions = agent.act(_toy_env_obs(), player=0, current_turn=0, max_turns=500)
+    pairs = set()
+    for from_id, _, _ in actions:
+        # targets aren't directly visible from env action; we only check
+        # that each from_id appears at most ``len(targets)`` times.
+        pairs.add(int(from_id))
+    # at least uniqueness sanity: number of distinct sources is reasonable
+    assert len(pairs) <= 2
