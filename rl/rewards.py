@@ -90,6 +90,19 @@ class RewardConfig:
     planet_defense_horizon: int = 30
     planet_defense_depart_share: float = 0.7
     planet_defense_hold_share: float = 0.3
+    # Sorun 1: post-capture reinforcement reward. Fired when a launch
+    # toward a non-mine target arrives at a now-mine planet (the planet
+    # was captured by an earlier-arriving friendly fleet while this one
+    # was still in flight). Tunes the magnitude of the bonus.
+    production_reinforcement_weight: float = 0.1
+    production_reinforcement_decay_window: int = 30
+    # Sorun 2: capture-then-lose clawback. When a captured planet is
+    # lost within `clawback_window` turns of capture, a fraction of the
+    # original capture reward is returned (negative reward) to the
+    # original capturing transitions. Magnitude is decayed linearly with
+    # the gap between capture and loss.
+    production_capture_clawback_window: int = 30
+    production_capture_clawback_fraction: float = 0.5
     defense_hold_weight: float = 0.001
     defense_hold_horizon: int = 15
     defense_arrival_window: float = 1.5

@@ -27,8 +27,12 @@ from rl.production_reward_tracker import (
     ProductionRewardTracker,
     ProductionCaptureOutcome,
     ProductionNeutralGiftOutcome,
+    ProductionReinforcementOutcome,
+    ProductionCaptureClawbackOutcome,
     compute_production_capture_reward,
     compute_production_neutral_gift_penalty,
+    compute_production_reinforcement_reward,
+    compute_production_capture_clawback,
     production_reward_value,
 )
 from rl.rollout import (
@@ -1379,6 +1383,295 @@ class TestProductionRewardTracker:
             weight=0.5,
         )
         assert penalty == pytest.approx(-5.0, abs=1e-6)
+
+
+class TestPostCaptureReinforcement:
+    """Sorun 1: a fleet launched at a non-mine target that is captured
+    by an earlier-arriving friendly fleet should still receive an
+    outcome-tied reward when it eventually arrives at the now-mine
+    planet."""
+
+    def _capture_neutral_p2_at_t10(self):
+        """Helper: prev has P2 neutral, curr has P2 owned by player 0."""
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        prev["planets"][2][1] = -1   # P2 neutral
+        prev["planets"][2][6] = 3    # P2 production
+        curr["planets"][2][1] = 0    # P2 mine after capture
+        curr["planets"][2][6] = 3
+        return prev, curr
+
+    def test_in_flight_launch_moves_to_reinforce_pending_at_capture(self):
+        """F1 arrives at T10 and captures. F2 still in flight (arrives
+        T15). After observe_turn(10), F2 must be queued in
+        _reinforce_pending, NOT silently dropped."""
+        prev, curr = self._capture_neutral_p2_at_t10()
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        # F1: arrives at T10 (capture launch)
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        # F2: still in flight, arrives T15
+        tracker.register_capture_launch(
+            buffer_idx=2, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=10,
+            est_arrival_turn=15, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev, curr, 0)
+        # F1 captured; F2 must still be tracked as a reinforcement.
+        captures = list(tracker.pop_capture_resolved(0))
+        assert [idx for idx, _ in captures] == [1]
+        reinforcements = list(tracker.pop_reinforcement_resolved(0))
+        assert reinforcements == []  # not yet arrived
+        # Internal state: F2 is in _reinforce_pending.
+        assert (0, 2) in tracker._reinforce_pending
+        assert len(tracker._reinforce_pending[(0, 2)]) == 1
+        assert tracker._reinforce_pending[(0, 2)][0].buffer_idx == 2
+
+    def test_arrival_at_still_mine_planet_emits_reinforcement_reward(self):
+        """F2 arrives at T15 to a still-mine P2 -> small + reward."""
+        prev, curr = self._capture_neutral_p2_at_t10()
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=2, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=10,
+            est_arrival_turn=15, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev, curr, 0)
+        list(tracker.pop_capture_resolved(0))  # drain
+        # Now T15: P2 still mine, F2 arrives.
+        prev2 = _toy_env_obs(player=0)
+        prev2["planets"][2][1] = 0
+        prev2["planets"][2][6] = 3
+        curr2 = _toy_env_obs(player=0)
+        curr2["planets"][2][1] = 0
+        curr2["planets"][2][6] = 3
+        tracker.observe_turn(15, prev2, curr2, 0)
+        reinforcements = list(tracker.pop_reinforcement_resolved(0))
+        assert [idx for idx, _ in reinforcements] == [2]
+        outcome = reinforcements[0][1]
+        assert outcome.ships_sent == 10
+        assert outcome.planet_production == pytest.approx(3.0)
+        assert outcome.arrival_turn == 15
+        assert outcome.capture_turn == 10
+        # Reward: 10 * 3 * (1 - 5/30) * 0.1 * 0.001 = ~0.0025
+        reward = compute_production_reinforcement_reward(
+            outcome,
+            reinforcement_weight=0.1,
+            reward_scale=0.001,
+            decay_window=30,
+        )
+        expected = 10.0 * 3.0 * (1.0 - 5.0 / 30.0) * 0.1 * 0.001
+        assert reward == pytest.approx(expected, abs=1e-6)
+        # And it must be positive.
+        assert reward > 0.0
+
+    def test_arrival_at_lost_planet_emits_no_reinforcement_reward(self):
+        """F2 arrives at T15 but P2 was lost to enemy at T13. No bonus."""
+        prev, curr = self._capture_neutral_p2_at_t10()
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=2, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=10,
+            est_arrival_turn=15, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev, curr, 0)
+        list(tracker.pop_capture_resolved(0))
+        # Drain any clawback pending events from the capture so the loss
+        # observed below doesn't mix with this test's assertions.
+        list(tracker.pop_capture_clawback_resolved(0))
+        # T15: P2 owned by enemy now (lost in between).
+        prev2 = _toy_env_obs(player=0)
+        prev2["planets"][2][1] = 1   # enemy
+        prev2["planets"][2][6] = 3
+        curr2 = _toy_env_obs(player=0)
+        curr2["planets"][2][1] = 1
+        curr2["planets"][2][6] = 3
+        tracker.observe_turn(15, prev2, curr2, 0)
+        reinforcements = list(tracker.pop_reinforcement_resolved(0))
+        assert reinforcements == []  # no reinforcement reward when not mine
+
+    def test_reinforcement_decay_floors_at_0_1(self):
+        """Beyond decay_window the reward is 0; at the boundary it floors
+        at 10% of the base magnitude."""
+        outcome = ProductionReinforcementOutcome(
+            ships_sent=10, planet_production=3.0,
+            arrival_turn=40, capture_turn=10,  # gap=30 == window
+            max_turns=500,
+        )
+        # gap exactly == decay_window: time_factor = max(0.1, 1 - 30/30) = 0.1
+        reward = compute_production_reinforcement_reward(
+            outcome,
+            reinforcement_weight=0.1, reward_scale=0.001, decay_window=30,
+        )
+        assert reward == pytest.approx(10 * 3 * 0.1 * 0.1 * 0.001, abs=1e-9)
+
+        # gap > decay_window: 0
+        outcome.arrival_turn = 41
+        reward = compute_production_reinforcement_reward(
+            outcome,
+            reinforcement_weight=0.1, reward_scale=0.001, decay_window=30,
+        )
+        assert reward == pytest.approx(0.0, abs=1e-9)
+
+    def test_self_reinforce_launch_target_is_filtered_at_register(self):
+        """A launch toward a target ALREADY mine at launch time is
+        filtered by `register_capture_launch` (existing behavior). The
+        reinforcement path must NOT receive such launches."""
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        tracker.register_capture_launch(
+            buffer_idx=99, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=10,
+            est_arrival_turn=15, launch_target_owner=0,  # mine at launch
+        )
+        assert tracker._capture_pending == {}
+        # Even after observe_turn, no reinforcement record appears.
+        prev, curr = self._capture_neutral_p2_at_t10()
+        tracker.observe_turn(10, prev, curr, 0)
+        assert list(tracker.pop_reinforcement_resolved(0)) == []
+
+
+class TestCaptureClawback:
+    """Sorun 2: a captured planet lost within the clawback window
+    triggers a partial refund of the original capture reward."""
+
+    def _scenario_capture_then_lose(self, *, capture_turn: int = 10,
+                                     loss_turn: int = 13):
+        """Build prev/curr observations for capture at `capture_turn`
+        and a separate prev/curr for loss at `loss_turn`."""
+        # T(capture-1) -> T(capture): neutral -> mine
+        prev_cap = _toy_env_obs(player=0)
+        curr_cap = _toy_env_obs(player=0)
+        prev_cap["planets"][2][1] = -1
+        prev_cap["planets"][2][6] = 3
+        curr_cap["planets"][2][1] = 0
+        curr_cap["planets"][2][6] = 3
+        # T(loss-1) -> T(loss): mine -> enemy
+        prev_loss = _toy_env_obs(player=0)
+        curr_loss = _toy_env_obs(player=0)
+        prev_loss["planets"][2][1] = 0
+        prev_loss["planets"][2][6] = 3
+        curr_loss["planets"][2][1] = 1
+        curr_loss["planets"][2][6] = 3
+        return prev_cap, curr_cap, prev_loss, curr_loss
+
+    def test_capture_then_lose_emits_negative_clawback(self):
+        """Capture at T10, lose at T13 (gap=3, well inside window=30):
+        original capturing transitions get a clawback (negative) reward."""
+        prev_cap, curr_cap, prev_loss, curr_loss = self._scenario_capture_then_lose(
+            capture_turn=10, loss_turn=13,
+        )
+        tracker = ProductionRewardTracker(
+            max_turns=500, num_agents=2,
+            capture_clawback_window=30, capture_clawback_fraction=0.5,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev_cap, curr_cap, 0)
+        captures = list(tracker.pop_capture_resolved(0))
+        assert [idx for idx, _ in captures] == [1]
+        capture_reward = compute_production_capture_reward(
+            captures[0][1], reward_scale=0.001,
+        )
+        assert capture_reward > 0.0
+
+        # T13: planet lost.
+        tracker.observe_turn(13, prev_loss, curr_loss, 0)
+        clawbacks = list(tracker.pop_capture_clawback_resolved(0))
+        assert [idx for idx, _ in clawbacks] == [1]
+        clawback_outcome = clawbacks[0][1]
+        clawback_reward = compute_production_capture_clawback(
+            clawback_outcome, reward_scale=0.001,
+        )
+        # gap = 13 - 10 = 3, time_factor = max(0.1, 1 - 2/30) = 28/30
+        # clawback_reward = -capture_reward * 0.5 * 28/30
+        expected = -capture_reward * 0.5 * (1.0 - 2.0 / 30.0)
+        assert clawback_reward == pytest.approx(expected, abs=1e-9)
+        # And clawback strictly less than capture (net positive).
+        assert capture_reward + clawback_reward > 0.0
+
+    def test_loss_outside_clawback_window_emits_no_clawback(self):
+        """Capture at T10, lose at T100 (gap=90, beyond window=30): no
+        clawback emitted because the recent-capture record has expired."""
+        prev_cap, curr_cap, prev_loss, curr_loss = self._scenario_capture_then_lose(
+            capture_turn=10, loss_turn=100,
+        )
+        tracker = ProductionRewardTracker(
+            max_turns=500, num_agents=2,
+            capture_clawback_window=30, capture_clawback_fraction=0.5,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev_cap, curr_cap, 0)
+        list(tracker.pop_capture_resolved(0))
+        # Walk forward via observe_turn (no transitions) to expire the
+        # recent-capture record.
+        unchanged = _toy_env_obs(player=0)
+        unchanged["planets"][2][1] = 0
+        unchanged["planets"][2][6] = 3
+        tracker.observe_turn(45, unchanged, unchanged, 0)  # > 10 + 30
+        assert (0, 2) not in tracker._recent_captures
+        # Now lose at T100 - no clawback record exists.
+        tracker.observe_turn(100, prev_loss, curr_loss, 0)
+        assert list(tracker.pop_capture_clawback_resolved(0)) == []
+
+    def test_loss_without_recent_capture_emits_no_clawback(self):
+        """A planet I owned all along (no recent capture record) loses;
+        no clawback emitted (Defense Window handles this case)."""
+        prev_cap = _toy_env_obs(player=0)
+        prev_cap["planets"][2][1] = 0  # already mine
+        prev_cap["planets"][2][6] = 3
+        curr_cap = _toy_env_obs(player=0)
+        curr_cap["planets"][2][1] = 0
+        curr_cap["planets"][2][6] = 3
+        prev_loss = _toy_env_obs(player=0)
+        prev_loss["planets"][2][1] = 0
+        prev_loss["planets"][2][6] = 3
+        curr_loss = _toy_env_obs(player=0)
+        curr_loss["planets"][2][1] = 1
+        curr_loss["planets"][2][6] = 3
+        tracker = ProductionRewardTracker(
+            max_turns=500, num_agents=2,
+            capture_clawback_window=30, capture_clawback_fraction=0.5,
+        )
+        tracker.observe_turn(10, prev_cap, curr_cap, 0)
+        tracker.observe_turn(13, prev_loss, curr_loss, 0)
+        assert list(tracker.pop_capture_clawback_resolved(0)) == []
+
+    def test_clawback_disabled_when_fraction_or_window_zero(self):
+        """Setting fraction=0 or window=0 disables clawback emission."""
+        outcome = ProductionCaptureOutcome(
+            ships_sent=30, total_ships_sent=30, total_ship_investment=0.0,
+            planet_production=3.0, capture_turn=10, max_turns=500,
+            captured_from_enemy=False, num_opponents=1,
+        )
+        clawback_outcome = ProductionCaptureClawbackOutcome(
+            capture_outcome=outcome, loss_turn=13,
+            clawback_window=0, clawback_fraction=0.5,
+        )
+        # Window=0 -> reward=0. (window is clamped to >=1, gap=3 > 1)
+        reward = compute_production_capture_clawback(
+            clawback_outcome, reward_scale=0.001,
+        )
+        assert reward == pytest.approx(0.0, abs=1e-9)
 
 
 def _dummy_dqn_transition(reward: float = 0.0, done: bool = False) -> DQNTransition:

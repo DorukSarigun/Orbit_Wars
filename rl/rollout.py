@@ -43,6 +43,8 @@ from .production_reward_tracker import (
     ProductionRewardTracker,
     compute_production_capture_reward,
     compute_production_neutral_gift_penalty,
+    compute_production_reinforcement_reward,
+    compute_production_capture_clawback,
 )
 from scripted_strategy import CaptureEfficiencyAgent, ScriptedConfig
 
@@ -568,7 +570,13 @@ def collect_episode(
     last_value = [0.0 for _ in range(num_agents)]      # for GAE bootstrapping at end-of-rollout
     fleet_trackers = [FleetTracker() for _ in range(num_agents)]  # One per player
     production_trackers = [
-        ProductionRewardTracker(max_turns=reward_cfg.max_turns, num_agents=num_agents)
+        ProductionRewardTracker(
+            max_turns=reward_cfg.max_turns,
+            num_agents=num_agents,
+            reinforcement_decay_window=reward_cfg.production_reinforcement_decay_window,
+            capture_clawback_window=reward_cfg.production_capture_clawback_window,
+            capture_clawback_fraction=reward_cfg.production_capture_clawback_fraction,
+        )
         for _ in range(num_agents)
     ]
     planet_loss_trackers = [
@@ -862,6 +870,34 @@ def collect_episode(
                     buffer.add_delayed_reward(
                         buffer_idx,
                         compute_production_neutral_gift_penalty(
+                            outcome,
+                            reward_scale=reward_cfg.reward_scale,
+                            production_reward_beta=reward_cfg.production_reward_beta,
+                            production_reward_reference=reward_cfg.production_reward_reference,
+                        ),
+                        event_turn=t,
+                        discount=reward_cfg.delayed_reward_discount,
+                    )
+                # Sorun 1: Post-capture reinforcement bonus.
+                for buffer_idx, outcome in production_trackers[p].pop_reinforcement_resolved(p):
+                    buffer.add_delayed_reward(
+                        buffer_idx,
+                        compute_production_reinforcement_reward(
+                            outcome,
+                            reinforcement_weight=reward_cfg.production_reinforcement_weight,
+                            reward_scale=reward_cfg.reward_scale,
+                            decay_window=reward_cfg.production_reinforcement_decay_window,
+                            production_reward_beta=reward_cfg.production_reward_beta,
+                            production_reward_reference=reward_cfg.production_reward_reference,
+                        ),
+                        event_turn=t,
+                        discount=reward_cfg.delayed_reward_discount,
+                    )
+                # Sorun 2: Capture-then-lose clawback (negative reward).
+                for buffer_idx, outcome in production_trackers[p].pop_capture_clawback_resolved(p):
+                    buffer.add_delayed_reward(
+                        buffer_idx,
+                        compute_production_capture_clawback(
                             outcome,
                             reward_scale=reward_cfg.reward_scale,
                             production_reward_beta=reward_cfg.production_reward_beta,

@@ -70,6 +70,63 @@ class ProductionPlanetLossOutcome:
     num_threatened_at_launch: int = 1
 
 
+# ---------------------------------------------------------------------------
+# Edge-case fixes (post-capture reinforcement + capture-then-lose clawback)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProductionReinforcementLaunch:
+    """A launch toward a non-mine target that is still in flight when the
+    target was captured by another (earlier-arriving) friendly fleet.
+
+    Such a launch will arrive at a now-mine planet and effectively
+    reinforce it. Without this tracking, the launch would be silently
+    dropped from `_capture_pending` and receive no outcome-tied reward.
+    """
+    buffer_idx: int
+    launch_turn: int
+    player: int
+    target_planet_id: int
+    ships_sent: int
+    est_arrival_turn: float
+    capture_turn: int           # turn at which the planet became ours
+    planet_production: float    # production of the now-mine planet
+
+
+@dataclass
+class ProductionReinforcementOutcome:
+    ships_sent: int
+    planet_production: float
+    arrival_turn: int
+    capture_turn: int
+    max_turns: int
+
+
+@dataclass
+class ProductionCaptureEvent:
+    """Bookkeeping for a recently captured planet so we can claw back
+    capture credit if the planet is lost shortly after.
+    """
+    buffer_indices: list[int]
+    outcomes: list[ProductionCaptureOutcome]
+    capture_turn: int
+    planet_id: int
+    player: int
+
+
+@dataclass
+class ProductionCaptureClawbackOutcome:
+    """Negative-reward outcome emitted when a captured planet is lost
+    within `clawback_window` turns of capture. The actual reward is
+    computed by `compute_production_capture_clawback` so that it stays
+    proportional to the original capture reward formula.
+    """
+    capture_outcome: ProductionCaptureOutcome
+    loss_turn: int
+    clawback_window: int
+    clawback_fraction: float
+
+
 class ProductionRewardTracker:
     """Tracks launch -> capture / defense-miss credit assignment.
 
@@ -82,15 +139,29 @@ class ProductionRewardTracker:
     """
 
     def __init__(self, *, max_turns: int = 500, num_agents: int = 2,
-                 softening_window: int = 30):
+                 softening_window: int = 30,
+                 reinforcement_decay_window: int = 30,
+                 capture_clawback_window: int = 30,
+                 capture_clawback_fraction: float = 0.5):
         self.max_turns = int(max_turns)
         self.num_opponents = max(1, int(num_agents) - 1)
         self.softening_window = max(0, int(softening_window))
+        # Reinforcement: time-decay window for the post-capture arrival bonus.
+        self.reinforcement_decay_window = max(1, int(reinforcement_decay_window))
+        # Clawback: window after capture during which a loss triggers a
+        # partial refund of the capture reward, and the maximum fraction
+        # of the original capture reward that can be clawed back.
+        self.capture_clawback_window = max(0, int(capture_clawback_window))
+        self.capture_clawback_fraction = max(0.0, min(1.0, float(capture_clawback_fraction)))
         self._capture_pending: dict[tuple[int, int], list[ProductionCaptureLaunch]] = {}
         self._loss_pending: dict[tuple[int, int], list[ProductionDefenseMissLaunch]] = {}
+        self._reinforce_pending: dict[tuple[int, int], list[ProductionReinforcementLaunch]] = {}
+        self._recent_captures: dict[tuple[int, int], ProductionCaptureEvent] = {}
         self._resolved_captures: dict[int, deque] = {}
         self._resolved_losses: dict[int, deque] = {}
         self._resolved_neutral_gifts: dict[int, deque] = {}
+        self._resolved_reinforcements: dict[int, deque] = {}
+        self._resolved_clawbacks: dict[int, deque] = {}
 
     def register_capture_launch(self, *, buffer_idx: int, launch_turn: int, player: int,
                                 target_planet_id: int, ships_sent: int,
@@ -147,12 +218,37 @@ class ProductionRewardTracker:
             if prev_owner == player or curr.owner != player:
                 continue
             key = (int(player), int(planet_id))
-            launches = [
-                fl for fl in self._capture_pending.pop(key, [])
-                if fl.est_arrival_turn <= turn + 1e-6
-                and fl.launch_turn <= turn
-                and (turn - fl.est_arrival_turn) <= self.softening_window
-            ]
+            # Partition pending launches into:
+            #   - arrived AND inside softening window  -> capture credit
+            #   - still in flight                      -> reinforcement pending
+            #   - arrived but past softening window    -> dropped (too old)
+            pending = self._capture_pending.pop(key, [])
+            launches: list[ProductionCaptureLaunch] = []
+            in_flight: list[ProductionCaptureLaunch] = []
+            for fl in pending:
+                if fl.launch_turn > turn:
+                    continue  # safety: launch in the future, ignore
+                if fl.est_arrival_turn > turn + 1e-6:
+                    in_flight.append(fl)
+                elif (turn - fl.est_arrival_turn) <= self.softening_window:
+                    launches.append(fl)
+                # else: arrived too long ago, dropped (no credit, no follow-up)
+            # Move still-in-flight launches to the reinforcement queue so
+            # they get an outcome-tied reward when they later arrive at
+            # the now-mine planet.
+            for fl in in_flight:
+                self._reinforce_pending.setdefault(key, []).append(
+                    ProductionReinforcementLaunch(
+                        buffer_idx=fl.buffer_idx,
+                        launch_turn=fl.launch_turn,
+                        player=fl.player,
+                        target_planet_id=fl.target_planet_id,
+                        ships_sent=fl.ships_sent,
+                        est_arrival_turn=fl.est_arrival_turn,
+                        capture_turn=int(turn),
+                        planet_production=float(curr.production),
+                    )
+                )
             total_ships = sum(max(0, fl.ships_sent) for fl in launches)
             if total_ships <= 0:
                 continue
@@ -161,6 +257,8 @@ class ProductionRewardTracker:
             launch_target_ships = max(max(0, int(fl.launch_target_ships)) for fl in launches)
             target_ship_investment = max(observed_target_ships, launch_target_ships)
             total_ship_investment = min(float(total_ships), float(target_ship_investment))
+            event_indices: list[int] = []
+            event_outcomes: list[ProductionCaptureOutcome] = []
             for fl in launches:
                 outcome = ProductionCaptureOutcome(
                     ships_sent=fl.ships_sent,
@@ -174,6 +272,21 @@ class ProductionRewardTracker:
                     my_total_ships_at_launch=fl.my_total_ships_at_launch,
                 )
                 self._resolved_captures.setdefault(player, deque()).append((fl.buffer_idx, outcome))
+                event_indices.append(fl.buffer_idx)
+                event_outcomes.append(outcome)
+            # Record the capture event so a quick subsequent loss can claw
+            # back part of the capture reward (Sorun 2: capture-then-lose).
+            if event_indices and self.capture_clawback_window > 0 and self.capture_clawback_fraction > 0.0:
+                self._recent_captures[key] = ProductionCaptureEvent(
+                    buffer_indices=event_indices,
+                    outcomes=event_outcomes,
+                    capture_turn=int(turn),
+                    planet_id=int(planet_id),
+                    player=int(player),
+                )
+        # Resolve reinforcement arrivals BEFORE expiry so a fleet that
+        # arrives the same turn the capture just happened still counts.
+        self._resolve_reinforcements(turn, player, curr_planets)
         self._expire_arrived_non_captures(turn, player, curr_planets)
         for planet_id, prev in prev_planets.items():
             if prev.owner != player:
@@ -182,6 +295,10 @@ class ProductionRewardTracker:
             if curr is not None and curr.owner == player:
                 continue
             key = (int(player), int(planet_id))
+            # Sorun 2: emit a capture-clawback if this lost planet was
+            # captured recently. The recent-capture record is consumed
+            # here so a later second loss does not double-charge.
+            self._emit_capture_clawback(key, int(turn), int(player))
             candidates = [
                 fl for fl in self._loss_pending.pop(key, [])
                 if fl.est_defense_arrival_turn <= turn + 1e-6 and fl.launch_turn <= turn
@@ -200,6 +317,9 @@ class ProductionRewardTracker:
                     num_threatened_at_launch=fl.num_threatened_at_launch,
                 )
                 self._resolved_losses.setdefault(player, deque()).append((fl.buffer_idx, outcome))
+        # House-keeping: drop stale capture events whose clawback window
+        # has fully elapsed without a loss.
+        self._expire_recent_captures(int(turn))
 
     def _resolve_neutral_gift_if_enemy_captured(self, turn: int, player: int,
                                                 planet_id: int, prev_owner: int,
@@ -277,6 +397,80 @@ class ProductionRewardTracker:
             else:
                 self._capture_pending.pop(key, None)
 
+    def _resolve_reinforcements(self, turn: int, player: int,
+                                 curr_planets: dict) -> None:
+        """Emit a reinforcement outcome for any in-flight launch that has
+        now arrived at a still-mine planet.
+
+        - planet still mine on arrival -> ProductionReinforcementOutcome
+        - planet not mine on arrival   -> silently dropped (no positive
+          signal; the fleet's combat outcome handles waste/capture).
+        - launch hasn't arrived yet    -> kept in queue for a future turn.
+        """
+        for key in list(self._reinforce_pending):
+            key_player, planet_id = key
+            if key_player != player:
+                continue
+            kept: list[ProductionReinforcementLaunch] = []
+            for fl in self._reinforce_pending[key]:
+                if fl.est_arrival_turn > turn + 1e-6:
+                    kept.append(fl)
+                    continue
+                if fl.launch_turn > turn:
+                    # Safety: shouldn't happen, but skip.
+                    continue
+                curr = curr_planets.get(planet_id)
+                if curr is None or curr.owner != player:
+                    # Arrived after planet was lost (or vanished). No
+                    # reinforcement reward; the loss path / fleet combat
+                    # handle this case separately.
+                    continue
+                outcome = ProductionReinforcementOutcome(
+                    ships_sent=int(fl.ships_sent),
+                    planet_production=float(fl.planet_production),
+                    arrival_turn=int(turn),
+                    capture_turn=int(fl.capture_turn),
+                    max_turns=self.max_turns,
+                )
+                self._resolved_reinforcements.setdefault(player, deque()).append(
+                    (fl.buffer_idx, outcome)
+                )
+            if kept:
+                self._reinforce_pending[key] = kept
+            else:
+                self._reinforce_pending.pop(key, None)
+
+    def _emit_capture_clawback(self, key: tuple[int, int], turn: int,
+                                player: int) -> None:
+        """If `key` has a recent CaptureEvent within the clawback window,
+        emit one ClawbackOutcome per launching transition that originally
+        captured the planet.
+        """
+        event = self._recent_captures.pop(key, None)
+        if event is None:
+            return
+        if self.capture_clawback_fraction <= 0.0 or self.capture_clawback_window <= 0:
+            return
+        gap = int(turn) - int(event.capture_turn)
+        if gap <= 0 or gap > self.capture_clawback_window:
+            return
+        for idx, capture_outcome in zip(event.buffer_indices, event.outcomes):
+            outcome = ProductionCaptureClawbackOutcome(
+                capture_outcome=capture_outcome,
+                loss_turn=int(turn),
+                clawback_window=int(self.capture_clawback_window),
+                clawback_fraction=float(self.capture_clawback_fraction),
+            )
+            self._resolved_clawbacks.setdefault(player, deque()).append((idx, outcome))
+
+    def _expire_recent_captures(self, turn: int) -> None:
+        if self.capture_clawback_window <= 0:
+            self._recent_captures.clear()
+            return
+        for key in list(self._recent_captures):
+            if turn - self._recent_captures[key].capture_turn > self.capture_clawback_window:
+                self._recent_captures.pop(key, None)
+
     def pop_capture_resolved(self, player: int):
         q = self._resolved_captures.get(player)
         if q:
@@ -291,6 +485,18 @@ class ProductionRewardTracker:
 
     def pop_neutral_gift_resolved(self, player: int):
         q = self._resolved_neutral_gifts.get(player)
+        if q:
+            while q:
+                yield q.popleft()
+
+    def pop_reinforcement_resolved(self, player: int):
+        q = self._resolved_reinforcements.get(player)
+        if q:
+            while q:
+                yield q.popleft()
+
+    def pop_capture_clawback_resolved(self, player: int):
+        q = self._resolved_clawbacks.get(player)
         if q:
             while q:
                 yield q.popleft()
@@ -362,6 +568,74 @@ def compute_production_neutral_gift_penalty(
         production_reward_reference=production_reward_reference,
     )
     return -production_value * time_factor * damage_fraction * float(reward_scale)
+
+
+def compute_production_reinforcement_reward(
+    outcome: ProductionReinforcementOutcome,
+    *,
+    reinforcement_weight: float = 0.1,
+    reward_scale: float = 0.001,
+    decay_window: int = 30,
+    production_reward_beta: float = 0.0,
+    production_reward_reference: float = 3.0,
+) -> float:
+    """Small positive reward for arriving at a freshly-captured planet
+    with a follow-up fleet (Sorun 1: F2 sinyalsiz).
+
+    Magnitude:
+        ships_sent * production_value * time_factor
+        * reinforcement_weight * reward_scale
+
+    where time_factor decays linearly with the gap between capture and
+    arrival, floored at 0.1 to keep some signal even for late arrivals.
+    """
+    if outcome.ships_sent <= 0:
+        return 0.0
+    window = max(1, int(decay_window))
+    gap = max(0, int(outcome.arrival_turn) - int(outcome.capture_turn))
+    if gap > window:
+        return 0.0
+    time_factor = max(0.1, 1.0 - gap / float(window))
+    production_value = production_reward_value(
+        outcome.planet_production,
+        production_reward_beta=production_reward_beta,
+        production_reward_reference=production_reward_reference,
+    )
+    return (
+        float(outcome.ships_sent) * production_value * time_factor
+        * float(reinforcement_weight) * float(reward_scale)
+    )
+
+
+def compute_production_capture_clawback(
+    outcome: ProductionCaptureClawbackOutcome,
+    *,
+    reward_scale: float = 0.001,
+    production_reward_beta: float = 0.0,
+    production_reward_reference: float = 3.0,
+) -> float:
+    """Negative reward returned to a capturing transition when the
+    captured planet is lost within `clawback_window` turns of capture
+    (Sorun 2: capture-then-lose).
+
+    Magnitude is a fraction of the original capture reward, decayed
+    linearly so a near-immediate loss reclaims the most. Capture
+    rewards remain net positive (clawback_fraction <= 1).
+    """
+    capture_reward = compute_production_capture_reward(
+        outcome.capture_outcome,
+        reward_scale=reward_scale,
+        production_reward_beta=production_reward_beta,
+        production_reward_reference=production_reward_reference,
+    )
+    if capture_reward <= 0.0:
+        return 0.0
+    window = max(1, int(outcome.clawback_window))
+    gap = max(0, int(outcome.loss_turn) - int(outcome.capture_outcome.capture_turn))
+    if gap == 0 or gap > window:
+        return 0.0
+    time_factor = max(0.1, 1.0 - (gap - 1) / float(window))
+    return -capture_reward * float(outcome.clawback_fraction) * time_factor
 
 
 def compute_production_planet_loss_penalty(
