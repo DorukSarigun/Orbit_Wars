@@ -200,7 +200,12 @@ def train(
     optimizer = torch.optim.Adam(policy.parameters(), lr=train_cfg.learning_rate)
     n_params = sum(p.numel() for p in policy.parameters())
     variant = getattr(policy, "model_variant", "full")
-    token_count = policy.p_max * 6 if variant == "grouped_planet" else policy.p_max + 1 if variant == "planet_only" else policy.p_max + policy.f_max + 1
+    if variant == "grouped_planet":
+        token_count = policy.p_max
+    elif variant == "planet_only":
+        token_count = policy.p_max + 1
+    else:
+        token_count = policy.p_max + policy.f_max + 1
     attention_info = ""
     if variant == "grouped_planet":
         attention_info = f", attention={policy.attention_type}, M={policy.n_inducing_points}"
