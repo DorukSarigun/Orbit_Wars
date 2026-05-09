@@ -38,6 +38,7 @@ from .rewards import RewardConfig, compute_step_reward, normalize_terminal_rewar
 from .fleet_tracker import FleetTracker, compute_fleet_reward, compute_production_simple_fleet_combat_reward
 from .defense_tracker import DefenseTracker, compute_defense_reward
 from .planet_loss_tracker import PlanetLossTracker, compute_planet_loss_launch_penalty
+from .planet_defense_tracker import PlanetDefenseTracker
 from .production_reward_tracker import (
     ProductionRewardTracker,
     compute_production_capture_reward,
@@ -574,6 +575,18 @@ def collect_episode(
         PlanetLossTracker(horizon=reward_cfg.planet_loss_credit_horizon)
         for _ in range(num_agents)
     ]
+    # Defense Window tracker (Tasarım 2). Active only in production_simple
+    # since the legacy reward systems use the narrower PlanetLossTracker.
+    planet_defense_trackers = [
+        PlanetDefenseTracker(
+            horizon=reward_cfg.planet_defense_horizon,
+            depart_share=reward_cfg.planet_defense_depart_share,
+            hold_share=reward_cfg.planet_defense_hold_share,
+            max_turns=reward_cfg.max_turns,
+            num_opponents=max(1, num_agents - 1),
+        )
+        for _ in range(num_agents)
+    ]
     defense_trackers = [
         DefenseTracker(
             horizon=reward_cfg.defense_hold_horizon,
@@ -743,6 +756,16 @@ def collect_episode(
                         enemy_total_ships_at_launch=fleet_meta["enemy_total_ships_at_launch"],
                     )
                     if reward_cfg.reward_system == "production_simple":
+                        # Defense Window: this launch took ships AWAY from
+                        # src_planet_id; if that planet is later lost, this
+                        # transition shares part of the loss penalty.
+                        planet_defense_trackers[p].register_depart(
+                            buffer_idx=idx,
+                            player=fleet_meta["player"],
+                            src_planet_id=fleet_meta["src_planet_id"],
+                            turn=fleet_meta["launch_turn"],
+                            ships_sent=fleet_meta["ships_sent"],
+                        )
                         production_trackers[p].register_capture_launch(
                             buffer_idx=idx,
                             launch_turn=fleet_meta["launch_turn"],
@@ -791,6 +814,37 @@ def collect_episode(
                     discount=reward_cfg.delayed_reward_discount,
                 )
             if reward_cfg.reward_system == "production_simple":
+                # --- Defense Window (Tasarım 2) ---
+                # Register passive HOLDs for every still-owned planet at
+                # end of turn, attributed to this turn's last transition
+                # (the agent's "decision pulse"). HOLDs for the lost
+                # planets are skipped here; their previous-turn HOLDs are
+                # already pending in the tracker and will be resolved by
+                # observe_turn below.
+                if new_indices:
+                    pulse_idx = new_indices[-1]
+                    for planet in parse_planets(new_obs[p]):
+                        if planet.owner != p or getattr(planet, "is_comet", False):
+                            continue
+                        planet_defense_trackers[p].register_hold(
+                            buffer_idx=pulse_idx,
+                            player=p,
+                            planet_id=int(planet.id),
+                            turn=t,
+                            ships_held=int(planet.ships),
+                        )
+                planet_defense_trackers[p].observe_turn(
+                    t, env_obs[p], new_obs[p], p,
+                    reward_scale=reward_cfg.reward_scale,
+                    loss_weight=reward_cfg.planet_loss_weight,
+                )
+                for buffer_idx, signed_reward in planet_defense_trackers[p].pop_resolved(p):
+                    buffer.add_delayed_reward(
+                        buffer_idx,
+                        signed_reward,
+                        event_turn=t,
+                        discount=reward_cfg.delayed_reward_discount,
+                    )
                 production_trackers[p].observe_turn(t, env_obs[p], new_obs[p], p)
                 for buffer_idx, outcome in production_trackers[p].pop_capture_resolved(p):
                     buffer.add_delayed_reward(

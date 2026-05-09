@@ -82,6 +82,14 @@ class RewardConfig:
     enemy_capture_radius_weight: float = 0.02
     planet_loss_weight: float = 0.05
     planet_loss_credit_horizon: int = 30
+    # Defense-Window credit assignment for planet loss (Tasarım 2). Used
+    # only by the production_simple reward system. The penalty is split:
+    #   depart_share to launches FROM the lost planet (took ships away)
+    #   hold_share   to passive holds (NO-OP / kept ships at planet)
+    # If only one side has records in window, it absorbs the full share.
+    planet_defense_horizon: int = 30
+    planet_defense_depart_share: float = 0.7
+    planet_defense_hold_share: float = 0.3
     defense_hold_weight: float = 0.001
     defense_hold_horizon: int = 15
     defense_arrival_window: float = 1.5

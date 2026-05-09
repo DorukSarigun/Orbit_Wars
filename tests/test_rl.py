@@ -22,6 +22,7 @@ from rl.planet_loss_tracker import (
     PlanetLossTracker,
     compute_planet_loss_launch_penalty,
 )
+from rl.planet_defense_tracker import PlanetDefenseTracker
 from rl.production_reward_tracker import (
     ProductionRewardTracker,
     ProductionCaptureOutcome,
@@ -821,6 +822,121 @@ class TestPlanetLossTracker:
         tracker.observe_turn(5, prev, curr, 0)
 
         assert list(tracker.pop_resolved(0)) == []
+
+
+class TestPlanetDefenseTracker:
+    """Defense Window credit assignment for planet loss (Tasarım 2)."""
+
+    def _flip_p0_to_enemy(self):
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        curr["planets"][0][1] = 1   # P0 ownership flips 0 -> 1
+        curr["planets"][0][5] = 25  # leftover ships (irrelevant for tracker)
+        return prev, curr
+
+    def test_depart_only_absorbs_full_penalty_split_by_ships(self):
+        """When only DEPART actions are recorded, they share the full
+        (depart_share + hold_share) = 1.0 penalty proportional to ships."""
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(
+            horizon=30, depart_share=0.7, hold_share=0.3,
+            max_turns=500, num_opponents=1,
+        )
+        # Two launches FROM planet 0 with ratio 1:3
+        tracker.register_depart(buffer_idx=10, player=0,
+                                src_planet_id=0, turn=4, ships_sent=10)
+        tracker.register_depart(buffer_idx=11, player=0,
+                                src_planet_id=0, turn=4, ships_sent=30)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        resolved = list(tracker.pop_resolved(0))
+        # loss_value = production(3) * remaining(495) * opp_mult(3/2) * 0.001 * 1.0
+        loss_value = 3.0 * 495 * 1.5 * 0.001 * 1.0
+        # Full share since no holds present.
+        full_share = 0.7 + 0.3
+        expected = {
+            10: -loss_value * full_share * (10 / 40),
+            11: -loss_value * full_share * (30 / 40),
+        }
+        assert {idx: r for idx, r in resolved} == pytest.approx(expected, abs=1e-6)
+
+    def test_hold_only_absorbs_full_penalty(self):
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(
+            horizon=30, depart_share=0.7, hold_share=0.3,
+            max_turns=500, num_opponents=1,
+        )
+        tracker.register_hold(buffer_idx=20, player=0,
+                              planet_id=0, turn=4, ships_held=100)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        resolved = list(tracker.pop_resolved(0))
+        loss_value = 3.0 * 495 * 1.5 * 0.001 * 1.0
+        # Full share absorbed by single hold.
+        assert resolved == [(20, pytest.approx(-loss_value, abs=1e-6))]
+
+    def test_depart_and_hold_split_per_configured_shares(self):
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(
+            horizon=30, depart_share=0.7, hold_share=0.3,
+            max_turns=500, num_opponents=1,
+        )
+        tracker.register_depart(buffer_idx=10, player=0,
+                                src_planet_id=0, turn=4, ships_sent=40)
+        tracker.register_hold(buffer_idx=20, player=0,
+                              planet_id=0, turn=4, ships_held=60)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        resolved = dict(tracker.pop_resolved(0))
+        loss_value = 3.0 * 495 * 1.5 * 0.001 * 1.0
+        assert resolved[10] == pytest.approx(-loss_value * 0.7, abs=1e-6)
+        assert resolved[20] == pytest.approx(-loss_value * 0.3, abs=1e-6)
+
+    def test_no_records_yields_no_penalty(self):
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(horizon=30)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        assert list(tracker.pop_resolved(0)) == []
+
+    def test_actions_outside_horizon_are_expired(self):
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(horizon=10, max_turns=500, num_opponents=1)
+        # Action way before window
+        tracker.register_depart(buffer_idx=10, player=0,
+                                src_planet_id=0, turn=0, ships_sent=50)
+        # Action inside window
+        tracker.register_depart(buffer_idx=11, player=0,
+                                src_planet_id=0, turn=98, ships_sent=20)
+        tracker.observe_turn(100, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        resolved = list(tracker.pop_resolved(0))
+        # Only buffer_idx=11 should appear
+        assert [idx for idx, _ in resolved] == [11]
+
+    def test_planet_still_owned_emits_no_penalty(self):
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        # Planet 0 still owned by player 0 in curr -> no loss
+        tracker = PlanetDefenseTracker(horizon=30, max_turns=500, num_opponents=1)
+        tracker.register_depart(buffer_idx=10, player=0,
+                                src_planet_id=0, turn=4, ships_sent=20)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        assert list(tracker.pop_resolved(0)) == []
+        # Records should still be pending (not popped) for future loss
+        # detection if it occurs later in window.
+        tracker.observe_turn(10, _toy_env_obs(player=0),
+                             {**_toy_env_obs(player=0),
+                              "planets": [
+                                  [0, 1, 70.0, 70.0, 3.0, 25, 3],
+                                  [1, 1, 30.0, 30.0, 2.0, 80, 2],
+                                  [2, -1, 50.0, 90.0, 2.0, 20, 1],
+                              ]}, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        # Now planet 0 lost, depart record from turn 4 (within horizon=30) gets penalty
+        resolved = list(tracker.pop_resolved(0))
+        assert [idx for idx, _ in resolved] == [10]
 
 
 class TestProductionRewardTracker:
