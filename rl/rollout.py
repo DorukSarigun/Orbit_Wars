@@ -25,6 +25,7 @@ from feature_extraction import parse_planets, parse_fleets, fleet_speed
 from obs_builder import (
     build_observation,
     decode_action_with_launch,
+    DEFAULT_SHIP_BINS,
     INCOMING_ETA_BUCKETS,
     PF_IDX_SHIPS,
     PF_IDX_INCOMING_SELF_B0,
@@ -40,7 +41,11 @@ from .planet_loss_tracker import PlanetLossTracker, compute_planet_loss_launch_p
 from .production_reward_tracker import (
     ProductionRewardTracker,
     compute_production_capture_reward,
+    compute_production_neutral_gift_penalty,
 )
+
+MAX_LAUNCHES_PER_PLAYER_TURN = 8
+MAX_PAIR_CANDIDATES = 64
 
 
 def _incoming_bucket_idx(eta: float) -> int:
@@ -81,14 +86,14 @@ def _enemy_incoming_ships(obs, slot: int) -> float:
             slot,
             PF_IDX_INCOMING_ENEMY_B0:PF_IDX_INCOMING_ENEMY_B0 + len(INCOMING_ETA_BUCKETS),
         ].sum()
-    ) * 500.0
+    ) * 100.0
 
 
 def _source_threat_intensity(obs, slot: int, ships_remaining_after_launch: int) -> float:
     """Approximate threat-to-remaining ratio for a source planet.
 
-    Enemy incoming ETA buckets store ships/500.0 (see rollout's
-    self-bucket update), so multiplying the bucket sum by 500 gives an
+    Enemy incoming ETA buckets store ships/100.0 (see rollout's
+    self-bucket update), so multiplying the bucket sum by 100 gives an
     approximate raw enemy ship count en route to this planet. Dividing
     by `ships_remaining_after_launch` produces a threat intensity in
     units of "incoming enemy ships per defender". 0 means safe.
@@ -145,6 +150,71 @@ class EpisodeStats:
         return self.n_launches[1] if len(self.n_launches) > 1 else 0
 
 
+@dataclass
+class ScriptedExpansionConfig:
+    turns: int = 0
+    nearest_k: int = 5
+
+
+def _scripted_neutral_expansion_action(
+    policy: OrbitWarsPolicy,
+    out,
+    obs,
+    src_slot: int,
+    planets: list,
+    player: int,
+    *,
+    device: torch.device,
+    nearest_k: int = 5,
+) -> Optional[dict]:
+    src_id = int(obs.planet_ids[src_slot])
+    src = next((p for p in planets if p.id == src_id), None)
+    if src is None or src.owner != player or src.ships <= 1:
+        return None
+    slot_by_planet_id = {
+        int(pid): slot
+        for slot, pid in enumerate(obs.planet_ids)
+        if int(pid) >= 0
+    }
+    candidates = [
+        p for p in planets
+        if p.owner == -1 and not p.is_comet and p.id != src_id and p.id in slot_by_planet_id
+    ]
+    if not candidates:
+        return None
+    nearest = sorted(
+        candidates,
+        key=lambda p: (math.hypot(src.x - p.x, src.y - p.y), p.id),
+    )[:max(1, int(nearest_k))]
+    scored = []
+    for tgt in nearest:
+        valid_bins = [
+            idx for idx, frac in enumerate(DEFAULT_SHIP_BINS)
+            if max(1, int(src.ships * float(frac))) > int(tgt.ships)
+        ]
+        if not valid_bins:
+            continue
+        distance = math.hypot(src.x - tgt.x, src.y - tgt.y)
+        score = float(tgt.production) / max(1.0, float(tgt.ships))
+        scored.append((score, -distance, int(tgt.production), -int(tgt.ships), tgt.id, valid_bins[0]))
+    if not scored:
+        return None
+    _, _, _, _, target_id, ship_bin = max(scored)
+    src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
+    tgt_tensor = torch.tensor([slot_by_planet_id[int(target_id)]], device=device, dtype=torch.long)
+    ship_tensor = torch.tensor([ship_bin], device=device, dtype=torch.long)
+    noop_tensor = torch.tensor([False], device=device, dtype=torch.bool)
+    with torch.no_grad():
+        ev = policy.evaluate_source_actions(out, src_tensor, tgt_tensor, ship_tensor, noop_tensor)
+    return {
+        "src": src_tensor,
+        "tgt": tgt_tensor,
+        "ship_bin": ship_tensor,
+        "is_noop": noop_tensor,
+        "log_prob": ev["log_prob"],
+    }
+
+
 def _act_for_player(
     policy: OrbitWarsPolicy,
     env_obs: dict,
@@ -153,6 +223,7 @@ def _act_for_player(
     device: torch.device,
     current_turn: int = 0,
     max_turns: int = 500,
+    scripted_expansion: Optional[ScriptedExpansionConfig] = None,
 ) -> tuple:
     angular_velocity = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=angular_velocity,
@@ -181,6 +252,176 @@ def _act_for_player(
     source_slots = [int(i) for i, ok in enumerate(obs.source_mask) if ok]
     last_out = None
 
+    if getattr(policy, "model_variant", "") == "grouped_planet":
+        available_pairs = obs.planet_mask[None, :].repeat(policy.p_max, axis=0)
+        available_pairs &= obs.source_mask[:, None]
+        available_pairs &= ~torch.eye(policy.p_max, dtype=torch.bool).numpy()
+        while launch_count < MAX_LAUNCHES_PER_PLAYER_TURN and any(bool(ok) for ok in obs_work.source_mask):
+            obs_decision = replace(
+                obs_work,
+                planet_feats=obs_work.planet_feats.copy(),
+                source_mask=obs_work.source_mask.copy(),
+            )
+            batch = pack_observations([obs_decision], device=device)
+            selected = None
+            with torch.no_grad():
+                out = policy(**batch)
+                if scripted_expansion is not None and current_turn < scripted_expansion.turns:
+                    scripted_action = None
+                    for src_slot in [int(i) for i, ok in enumerate(obs_decision.source_mask) if ok]:
+                        scripted_action = _scripted_neutral_expansion_action(
+                            policy,
+                            out,
+                            obs_decision,
+                            src_slot,
+                            parsed,
+                            player,
+                            device=device,
+                            nearest_k=scripted_expansion.nearest_k,
+                        )
+                        if scripted_action is not None:
+                            break
+                    if scripted_action is not None:
+                        action = scripted_action
+                        src_slot = int(action["src"][0])
+                        tgt_slot = int(action["tgt"][0])
+                        ship_bin = int(action["ship_bin"][0])
+                        is_noop = bool(action["is_noop"][0])
+                        decoded = decode_action_with_launch(
+                            obs_decision, src_slot, tgt_slot, ship_bin,
+                            planets=parsed, angular_velocity=angular_velocity, no_op=is_noop,
+                        )
+                        if decoded is not None:
+                            selected = (action, decoded)
+                        ranked = []
+                    else:
+                        pair_logits = out.tgt_logits[0].clone()
+                        pair_logits[~torch.as_tensor(available_pairs, device=pair_logits.device)] = torch.finfo(pair_logits.dtype).min
+                        ranked = torch.topk(
+                            pair_logits.reshape(-1),
+                            k=min(MAX_PAIR_CANDIDATES, pair_logits.numel()),
+                        ).indices.tolist()
+                else:
+                    pair_logits = out.tgt_logits[0].clone()
+                    pair_logits[~torch.as_tensor(available_pairs, device=pair_logits.device)] = torch.finfo(pair_logits.dtype).min
+                    ranked = torch.topk(
+                        pair_logits.reshape(-1),
+                        k=min(MAX_PAIR_CANDIDATES, pair_logits.numel()),
+                    ).indices.tolist()
+            last_out = out
+            if ranked:
+                for pair_idx in ranked:
+                    src_slot = int(pair_idx // policy.p_max)
+                    tgt_slot = int(pair_idx % policy.p_max)
+                    if not bool(obs_decision.source_mask[src_slot]):
+                        continue
+                    if not bool(obs_decision.planet_mask[tgt_slot]):
+                        continue
+                    if src_slot == tgt_slot:
+                        continue
+                    if not bool(available_pairs[src_slot, tgt_slot]):
+                        continue
+                    ship_order = torch.argsort(out.ship_logits[0, src_slot, tgt_slot], descending=True).tolist()
+                    for ship_bin in ship_order:
+                        decoded = decode_action_with_launch(
+                            obs_decision, src_slot, tgt_slot, int(ship_bin),
+                            planets=parsed, angular_velocity=angular_velocity, no_op=False,
+                        )
+                        if decoded is None:
+                            continue
+                        src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
+                        tgt_tensor = torch.tensor([tgt_slot], device=device, dtype=torch.long)
+                        ship_tensor = torch.tensor([int(ship_bin)], device=device, dtype=torch.long)
+                        noop_tensor = torch.tensor([False], device=device, dtype=torch.bool)
+                        with torch.no_grad():
+                            ev = policy.evaluate_source_actions(out, src_tensor, tgt_tensor, ship_tensor, noop_tensor)
+                        action = {
+                            "src": src_tensor,
+                            "tgt": tgt_tensor,
+                            "ship_bin": ship_tensor,
+                            "is_noop": noop_tensor,
+                            "log_prob": ev["log_prob"],
+                        }
+                        selected = (action, decoded)
+                        break
+                    if selected is not None:
+                        break
+            if selected is None:
+                with torch.no_grad():
+                    for src_slot in [int(i) for i, ok in enumerate(obs_decision.source_mask) if ok]:
+                        src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
+                        tgt_tensor = torch.tensor([0], device=device, dtype=torch.long)
+                        ship_tensor = torch.tensor([0], device=device, dtype=torch.long)
+                        noop_tensor = torch.tensor([True], device=device, dtype=torch.bool)
+                        ev = policy.evaluate_source_actions(out, src_tensor, tgt_tensor, ship_tensor, noop_tensor)
+                        decisions.append((obs_decision, {
+                            "src": src_tensor,
+                            "tgt": tgt_tensor,
+                            "ship_bin": ship_tensor,
+                            "is_noop": noop_tensor,
+                            "log_prob": ev["log_prob"],
+                        }, out, False, False, None))
+                        obs_work.source_mask[src_slot] = False
+                break
+
+            action, decoded = selected
+            src_slot = int(action["src"][0])
+            tgt_slot = int(action["tgt"][0])
+            move = decoded[0]
+            launch_info = decoded[1]
+            env_action.append(move)
+            launch_count += 1
+            sent_ships = float(move[2])
+            obs_work.planet_feats[src_slot, PF_IDX_SHIPS] = max(
+                0.0, obs_work.planet_feats[src_slot, PF_IDX_SHIPS] - sent_ships / 100.0
+            )
+            src_planet_id = int(obs_decision.planet_ids[src_slot])
+            tgt_planet_id = int(obs_decision.planet_ids[tgt_slot])
+            src_planet = next((p for p in parsed if p.id == src_planet_id), None)
+            tgt_planet = next((p for p in parsed if p.id == tgt_planet_id), None)
+            speed = fleet_speed(int(sent_ships))
+            eta = float(launch_info["eta"]) if launch_info is not None else 0.0
+            distance = eta * max(speed, 1e-6) if eta > 0.0 else 0.0
+            if eta <= 0.0 and src_planet and tgt_planet:
+                distance = math.hypot(src_planet.x - tgt_planet.x, src_planet.y - tgt_planet.y)
+                eta = distance / max(speed, 1e-6)
+            bucket = _incoming_bucket_idx(eta)
+            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 100.0
+            src_ships_pre = int(round(float(obs_decision.planet_feats[src_slot, PF_IDX_SHIPS]) * 100.0))
+            src_ships_remaining = max(0, src_ships_pre - int(sent_ships))
+            if src_planet is not None:
+                src_planet.ships = src_ships_remaining
+            source_enemy_incoming = _enemy_incoming_ships(obs_decision, src_slot)
+            source_threat = _source_threat_intensity(obs_decision, src_slot, src_ships_remaining)
+            fleet_meta = {
+                "launch_turn": current_turn,
+                "player": player,
+                "src_planet_id": src_planet_id,
+                "tgt_planet_id": tgt_planet_id,
+                "ships_sent": int(sent_ships),
+                "angle": move[1],
+                "distance": distance,
+                "eta": eta,
+                "launch_tgt_owner": int(tgt_planet.owner) if tgt_planet else -2,
+                "launch_tgt_ships": int(tgt_planet.ships) if tgt_planet else 0,
+                "source_had_enemy_incoming": _planet_under_enemy_attack(obs_decision, src_slot),
+                "source_enemy_incoming": float(source_enemy_incoming),
+                "source_ships_remaining_after_launch": int(src_ships_remaining),
+                "source_threat_intensity": float(source_threat),
+                "my_total_ships_at_launch": int(my_total_ships),
+                "enemy_total_ships_at_launch": int(enemy_total_ships),
+            }
+            obs_work.source_mask[src_slot] = obs_work.planet_feats[src_slot, PF_IDX_SHIPS] > 0.01
+            available_pairs[src_slot, tgt_slot] = False
+            if not bool(obs_work.source_mask[src_slot]):
+                available_pairs[src_slot, :] = False
+            decisions.append((obs_decision, action, out, True, False, fleet_meta))
+        if last_out is None:
+            batch = pack_observations([obs], device=device)
+            with torch.no_grad():
+                last_out = policy(**batch)
+        return decisions, env_action, last_out, launch_count, invalid_count
+
     for src_slot in source_slots:
         obs_decision = replace(
             obs_work,
@@ -195,6 +436,19 @@ def _act_for_player(
                 torch.tensor([src_slot], device=device),
                 deterministic=False,
             )
+            if scripted_expansion is not None and current_turn < scripted_expansion.turns:
+                scripted_action = _scripted_neutral_expansion_action(
+                    policy,
+                    out,
+                    obs_decision,
+                    src_slot,
+                    parsed,
+                    player,
+                    device=device,
+                    nearest_k=scripted_expansion.nearest_k,
+                )
+                if scripted_action is not None:
+                    action = scripted_action
         last_out = out
 
         tgt_slot = int(action["tgt"][0])
@@ -226,7 +480,7 @@ def _act_for_player(
                 distance = math.hypot(src_planet.x - tgt_planet.x, src_planet.y - tgt_planet.y)
                 eta = distance / max(speed, 1e-6)
             bucket = _incoming_bucket_idx(eta)
-            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 500.0
+            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 100.0
             # Source-planet threat assessment (used for risk-aware airborne).
             src_ships_pre = int(round(float(obs_decision.planet_feats[src_slot, PF_IDX_SHIPS]) * 100.0))
             src_ships_remaining = max(0, src_ships_pre - int(sent_ships))
@@ -276,6 +530,7 @@ def collect_episode(
     device: Optional[torch.device] = None,
     seed: Optional[int] = None,
     progress_cb=None,
+    scripted_expansion: Optional[ScriptedExpansionConfig] = None,
 ) -> EpisodeStats:
     """Play one self-play game and append all transitions (both players)
     into `buffer`. Returns episode-level statistics.
@@ -321,7 +576,8 @@ def collect_episode(
         # own perspective (different feature normalization in obs_builder).
         acted = [
             _act_for_player(policy, env_obs[p], p, device=device, current_turn=t,
-                        max_turns=reward_cfg.max_turns)
+                        max_turns=reward_cfg.max_turns,
+                        scripted_expansion=scripted_expansion)
             for p in range(num_agents)
         ]
         env_actions = []
@@ -454,6 +710,8 @@ def collect_episode(
                             ships_sent=fleet_meta["ships_sent"],
                             est_arrival_turn=fleet_meta["launch_turn"] + fleet_meta["eta"],
                             launch_target_owner=fleet_meta["launch_tgt_owner"],
+                            launch_target_ships=fleet_meta["launch_tgt_ships"],
+                            my_total_ships_at_launch=fleet_meta["my_total_ships_at_launch"],
                         )
                     else:
                         planet_loss_trackers[p].register_launch(
@@ -499,6 +757,20 @@ def collect_episode(
                         compute_production_capture_reward(
                             outcome,
                             reward_scale=reward_cfg.reward_scale,
+                            production_reward_beta=reward_cfg.production_reward_beta,
+                            production_reward_reference=reward_cfg.production_reward_reference,
+                        ),
+                        event_turn=t,
+                        discount=reward_cfg.delayed_reward_discount,
+                    )
+                for buffer_idx, outcome in production_trackers[p].pop_neutral_gift_resolved(p):
+                    buffer.add_delayed_reward(
+                        buffer_idx,
+                        compute_production_neutral_gift_penalty(
+                            outcome,
+                            reward_scale=reward_cfg.reward_scale,
+                            production_reward_beta=reward_cfg.production_reward_beta,
+                            production_reward_reference=reward_cfg.production_reward_reference,
                         ),
                         event_turn=t,
                         discount=reward_cfg.delayed_reward_discount,

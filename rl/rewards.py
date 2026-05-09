@@ -86,6 +86,8 @@ class RewardConfig:
     defense_hold_horizon: int = 15
     defense_arrival_window: float = 1.5
     delayed_reward_discount: float = 1.0
+    production_reward_beta: float = 0.0
+    production_reward_reference: float = 3.0
     invalid_action_penalty: float = 0.01
     reward_scale: float = 1.0
     draw_terminal_reward: float = 0.0

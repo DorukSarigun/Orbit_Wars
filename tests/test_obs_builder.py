@@ -24,6 +24,21 @@ from obs_builder import (
     build_observation,
     decode_action,
     decode_action_with_launch,
+    PF_IDX_OWNER_SELF,
+    PF_IDX_OWNER_ENEMY_0,
+    PF_IDX_OWNER_ENEMY_1,
+    PF_IDX_OWNER_ENEMY_2,
+    PF_IDX_OWNER_NEUTRAL,
+    PF_IDX_INCOMING_SELF_B0,
+    PF_IDX_INCOMING_ENEMY_B0,
+    PF_IDX_INCOMING_SELF_TOTAL,
+    PF_IDX_INCOMING_ENEMY_TOTAL,
+    PF_IDX_INCOMING_SELF_MIN_ETA,
+    PF_IDX_INCOMING_ENEMY_MIN_ETA,
+    PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS,
+    PF_IDX_INCOMING_ENEMY_LARGEST_SHIPS,
+    PF_IDX_INCOMING_ENEMY_LARGEST_ETA,
+    PF_IDX_INCOMING_NET_THREAT,
 )
 
 
@@ -111,16 +126,19 @@ def test_too_many_planets_raises():
 def test_owner_one_hot_in_planet_features():
     obs = make_obs(planets=[
         [0, 0, 70.0, 70.0, 3.0, 100, 3],   # mine
-        [1, 1, 30.0, 30.0, 2.0, 50, 2],    # enemy
-        [2, -1, 80.0, 20.0, 2.0, 20, 1],   # neutral
+        [1, 1, 30.0, 30.0, 2.0, 50, 2],    # enemy 0
+        [2, 2, 35.0, 30.0, 2.0, 40, 2],    # enemy 1
+        [3, 3, 40.0, 30.0, 2.0, 30, 2],    # enemy 2
+        [4, -1, 80.0, 20.0, 2.0, 20, 1],   # neutral
     ])
     o = build_observation(obs, player=0, angular_velocity=0.0)
-    # Cols 0,1,2 = (is_self, is_enemy, is_neutral); exactly one set per real planet.
-    one_hot = o.planet_feats[:3, :3]
+    one_hot = o.planet_feats[:5, :5]
     assert np.allclose(one_hot.sum(axis=1), 1.0)
-    assert one_hot[0, 0] == 1.0   # planet 0 -> self
-    assert one_hot[1, 1] == 1.0   # planet 1 -> enemy
-    assert one_hot[2, 2] == 1.0   # planet 2 -> neutral
+    assert one_hot[0, PF_IDX_OWNER_SELF] == 1.0
+    assert one_hot[1, PF_IDX_OWNER_ENEMY_0] == 1.0
+    assert one_hot[2, PF_IDX_OWNER_ENEMY_1] == 1.0
+    assert one_hot[3, PF_IDX_OWNER_ENEMY_2] == 1.0
+    assert one_hot[4, PF_IDX_OWNER_NEUTRAL] == 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -241,23 +259,22 @@ def test_planet_features_track_multi_enemy_incoming_slots():
         [11, 1, 72.0, 60.0, 0.0, 0, 30],
         [12, 2, 74.0, 60.0, 0.0, 0, 40],
         [13, 3, 76.0, 60.0, 0.0, 0, 50],
-        [14, 4, 78.0, 60.0, 0.0, 0, 60],
     ]
     obs = make_obs(planets=planets, fleets=fleets)
     o = build_observation(obs, player=0, angular_velocity=0.0, f_max=8)
 
     target_feats = o.planet_feats[1]
-    assert math.isclose(target_feats[16], 20 / 500.0, abs_tol=1e-6)
-    assert math.isclose(target_feats[19], 150 / 500.0, abs_tol=1e-6)
-    assert math.isclose(target_feats[20], 30 / 500.0, abs_tol=1e-6)
-    assert math.isclose(target_feats[23], 20 / 500.0, abs_tol=1e-6)
-    assert math.isclose(target_feats[24], 180 / 500.0, abs_tol=1e-6)
-    assert target_feats[25] > 0.0
-    assert target_feats[26] > 0.0
-    assert math.isclose(target_feats[27], 60 / 500.0, abs_tol=1e-6)
-    assert math.isclose(target_feats[28], 60 / 500.0, abs_tol=1e-6)
-    assert target_feats[29] > 0.0
-    assert math.isclose(target_feats[30], (180 - 50 - 20) / 500.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[PF_IDX_INCOMING_SELF_B0 + 1], 20 / 100.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[PF_IDX_INCOMING_ENEMY_B0], 90 / 100.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[PF_IDX_INCOMING_ENEMY_B0 + 1], 30 / 100.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[PF_IDX_INCOMING_SELF_TOTAL], 20 / 100.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[PF_IDX_INCOMING_ENEMY_TOTAL], 120 / 100.0, abs_tol=1e-6)
+    assert target_feats[PF_IDX_INCOMING_SELF_MIN_ETA] > 0.0
+    assert target_feats[PF_IDX_INCOMING_ENEMY_MIN_ETA] > 0.0
+    assert math.isclose(target_feats[PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS], 50 / 100.0, abs_tol=1e-6)
+    assert math.isclose(target_feats[PF_IDX_INCOMING_ENEMY_LARGEST_SHIPS], 50 / 100.0, abs_tol=1e-6)
+    assert target_feats[PF_IDX_INCOMING_ENEMY_LARGEST_ETA] > 0.0
+    assert math.isclose(target_feats[PF_IDX_INCOMING_NET_THREAT], (120 - 50 - 20) / 100.0, abs_tol=1e-6)
 
 
 def test_global_features_player_aggregates():
@@ -274,8 +291,7 @@ def test_global_features_player_aggregates():
     assert math.isclose(o.global_feats[3], 1 / 25.0, abs_tol=1e-6)
     # neutral / 25
     assert math.isclose(o.global_feats[4], 1 / 25.0, abs_tol=1e-6)
-    # my_total_ships / 1000 = 300/1000
-    assert math.isclose(o.global_feats[5], 0.3, abs_tol=1e-6)
+    assert math.isclose(o.global_feats[5], 300 / 100.0, abs_tol=1e-6)
 
 
 # -----------------------------------------------------------------------------

@@ -24,6 +24,7 @@ from typing import Optional
 import torch
 
 from model import OrbitWarsPolicy
+from model_grouped_planet import GroupedPlanetOrbitWarsPolicy
 from model_planet_only import PlanetOnlyOrbitWarsPolicy
 
 from .buffer import RolloutBuffer
@@ -33,7 +34,7 @@ from .metrics import (
 )
 from .ppo import PPOConfig, ppo_update
 from .rewards import REWARD_SYSTEMS, RewardConfig, build_reward_config
-from .rollout import collect_episode
+from .rollout import ScriptedExpansionConfig, collect_episode
 
 
 @dataclass
@@ -56,12 +57,20 @@ class TrainConfig:
     d_model: int = 128
     n_heads: int = 4
     n_layers: int = 4
+    grouped_attention_type: str = "full"
+    n_inducing_points: int = 32
     model_variant: str = "planet_only"
     save_game_batches: bool = False
     batch_save_dir: str = "checkpoints/game_batches"
+    scripted_expansion_turns: int = 0
+    scripted_expansion_nearest_k: int = 5
 
 
 def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
+    if variant == "grouped_planet":
+        return GroupedPlanetOrbitWarsPolicy(**kwargs)
+    kwargs.pop("attention_type", None)
+    kwargs.pop("n_inducing_points", None)
     if variant == "planet_only":
         return PlanetOnlyOrbitWarsPolicy(**kwargs)
     if variant == "full":
@@ -106,9 +115,11 @@ def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int
             "planet_dim": policy.planet_dim,
             "d_model": policy.d_model,
             "n_heads": policy.n_heads,
-            "n_layers": len(policy.blocks),
+            "n_layers": len(policy.encoder.blocks) if getattr(policy, "model_variant", "full") == "grouped_planet" else len(policy.blocks),
             "n_ship_bins": policy.n_ship_bins,
             "model_variant": getattr(policy, "model_variant", "full"),
+            "attention_type": getattr(policy, "attention_type", "full"),
+            "n_inducing_points": getattr(policy, "n_inducing_points", 32),
         },
     }, path)
 
@@ -149,6 +160,8 @@ def load_checkpoint(path: str | Path, device: torch.device | None = None) -> tup
         p_max=arch["p_max"], f_max=arch["f_max"], planet_dim=planet_dim,
         d_model=arch["d_model"], n_heads=arch["n_heads"],
         n_layers=arch["n_layers"], n_ship_bins=arch["n_ship_bins"],
+        attention_type=arch.get("attention_type", "full"),
+        n_inducing_points=arch.get("n_inducing_points", 32),
     )
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.to(device)
@@ -179,14 +192,19 @@ def train(
             d_model=train_cfg.d_model,
             n_heads=train_cfg.n_heads,
             n_layers=train_cfg.n_layers,
+            attention_type=train_cfg.grouped_attention_type,
+            n_inducing_points=train_cfg.n_inducing_points,
         ).to(device)
         start_iter = 0
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=train_cfg.learning_rate)
     n_params = sum(p.numel() for p in policy.parameters())
     variant = getattr(policy, "model_variant", "full")
-    token_count = policy.p_max + 1 if variant == "planet_only" else policy.p_max + policy.f_max + 1
-    print(f"Policy[{variant}]: {n_params:,} params, T={token_count}, device={device}")
+    token_count = policy.p_max * 6 if variant == "grouped_planet" else policy.p_max + 1 if variant == "planet_only" else policy.p_max + policy.f_max + 1
+    attention_info = ""
+    if variant == "grouped_planet":
+        attention_info = f", attention={policy.attention_type}, M={policy.n_inducing_points}"
+    print(f"Policy[{variant}]: {n_params:,} params, T={token_count}{attention_info}, device={device}")
 
     log_path = Path(train_cfg.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -206,6 +224,13 @@ def train(
                 reward_cfg=reward_cfg,
                 device=device,
                 seed=seed,
+                scripted_expansion=(
+                    ScriptedExpansionConfig(
+                        turns=train_cfg.scripted_expansion_turns,
+                        nearest_k=train_cfg.scripted_expansion_nearest_k,
+                    )
+                    if train_cfg.scripted_expansion_turns > 0 else None
+                ),
             )
             end_idx = len(buffer)
             ep_stats_list.append((ep, start_idx, end_idx, seed, stats))
@@ -344,10 +369,16 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--n-layers", type=int, default=4)
-    p.add_argument("--model-variant", choices=("full", "planet_only"), default="planet_only")
+    p.add_argument("--grouped-attention-type", choices=("full", "induced"), default="full")
+    p.add_argument("--n-inducing-points", type=int, default=32)
+    p.add_argument("--model-variant", choices=("full", "planet_only", "grouped_planet"), default="planet_only")
     p.add_argument("--save-game-batches", action="store_true",
                    help="Save one .pt rollout/training batch per self-play game after GAE")
     p.add_argument("--batch-save-dir", default="checkpoints/game_batches")
+    p.add_argument("--scripted-expansion-turns", type=int, default=0,
+                   help="Force early neutral-expansion launches for this many turns")
+    p.add_argument("--scripted-expansion-nearest-k", type=int, default=5,
+                   help="Choose best production/ships neutral target among this many nearest planets")
     p.add_argument("--clip-range", type=float, default=0.2)
     p.add_argument("--ppo-epochs", type=int, default=4, dest="epochs",
                    help="Number of optimization epochs over each rollout buffer "
@@ -385,6 +416,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--defense-arrival-window", type=float, default=None)
     p.add_argument("--delayed-reward-discount", type=float, default=None,
                    help="Multiplier per delayed-credit step: reward *= discount ** delay")
+    p.add_argument("--production-reward-beta", type=float, default=None,
+                   help="Superlinear production reward exponent; 0 keeps production value linear")
+    p.add_argument("--production-reward-reference", type=float, default=None,
+                   help="Reference production value preserved by --production-reward-beta")
     p.add_argument("--invalid-action-penalty", type=float, default=None)
     p.add_argument("--reward-scale", type=float, default=None)
     p.add_argument("--draw-terminal-reward", type=float, default=None)
@@ -415,9 +450,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         log_path=args.log_path,
         device=args.device,
         d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
+        grouped_attention_type=args.grouped_attention_type,
+        n_inducing_points=args.n_inducing_points,
         model_variant=args.model_variant,
         save_game_batches=args.save_game_batches,
         batch_save_dir=args.batch_save_dir,
+        scripted_expansion_turns=args.scripted_expansion_turns,
+        scripted_expansion_nearest_k=args.scripted_expansion_nearest_k,
     )
     ppo_cfg = PPOConfig(
         clip_range=args.clip_range,
@@ -446,6 +485,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         defense_hold_horizon=args.defense_hold_horizon,
         defense_arrival_window=args.defense_arrival_window,
         delayed_reward_discount=args.delayed_reward_discount,
+        production_reward_beta=args.production_reward_beta,
+        production_reward_reference=args.production_reward_reference,
         invalid_action_penalty=args.invalid_action_penalty,
         reward_scale=args.reward_scale,
         draw_terminal_reward=args.draw_terminal_reward,

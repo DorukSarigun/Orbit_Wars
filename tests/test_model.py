@@ -18,6 +18,11 @@ sys.path.insert(0, ROOT)
 
 from obs_builder import build_observation
 from model import OrbitWarsPolicy, pack_observations
+from model_grouped_planet import (
+    GroupedPlanetOrbitWarsPolicy,
+    GroupedPlanetRelationEncoder,
+    PlanetFeatureGroupProjector,
+)
 from model_planet_only import PlanetOnlyOrbitWarsPolicy
 
 
@@ -78,6 +83,77 @@ def test_planet_only_forward_pass_shapes(batch):
     assert out.ship_logits.shape == (B, 8, 5)
     assert out.value.shape == (B,)
     assert out.tokens.shape == (B, 8 + 1, 32)
+
+
+def test_grouped_planet_forward_pass_shapes(batch):
+    obs_list, b = batch
+    net = GroupedPlanetRelationEncoder(p_max=8, f_max=4, d_model=32, n_heads=2, n_layers=2)
+    out = net(**b)
+    B = len(obs_list)
+    assert out["group_tokens"].shape == (B, 8, 6, 32)
+    assert out["planet_tokens"].shape == (B, 8, 32)
+    assert out["group_summary_tokens"].shape == (B, 6, 32)
+    assert out["global_summary"].shape == (B, 32)
+    assert out["group_tokens"][:, 4:].abs().max().item() == 0.0
+    assert out["planet_tokens"][:, 4:].abs().max().item() == 0.0
+
+
+def test_grouped_planet_policy_forward_pass_shapes(batch):
+    obs_list, b = batch
+    net = GroupedPlanetOrbitWarsPolicy(p_max=8, f_max=4, d_model=32, n_heads=2, n_layers=2)
+    out = net(**b)
+    B = len(obs_list)
+    assert out.src_logits.shape == (B, 8 + 1)
+    assert out.tgt_logits.shape == (B, 8, 8)
+    assert out.ship_logits.shape == (B, 8, 8, 5)
+    assert out.value.shape == (B,)
+    assert out.tokens.shape == (B, 8 * 6, 32)
+    assert out.aux_owner_logits.shape == (B, 8, 5)
+
+
+def test_grouped_planet_policy_induced_forward_pass_shapes(batch):
+    obs_list, b = batch
+    net = GroupedPlanetOrbitWarsPolicy(
+        p_max=8,
+        f_max=4,
+        d_model=32,
+        n_heads=2,
+        n_layers=2,
+        attention_type="induced",
+        n_inducing_points=4,
+    )
+    out = net(**b)
+    B = len(obs_list)
+    assert out.src_logits.shape == (B, 8 + 1)
+    assert out.tgt_logits.shape == (B, 8, 8)
+    assert out.ship_logits.shape == (B, 8, 8, 5)
+    assert out.value.shape == (B,)
+    assert out.tokens.shape == (B, 8 * 6, 32)
+
+
+def test_grouped_planet_policy_act_source_matches_eval(batch):
+    torch.manual_seed(0)
+    _, b = batch
+    net = GroupedPlanetOrbitWarsPolicy(p_max=8, f_max=4, d_model=32, n_heads=2, n_layers=2)
+    out = net(**b)
+    src = torch.zeros(b["planet_feats"].shape[0], dtype=torch.long)
+    action = net.act_source(out, src, deterministic=False)
+    assert torch.equal(action["src"], src)
+    ev = net.evaluate_source_actions(
+        out,
+        action["src"],
+        action["tgt"],
+        action["ship_bin"],
+        action["is_noop"],
+    )
+    assert torch.allclose(ev["log_prob"], action["log_prob"], atol=1e-5)
+
+
+def test_grouped_planet_projector_output_shape(batch):
+    _, b = batch
+    projector = PlanetFeatureGroupProjector(planet_dim=b["planet_feats"].shape[-1], d_model=32)
+    tokens = projector(b["planet_feats"])
+    assert tokens.shape == (b["planet_feats"].shape[0], b["planet_feats"].shape[1], 6, 32)
 
 
 def test_no_nan_in_logits(batch):

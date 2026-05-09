@@ -30,6 +30,7 @@ from feature_extraction import parse_planets, fleet_speed
 from obs_builder import (
     build_observation,
     decode_action,
+    decode_action_with_launch,
     INCOMING_ETA_BUCKETS,
     PF_IDX_SHIPS,
     PF_IDX_INCOMING_SELF_B0,
@@ -40,6 +41,9 @@ from .train import load_checkpoint as load_ppo_checkpoint
 from .dqn_train import load_dqn_checkpoint
 from model_q import OrbitWarsQNet
 from playground import render_board
+
+MAX_LAUNCHES_PER_PLAYER_TURN = 8
+MAX_PAIR_CANDIDATES = 64
 
 
 def _incoming_bucket_idx(eta: float) -> int:
@@ -120,6 +124,83 @@ def _act_all_sources(net, env_obs, player: int, *,
         source_mask=obs.source_mask.copy(),
     )
 
+    if getattr(net, "model_variant", "") == "grouped_planet":
+        available_pairs = obs.planet_mask[None, :].repeat(net.p_max, axis=0)
+        available_pairs &= obs.source_mask[:, None]
+        available_pairs &= ~torch.eye(net.p_max, dtype=torch.bool).numpy()
+        while len(env_actions) < MAX_LAUNCHES_PER_PLAYER_TURN and any(bool(ok) for ok in obs_work.source_mask):
+            obs_decision = replace(
+                obs_work,
+                planet_feats=obs_work.planet_feats.copy(),
+                source_mask=obs_work.source_mask.copy(),
+            )
+            batch = pack_observations([obs_decision], device=device)
+            with torch.no_grad():
+                out = net(**batch)
+            selected = None
+            pair_logits = out.tgt_logits[0].clone()
+            pair_logits[~torch.as_tensor(available_pairs, device=pair_logits.device)] = torch.finfo(pair_logits.dtype).min
+            ranked = torch.topk(
+                pair_logits.reshape(-1),
+                k=min(MAX_PAIR_CANDIDATES, pair_logits.numel()),
+            ).indices.tolist()
+            for pair_idx in ranked:
+                src_slot = int(pair_idx // net.p_max)
+                tgt_slot = int(pair_idx % net.p_max)
+                if not bool(obs_decision.source_mask[src_slot]):
+                    continue
+                if not bool(obs_decision.planet_mask[tgt_slot]):
+                    continue
+                if src_slot == tgt_slot:
+                    continue
+                if not bool(available_pairs[src_slot, tgt_slot]):
+                    continue
+                ship_order = torch.argsort(out.ship_logits[0, src_slot, tgt_slot], descending=True).tolist()
+                for ship_bin in ship_order:
+                    decoded = decode_action_with_launch(
+                        obs_decision, src_slot, tgt_slot, int(ship_bin),
+                        planets=parsed, angular_velocity=omega, no_op=False,
+                    )
+                    if decoded is not None:
+                        selected = (src_slot, tgt_slot, int(ship_bin), decoded)
+                        break
+                if selected is not None:
+                    break
+            if selected is None:
+                break
+            src_slot, tgt_slot, ship_bin, decoded = selected
+            move, launch_info = decoded
+            env_actions.append(move)
+            sent_ships = float(move[2])
+            obs_work.planet_feats[src_slot, PF_IDX_SHIPS] = max(
+                0.0, obs_work.planet_feats[src_slot, PF_IDX_SHIPS] - sent_ships / 100.0
+            )
+            src_planet_id = int(obs_decision.planet_ids[src_slot])
+            src_planet = next((p for p in parsed if p.id == src_planet_id), None)
+            if src_planet is not None:
+                src_planet.ships = max(0, int(round(float(obs_work.planet_feats[src_slot, PF_IDX_SHIPS]) * 100.0)))
+            eta = float(launch_info["eta"]) if launch_info is not None else 0.0
+            if eta <= 0.0:
+                tgt_planet_id = int(obs_decision.planet_ids[tgt_slot])
+                tgt_planet = next((p for p in parsed if p.id == tgt_planet_id), None)
+                if src_planet and tgt_planet:
+                    distance = ((src_planet.x - tgt_planet.x) ** 2 + (src_planet.y - tgt_planet.y) ** 2) ** 0.5
+                    eta = distance / max(fleet_speed(int(sent_ships)), 1e-6)
+            bucket = _incoming_bucket_idx(eta)
+            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 100.0
+            obs_work.source_mask[src_slot] = obs_work.planet_feats[src_slot, PF_IDX_SHIPS] > 0.01
+            available_pairs[src_slot, tgt_slot] = False
+            if not bool(obs_work.source_mask[src_slot]):
+                available_pairs[src_slot, :] = False
+            infos.append({
+                "src_slot": src_slot,
+                "tgt_slot": tgt_slot,
+                "ship_bin": ship_bin,
+                "is_noop": False,
+                "value": float(out.value[0].item()),
+            })
+        return env_actions, infos
+
     for src_slot in [int(i) for i, ok in enumerate(obs.source_mask) if ok]:
         obs_decision = replace(
             obs_work,
@@ -157,7 +238,7 @@ def _act_all_sources(net, env_obs, player: int, *,
                 distance = ((src_planet.x - tgt_planet.x) ** 2 + (src_planet.y - tgt_planet.y) ** 2) ** 0.5
             eta = distance / max(fleet_speed(int(sent_ships)), 1e-6)
             bucket = _incoming_bucket_idx(eta)
-            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 500.0
+            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 100.0
         obs_work.source_mask[src_slot] = False
         infos.append({
             "src_slot": src_slot,

@@ -15,17 +15,30 @@ class ProductionCaptureLaunch:
     ships_sent: int
     est_arrival_turn: float
     launch_target_owner: int
+    launch_target_ships: int = 0
+    my_total_ships_at_launch: int = 0
 
 
 @dataclass
 class ProductionCaptureOutcome:
     ships_sent: int
     total_ships_sent: int
+    total_ship_investment: float
     planet_production: float
     capture_turn: int
     max_turns: int
     captured_from_enemy: bool
     num_opponents: int
+    my_total_ships_at_launch: int = 0
+
+
+@dataclass
+class ProductionNeutralGiftOutcome:
+    damage_done: float
+    launch_target_ships: int
+    planet_production: float
+    capture_turn: int
+    max_turns: int
 
 
 @dataclass
@@ -77,10 +90,13 @@ class ProductionRewardTracker:
         self._loss_pending: dict[tuple[int, int], list[ProductionDefenseMissLaunch]] = {}
         self._resolved_captures: dict[int, deque] = {}
         self._resolved_losses: dict[int, deque] = {}
+        self._resolved_neutral_gifts: dict[int, deque] = {}
 
     def register_capture_launch(self, *, buffer_idx: int, launch_turn: int, player: int,
                                 target_planet_id: int, ships_sent: int,
-                                est_arrival_turn: float, launch_target_owner: int) -> None:
+                                est_arrival_turn: float, launch_target_owner: int,
+                                launch_target_ships: int = 0,
+                                my_total_ships_at_launch: int = 0) -> None:
         if ships_sent <= 0 or launch_target_owner == player:
             return
         key = (int(player), int(target_planet_id))
@@ -92,6 +108,8 @@ class ProductionRewardTracker:
             ships_sent=int(ships_sent),
             est_arrival_turn=float(est_arrival_turn),
             launch_target_owner=int(launch_target_owner),
+            launch_target_ships=int(launch_target_ships),
+            my_total_ships_at_launch=int(my_total_ships_at_launch),
         ))
 
     def register_defense_miss_candidate(self, *, buffer_idx: int, launch_turn: int,
@@ -118,6 +136,14 @@ class ProductionRewardTracker:
         for planet_id, curr in curr_planets.items():
             prev = prev_planets.get(planet_id)
             prev_owner = prev.owner if prev is not None else -1
+            self._resolve_neutral_gift_if_enemy_captured(
+                turn,
+                player,
+                planet_id,
+                prev_owner,
+                curr.owner,
+                float(curr.production),
+            )
             if prev_owner == player or curr.owner != player:
                 continue
             key = (int(player), int(planet_id))
@@ -131,15 +157,21 @@ class ProductionRewardTracker:
             if total_ships <= 0:
                 continue
             captured_from_enemy = prev_owner not in (-1, player)
+            observed_target_ships = max(0, int(prev.ships)) if prev is not None else 0
+            launch_target_ships = max(max(0, int(fl.launch_target_ships)) for fl in launches)
+            target_ship_investment = max(observed_target_ships, launch_target_ships)
+            total_ship_investment = min(float(total_ships), float(target_ship_investment))
             for fl in launches:
                 outcome = ProductionCaptureOutcome(
                     ships_sent=fl.ships_sent,
                     total_ships_sent=total_ships,
+                    total_ship_investment=total_ship_investment,
                     planet_production=float(curr.production),
                     capture_turn=int(turn),
                     max_turns=self.max_turns,
                     captured_from_enemy=bool(captured_from_enemy),
                     num_opponents=self.num_opponents,
+                    my_total_ships_at_launch=fl.my_total_ships_at_launch,
                 )
                 self._resolved_captures.setdefault(player, deque()).append((fl.buffer_idx, outcome))
         self._expire_arrived_non_captures(turn, player, curr_planets)
@@ -169,6 +201,51 @@ class ProductionRewardTracker:
                 )
                 self._resolved_losses.setdefault(player, deque()).append((fl.buffer_idx, outcome))
 
+    def _resolve_neutral_gift_if_enemy_captured(self, turn: int, player: int,
+                                                planet_id: int, prev_owner: int,
+                                                curr_owner: int,
+                                                planet_production: float) -> None:
+        if prev_owner != -1 or curr_owner in (-1, player):
+            return
+        key = (int(player), int(planet_id))
+        pending = self._capture_pending.get(key, [])
+        if not pending:
+            return
+        eligible = [
+            fl for fl in pending
+            if fl.launch_target_owner == -1
+            and fl.est_arrival_turn <= turn + 1e-6
+            and fl.launch_turn <= turn
+        ]
+        if not eligible:
+            return
+        initial_ships = max(max(0, fl.launch_target_ships) for fl in eligible)
+        if initial_ships <= 0:
+            return
+        raw_damage = [
+            min(float(max(0, fl.ships_sent)), float(initial_ships))
+            for fl in eligible
+        ]
+        raw_total = sum(raw_damage)
+        if raw_total <= 0.0:
+            return
+        damage_scale = min(1.0, float(initial_ships) / raw_total)
+        eligible_keys = {id(fl) for fl in eligible}
+        remaining = [fl for fl in pending if id(fl) not in eligible_keys]
+        if remaining:
+            self._capture_pending[key] = remaining
+        else:
+            self._capture_pending.pop(key, None)
+        for fl, damage in zip(eligible, raw_damage):
+            outcome = ProductionNeutralGiftOutcome(
+                damage_done=float(damage) * damage_scale,
+                launch_target_ships=int(initial_ships),
+                planet_production=float(planet_production),
+                capture_turn=int(turn),
+                max_turns=self.max_turns,
+            )
+            self._resolved_neutral_gifts.setdefault(player, deque()).append((fl.buffer_idx, outcome))
+
     def _expire_arrived_non_captures(self, turn: int, player: int, curr_planets: dict) -> None:
         """Keep arrived-but-not-captured launches for `softening_window`
         turns so they can share capture credit if a follow-up fleet
@@ -192,6 +269,7 @@ class ProductionRewardTracker:
             launches = [
                 fl for fl in self._capture_pending[key]
                 if (fl.est_arrival_turn > turn + 1e-6)                              # not yet arrived
+                or (curr is not None and curr.owner == -1 and fl.launch_target_owner == -1)
                 or ((turn - fl.est_arrival_turn) <= self.softening_window)    # within softening window
             ]
             if launches:
@@ -211,35 +289,87 @@ class ProductionRewardTracker:
             while q:
                 yield q.popleft()
 
+    def pop_neutral_gift_resolved(self, player: int):
+        q = self._resolved_neutral_gifts.get(player)
+        if q:
+            while q:
+                yield q.popleft()
+
 
 def opponent_count_multiplier(num_opponents: int) -> float:
-    n = max(1, int(num_opponents))
-    return (n + 1.0) / n
+    total_players = max(2, int(num_opponents) + 1)
+    return (total_players + 1.0) / total_players
 
 
 def remaining_steps(max_turns: int, turn: int) -> int:
     return max(0, int(max_turns) - int(turn))
 
 
+def production_reward_value(
+    production: float,
+    *,
+    production_reward_beta: float = 0.0,
+    production_reward_reference: float = 3.0,
+) -> float:
+    value = max(0.0, float(production))
+    beta = max(0.0, float(production_reward_beta))
+    if value <= 0.0 or beta <= 0.0:
+        return value
+    reference = max(1e-6, float(production_reward_reference))
+    return value * ((value / reference) ** beta)
+
+
 def compute_production_capture_reward(
     outcome: ProductionCaptureOutcome,
     *,
     reward_scale: float = 0.001,
+    production_reward_beta: float = 0.0,
+    production_reward_reference: float = 3.0,
 ) -> float:
     if outcome.total_ships_sent <= 0:
         return 0.0
     max_turns = max(1, int(outcome.max_turns))
     time_factor = remaining_steps(max_turns, outcome.capture_turn)
-    reward = float(outcome.planet_production) * time_factor
+    reward = production_reward_value(
+        outcome.planet_production,
+        production_reward_beta=production_reward_beta,
+        production_reward_reference=production_reward_reference,
+    ) * time_factor
     if outcome.captured_from_enemy:
         reward *= opponent_count_multiplier(outcome.num_opponents)
+    reward -= max(0.0, float(outcome.total_ship_investment))
     return reward * max(0.0, outcome.ships_sent / outcome.total_ships_sent) * float(reward_scale)
+
+
+def compute_production_neutral_gift_penalty(
+    outcome: ProductionNeutralGiftOutcome,
+    *,
+    reward_scale: float = 0.001,
+    production_reward_beta: float = 0.0,
+    production_reward_reference: float = 3.0,
+) -> float:
+    if outcome.launch_target_ships <= 0:
+        return 0.0
+    max_turns = max(1, int(outcome.max_turns))
+    time_factor = remaining_steps(max_turns, outcome.capture_turn)
+    damage_fraction = max(
+        0.0,
+        min(1.0, float(outcome.damage_done) / float(outcome.launch_target_ships)),
+    )
+    production_value = production_reward_value(
+        outcome.planet_production,
+        production_reward_beta=production_reward_beta,
+        production_reward_reference=production_reward_reference,
+    )
+    return -production_value * time_factor * damage_fraction * float(reward_scale)
 
 
 def compute_production_planet_loss_penalty(
     outcome: ProductionPlanetLossOutcome,
     *,
     reward_scale: float = 0.001,
+    production_reward_beta: float = 0.0,
+    production_reward_reference: float = 3.0,
 ) -> float:
     """Per-launch planet-loss penalty.
 
@@ -256,7 +386,11 @@ def compute_production_planet_loss_penalty(
         return 0.0
     max_turns = max(1, int(outcome.max_turns))
     time_factor = remaining_steps(max_turns, outcome.loss_turn)
-    penalty = -float(outcome.planet_production) * time_factor
+    penalty = -production_reward_value(
+        outcome.planet_production,
+        production_reward_beta=production_reward_beta,
+        production_reward_reference=production_reward_reference,
+    ) * time_factor
     penalty *= opponent_count_multiplier(outcome.num_opponents)
     ship_share = max(0.0, outcome.ships_sent / outcome.total_ships_sent)
     threat_normalizer = 1.0 / max(1, int(outcome.num_threatened_at_launch))

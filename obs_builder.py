@@ -48,50 +48,52 @@ from navigation import predict_all_fleet_targets
 # -----------------------------------------------------------------------------
 # Sizing / feature dims (edit here if you change features below).
 # -----------------------------------------------------------------------------
-P_MAX_DEFAULT = 48   # env: 5..10 planet groups x 4 mirrors = 20..40 base,
-                     # + up to ~8 active comets => 48 covers worst case.
+P_MAX_DEFAULT = 44   # env: 5..10 planet groups x 4 mirrors = 20..40 base,
+                     # + one active comet group x 4 mirrors => 44 worst case.
 F_MAX_DEFAULT = 64   # no env hard cap on in-flight fleets; 64 is a safe
                      # ceiling for both players' typical/peak load.
 
-MAX_ENEMY_INCOMING_SLOTS = 3
-PLANET_FEATURE_DIM = 33
+MAX_ENEMY_OWNER_SLOTS = 3
+PLANET_FEATURE_DIM = 34
 INCOMING_ETA_BUCKETS = (5.0, 15.0, 30.0, float("inf"))
 
 # Planet feature index constants (derived from _planet_features order).
 # Use these instead of hard-coded ints to survive feature reordering.
 PF_IDX_OWNER_SELF = 0
-PF_IDX_OWNER_ENEMY = 1
-PF_IDX_OWNER_NEUTRAL = 2
-PF_IDX_SHIPS = 3          # ships / 100.0
-PF_IDX_PRODUCTION = 4     # production / 5.0
-PF_IDX_RADIUS = 5         # radius / 5.0
-PF_IDX_R_SUN = 6          # r_sun / 50.0
-PF_IDX_COS_THETA = 7
-PF_IDX_SIN_THETA = 8
-PF_IDX_IS_STATIC = 9
-PF_IDX_IS_ROTATING = 10
-PF_IDX_IS_COMET = 11
-PF_IDX_OMEGA = 12         # omega if rotating else 0
-PF_IDX_SHIPS_TO_CAP = 13  # ships + 1 (if not self) / 100.0
-PF_IDX_LOG_SHIPS = 14
-PF_IDX_INCOMING_SELF_B0 = 15        # self ships arriving in [0, 5] turns / 500.0
-PF_IDX_INCOMING_SELF_B1 = 16        # self ships arriving in (5, 15] turns / 500.0
-PF_IDX_INCOMING_SELF_B2 = 17        # self ships arriving in (15, 30] turns / 500.0
-PF_IDX_INCOMING_SELF_B3 = 18        # self ships arriving after 30 turns / 500.0
-PF_IDX_INCOMING_ENEMY_B0 = 19       # enemy ships arriving in [0, 5] turns / 500.0
-PF_IDX_INCOMING_ENEMY_B1 = 20       # enemy ships arriving in (5, 15] turns / 500.0
-PF_IDX_INCOMING_ENEMY_B2 = 21       # enemy ships arriving in (15, 30] turns / 500.0
-PF_IDX_INCOMING_ENEMY_B3 = 22       # enemy ships arriving after 30 turns / 500.0
-PF_IDX_INCOMING_SELF_TOTAL = 23
-PF_IDX_INCOMING_ENEMY_TOTAL = 24
-PF_IDX_INCOMING_SELF_MIN_ETA = 25
-PF_IDX_INCOMING_ENEMY_MIN_ETA = 26
-PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS = 27
-PF_IDX_INCOMING_ENEMY_LARGEST_SHIPS = 28
-PF_IDX_INCOMING_ENEMY_LARGEST_ETA = 29
-PF_IDX_INCOMING_NET_THREAT = 30
-PF_IDX_CAPTURE_VALUE = 31
-PF_IDX_DEFENSE_DEFICIT = 32
+PF_IDX_OWNER_ENEMY_0 = 1
+PF_IDX_OWNER_ENEMY_1 = 2
+PF_IDX_OWNER_ENEMY_2 = 3
+PF_IDX_OWNER_NEUTRAL = 4
+PF_IDX_OWNER_ENEMY = PF_IDX_OWNER_ENEMY_0
+PF_IDX_SHIPS = 5          # ships / 100.0
+PF_IDX_PRODUCTION = 6     # production / 5.0
+PF_IDX_RADIUS = 7         # radius / 5.0
+PF_IDX_R_SUN = 8          # r_sun / 50.0
+PF_IDX_COS_THETA = 9
+PF_IDX_SIN_THETA = 10
+PF_IDX_IS_STATIC = 11
+PF_IDX_IS_ROTATING = 12
+PF_IDX_IS_COMET = 13
+PF_IDX_OMEGA = 14         # omega if rotating else 0
+PF_IDX_LOG_SHIPS = 15
+PF_IDX_INCOMING_SELF_B0 = 16        # self ships arriving in [0, 5] turns / 100.0
+PF_IDX_INCOMING_SELF_B1 = 17        # self ships arriving in (5, 15] turns / 100.0
+PF_IDX_INCOMING_SELF_B2 = 18        # self ships arriving in (15, 30] turns / 100.0
+PF_IDX_INCOMING_SELF_B3 = 19        # self ships arriving after 30 turns / 100.0
+PF_IDX_INCOMING_ENEMY_B0 = 20       # enemy ships arriving in [0, 5] turns / 100.0
+PF_IDX_INCOMING_ENEMY_B1 = 21       # enemy ships arriving in (5, 15] turns / 100.0
+PF_IDX_INCOMING_ENEMY_B2 = 22       # enemy ships arriving in (15, 30] turns / 100.0
+PF_IDX_INCOMING_ENEMY_B3 = 23       # enemy ships arriving after 30 turns / 100.0
+PF_IDX_INCOMING_SELF_TOTAL = 24
+PF_IDX_INCOMING_ENEMY_TOTAL = 25
+PF_IDX_INCOMING_SELF_MIN_ETA = 26
+PF_IDX_INCOMING_ENEMY_MIN_ETA = 27
+PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS = 28
+PF_IDX_INCOMING_ENEMY_LARGEST_SHIPS = 29
+PF_IDX_INCOMING_ENEMY_LARGEST_ETA = 30
+PF_IDX_INCOMING_NET_THREAT = 31
+PF_IDX_CAPTURE_VALUE = 32
+PF_IDX_DEFENSE_DEFICIT = 33
 FLEET_FEATURE_DIM = 11
 GLOBAL_FEATURE_DIM = 14
 EDGE_FEATURE_DIM = 6  # + crosses_sun
@@ -138,7 +140,12 @@ def _planet_features(
 ) -> np.ndarray:
     """Feature vector for a single planet."""
     is_self = float(p.owner == player)
-    is_enemy = float(p.owner != player and p.owner != -1)
+    enemy_owner = p.owner != player and p.owner != -1
+    enemy_slots = [0.0] * MAX_ENEMY_OWNER_SLOTS
+    if enemy_owner:
+        slot = (int(p.owner) - int(player) - 1) % (MAX_ENEMY_OWNER_SLOTS + 1)
+        if 0 <= slot < MAX_ENEMY_OWNER_SLOTS:
+            enemy_slots[slot] = 1.0
     is_neutral = float(p.owner == -1)
 
     ships = float(p.ships)
@@ -152,8 +159,6 @@ def _planet_features(
 
     omega_dt = omega if p.is_rotating else 0.0
 
-    # "How many ships do I need to capture this?" - rough lower bound.
-    ships_to_cap = ships + 1.0 if not is_self else 0.0
     incoming = incoming or {}
     self_buckets = list(incoming.get("self_buckets", [0.0] * len(INCOMING_ETA_BUCKETS)))
     enemy_buckets = list(incoming.get("enemy_buckets", [0.0] * len(INCOMING_ETA_BUCKETS)))
@@ -172,7 +177,9 @@ def _planet_features(
 
     feats = np.asarray([
         is_self,
-        is_enemy,
+        enemy_slots[0],
+        enemy_slots[1],
+        enemy_slots[2],
         is_neutral,
         ships / 100.0,
         prod / 5.0,
@@ -184,26 +191,25 @@ def _planet_features(
         float(p.is_rotating),
         float(p.is_comet),
         omega_dt,
-        ships_to_cap / 100.0,
         log_ships,
-        self_buckets[0] / 500.0,
-        self_buckets[1] / 500.0,
-        self_buckets[2] / 500.0,
-        self_buckets[3] / 500.0,
-        enemy_buckets[0] / 500.0,
-        enemy_buckets[1] / 500.0,
-        enemy_buckets[2] / 500.0,
-        enemy_buckets[3] / 500.0,
-        self_total / 500.0,
-        enemy_total / 500.0,
+        self_buckets[0] / 100.0,
+        self_buckets[1] / 100.0,
+        self_buckets[2] / 100.0,
+        self_buckets[3] / 100.0,
+        enemy_buckets[0] / 100.0,
+        enemy_buckets[1] / 100.0,
+        enemy_buckets[2] / 100.0,
+        enemy_buckets[3] / 100.0,
+        self_total / 100.0,
+        enemy_total / 100.0,
         min(self_min_eta, 50.0) / 50.0 if self_min_eta > 0.0 else 0.0,
         min(enemy_min_eta, 50.0) / 50.0 if enemy_min_eta > 0.0 else 0.0,
-        enemy_soonest_ships / 500.0,
-        enemy_largest_ships / 500.0,
+        enemy_soonest_ships / 100.0,
+        enemy_largest_ships / 100.0,
         min(enemy_largest_eta, 50.0) / 50.0 if enemy_largest_eta > 0.0 else 0.0,
-        net_threat / 500.0,
+        net_threat / 100.0,
         capture_value / 50.0,
-        defense_deficit / 500.0,
+        defense_deficit / 100.0,
     ], dtype=np.float32)
     return feats[:planet_feature_dim]
 
@@ -278,7 +284,7 @@ def _global_features(
     my_capture_value = my_prod * remaining / max(1, max_turns)
     my_air = sum(f.ships for f in fleets if f.owner == player)
     enemy_air = sum(f.ships for f in fleets if f.owner != player and f.owner != -1)
-    air_advantage = (my_air - enemy_air) / 500.0
+    air_advantage = (my_air - enemy_air) / 100.0
 
     return np.asarray([
         turn / 200.0,
@@ -286,13 +292,13 @@ def _global_features(
         len(my_planets) / 25.0,
         len(enemy_planets) / 25.0,
         len(neutral) / 25.0,
-        my_ships / 1000.0,
-        enemy_ships / 1000.0,
+        my_ships / 100.0,
+        enemy_ships / 100.0,
         my_prod / 50.0,
         enemy_prod / 50.0,
         len(fleets) / 25.0,
-        incoming_other / 500.0,
-        incoming_self / 500.0,
+        incoming_other / 100.0,
+        incoming_self / 100.0,
         my_capture_value / 5000.0,
         air_advantage,
     ], dtype=np.float32)
@@ -375,10 +381,6 @@ def build_observation(
     else:
         fleets = all_fleets
 
-    enemy_owners = sorted({f.owner for f in all_fleets if f.owner not in (player, -1)})
-    enemy_owner_to_slot = {
-        owner: i for i, owner in enumerate(enemy_owners[:MAX_ENEMY_INCOMING_SLOTS])
-    }
     incoming_by_planet: dict[int, dict[str, Any]] = {
         p.id: {
             "self_buckets": [0.0] * len(INCOMING_ETA_BUCKETS),

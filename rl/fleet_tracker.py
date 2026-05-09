@@ -245,13 +245,13 @@ def compute_fleet_reward(outcome: FleetOutcome, *, capture_weight: float = 0.05,
 
 
 def _combat_strength_factor(*, my_total_ships: int, enemy_total_ships: int,
-                            min_factor: float = -1.0,
+                            min_factor: float = 0.5,
                             max_factor: float = 2.0) -> float:
     enemy = float(enemy_total_ships)
     mine = float(my_total_ships)
     if enemy <= 0.0:
         return 1.0 if mine > 0.0 else 0.0
-    return max(float(min_factor), min(float(max_factor), mine / enemy - 1.0))
+    return max(float(min_factor), min(float(max_factor), mine / enemy))
 
 
 def compute_production_simple_fleet_combat_reward(
@@ -283,7 +283,7 @@ def compute_production_simple_fleet_combat_reward(
             my_total_ships=outcome.my_total_ships_at_launch,
             enemy_total_ships=outcome.enemy_total_ships_at_launch,
         )
-        reward += float(kill_weight) * float(outcome.enemy_ships_killed) / denom * strength_factor
+        reward += float(kill_weight) * float(outcome.enemy_ships_killed) * strength_factor
     elif outcome.destroyed_enroute:
         reward -= float(outcome.own_waste) / denom
     return reward * float(reward_scale)
