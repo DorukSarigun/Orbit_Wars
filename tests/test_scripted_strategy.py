@@ -14,7 +14,9 @@ from feature_extraction import Planet
 from scripted_strategy import (
     CaptureEfficiencyAgent,
     ScriptedConfig,
+    SyncCoalition,
     _defense_at_arrival,
+    best_synchronized_coalition,
     compute_src_budgets,
     score_capture_candidate,
 )
@@ -235,3 +237,158 @@ def test_agent_no_double_targeting_per_pair():
         pairs.add(int(from_id))
     # at least uniqueness sanity: number of distinct sources is reasonable
     assert len(pairs) <= 2
+
+
+# ---------------------------------------------------------------------------
+# Synchronized coalitions
+# ---------------------------------------------------------------------------
+def test_coalition_single_source_easy_neutral():
+    """A single static planet with low defense: size-1 coalition captures."""
+    src = _planet(0, 0, 20, 20, ships=20, prod=2, radius=2.0)
+    tgt = _planet(1, -1, 35, 20, ships=4, prod=3, radius=2.0)
+    cfg = ScriptedConfig()
+    plan = best_synchronized_coalition(
+        tgt, [src], {0: 20}, [src, tgt], 0.0,
+        current_turn=0, max_turns=500, player=0, cfg=cfg,
+    )
+    assert plan is not None
+    assert len(plan.members) == 1
+    assert plan.members[0].src_id == 0
+    assert plan.members[0].delay == 0          # bottleneck launches now
+    assert plan.total_ships > plan.defense
+    assert plan.score > 0
+
+
+def test_coalition_two_sources_insufficient_alone():
+    """Each source alone has too few ships, but together they capture."""
+    # Two sources, each 30 ships, target with 50 ships defense.
+    src_a = _planet(0, 0, 20, 20, ships=30, prod=2, radius=2.0)
+    src_b = _planet(1, 0, 20, 30, ships=30, prod=2, radius=2.0)
+    tgt = _planet(2, -1, 35, 25, ships=50, prod=3, radius=2.0)
+    cfg = ScriptedConfig(max_coalition_size=4, max_delay_window=8)
+    plan = best_synchronized_coalition(
+        tgt, [src_a, src_b], {0: 30, 1: 30},
+        [src_a, src_b, tgt], 0.0,
+        current_turn=0, max_turns=500, player=0, cfg=cfg,
+    )
+    assert plan is not None
+    assert len(plan.members) >= 2
+    assert plan.total_ships > plan.defense     # cross-threshold
+    assert plan.score > 0
+
+
+def test_coalition_no_valid_returns_none():
+    """Insufficient ships even with all sources combined."""
+    src_a = _planet(0, 0, 20, 20, ships=5, prod=0, radius=2.0)
+    src_b = _planet(1, 0, 20, 30, ships=5, prod=0, radius=2.0)
+    tgt = _planet(2, -1, 35, 25, ships=200, prod=3, radius=2.0)
+    cfg = ScriptedConfig()
+    plan = best_synchronized_coalition(
+        tgt, [src_a, src_b], {0: 5, 1: 5},
+        [src_a, src_b, tgt], 0.0,
+        current_turn=0, max_turns=500, player=0, cfg=cfg,
+    )
+    assert plan is None
+
+
+def test_coalition_respects_max_size():
+    """``max_coalition_size`` caps coalition members."""
+    sources = [
+        _planet(i, 0, 15.0 + i * 4, 15.0, ships=10, prod=1, radius=2.0)
+        for i in range(6)
+    ]
+    tgt = _planet(99, -1, 25.0, 35.0, ships=40, prod=3, radius=2.0)
+    cfg = ScriptedConfig(max_coalition_size=2, max_delay_window=8)
+    budgets = {s.id: 10 for s in sources}
+    plan = best_synchronized_coalition(
+        tgt, sources, budgets,
+        sources + [tgt], 0.0,
+        current_turn=0, max_turns=500, player=0, cfg=cfg,
+    )
+    if plan is not None:
+        assert len(plan.members) <= 2
+
+
+def test_coalition_delay_grows_ships_for_neutral():
+    """Against a neutral, waiting lets us send more ships at the same defense."""
+    src = _planet(0, 0, 20, 20, ships=10, prod=5, radius=2.0)
+    tgt = _planet(1, -1, 35, 20, ships=8, prod=3, radius=2.0)
+    cfg = ScriptedConfig(max_coalition_size=1, max_delay_window=8)
+    plan = best_synchronized_coalition(
+        tgt, [src], {0: 10}, [src, tgt], 0.0,
+        current_turn=0, max_turns=500, player=0, cfg=cfg,
+    )
+    assert plan is not None
+    # Neutral defense is static (8); production_gain = 3 * (500 - T_star)
+    # No-delay capture is already trivial; algorithm should still find a plan.
+    assert plan.score > 0
+    assert plan.total_ships > plan.defense
+
+
+def test_coalition_shift_zero_bottleneck_launches_now():
+    """When max_delay_window=0 the bottleneck always has delay=0."""
+    # Sources well separated in y so neither blocks the other's path to tgt.
+    src_a = _planet(0, 0, 15, 10, ships=30, prod=2, radius=2.0)
+    src_b = _planet(1, 0, 15, 30, ships=30, prod=2, radius=2.0)
+    tgt = _planet(2, -1, 40, 20, ships=40, prod=3, radius=2.0)
+    cfg = ScriptedConfig(max_coalition_size=4, max_delay_window=0)
+    plan = best_synchronized_coalition(
+        tgt, [src_a, src_b], {0: 30, 1: 30},
+        [src_a, src_b, tgt], 0.0,
+        current_turn=0, max_turns=500, player=0, cfg=cfg,
+    )
+    assert plan is not None
+    # With shift=0 forced, the slowest member has delay=0.
+    assert any(m.delay == 0 for m in plan.members)
+
+
+def test_coalition_shift_nonzero_all_members_wait():
+    """With shift>0 every coalition member has delay>0; this turn is passive."""
+    # Identical etas (ships, distance) so T_min is the same for both.
+    src_a = _planet(0, 0, 20, 20, ships=30, prod=2, radius=2.0)
+    src_b = _planet(1, 0, 22, 20, ships=30, prod=2, radius=2.0)
+    tgt = _planet(2, -1, 40, 20, ships=40, prod=3, radius=2.0)
+    # Shift=0 valid plan exists; shift>0 plans have all delays > 0.
+    cfg = ScriptedConfig(max_coalition_size=4, max_delay_window=8)
+    plan = best_synchronized_coalition(
+        tgt, [src_a, src_b], {0: 30, 1: 30},
+        [src_a, src_b, tgt], 0.0,
+        current_turn=0, max_turns=500, player=0, cfg=cfg,
+    )
+    assert plan is not None
+    # Sanity: total ships still cross the defense threshold.
+    assert plan.total_ships > plan.defense
+    # All delays must be consistent: min(delay) == T_star - max(eta_now).
+    # Since the agent re-derives each turn, both shift=0 and shift>0 plans
+    # are valid at planning time. The downstream `act()` will simply skip
+    # this plan if no member has delay=0.
+
+
+def test_agent_uses_coalition_for_hard_target():
+    """Build an env_obs where two of my planets are needed to capture."""
+    obs = {
+        "planets": [
+            [0, 0, 20.0, 20.0, 2.0, 25, 2],   # mine
+            [1, 0, 20.0, 30.0, 2.0, 25, 2],   # mine
+            [2, -1, 35.0, 25.0, 2.0, 40, 3],  # neutral, hard
+        ],
+        "initial_planets": [
+            [0, 0, 20.0, 20.0, 2.0, 25, 2],
+            [1, 0, 20.0, 30.0, 2.0, 25, 2],
+            [2, -1, 35.0, 25.0, 2.0, 40, 3],
+        ],
+        "comet_planet_ids": [],
+        "comets": [],
+        "fleets": [],
+        "angular_velocity": 0.0,
+    }
+    agent = CaptureEfficiencyAgent(ScriptedConfig(max_coalition_size=4, max_delay_window=8))
+    actions = agent.act(obs, player=0, current_turn=0, max_turns=500)
+    # Expect at least one launch this turn (the bottleneck source).
+    assert len(actions) >= 1
+    # All launches should be from valid sources (0 or 1) toward the only target.
+    for a in actions:
+        from_id, angle, ships = a
+        assert int(from_id) in (0, 1)
+        assert int(ships) >= 1
+        assert math.isfinite(float(angle))

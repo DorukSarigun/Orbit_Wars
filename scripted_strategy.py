@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 from feature_extraction import Planet, Fleet, parse_planets, parse_fleets
-from navigation import compute_launch, predict_fleet_target
+from navigation import compute_launch, compute_launch_at, predict_fleet_target
 from obs_builder import DEFAULT_SHIP_BINS
 
 
@@ -60,6 +60,21 @@ class ScriptedConfig:
     ship_bins: tuple = DEFAULT_SHIP_BINS
     """Same discrete ship fractions as the model's action space."""
 
+    max_coalition_size: int = 4
+    """Maximum number of source planets in a synchronized coalition.
+    A size-1 coalition is just a single-source attack."""
+
+    max_delay_window: int = 8
+    """Try synchronized arrival times in [T_min, T_min + max_delay_window].
+    Larger windows let coalition members accumulate more ships before
+    launch but give enemy targets more time to grow as well."""
+
+    eta_horizon: float = 30.0
+    """Skip targets whose minimum reach time exceeds this many turns."""
+
+    sync_tolerance: float = 1.5
+    """Coalition members must arrive within this many turns of T*."""
+
 
 @dataclass
 class LaunchCandidate:
@@ -71,6 +86,32 @@ class LaunchCandidate:
     ships_sent: int
     angle: float
     defense_at_arrival: int
+    production_gain: float
+
+
+@dataclass
+class CoalitionMember:
+    src_id: int
+    ships_sent: int
+    delay: int
+    angle: float
+    actual_arrival: float
+
+
+@dataclass
+class SyncCoalition:
+    """A delayed-synchronized multi-source attack plan against one target.
+
+    All members aim to arrive at ``T_star``.  Members with ``delay == 0``
+    must launch this turn; members with ``delay > 0`` wait and the agent
+    re-derives the plan next turn from updated state.
+    """
+    score: float
+    target_id: int
+    members: list[CoalitionMember]
+    T_star: float
+    defense: int
+    total_ships: int
     production_gain: float
 
 
@@ -183,6 +224,120 @@ def _group_fleets_by_target(
     return my_to_my, enemy_to_my
 
 
+def best_synchronized_coalition(
+    tgt: Planet,
+    my_sources: list[Planet],
+    src_budgets: dict[int, int],
+    planets: list[Planet],
+    angular_velocity: float,
+    *,
+    current_turn: int,
+    max_turns: int,
+    player: int,
+    cfg: ScriptedConfig,
+) -> SyncCoalition | None:
+    """Find the best delayed-synchronized coalition for capturing ``tgt``.
+
+    Each candidate coalition is a prefix of sources sorted by their
+    minimum reach time.  For each prefix and each shift in
+    ``[0, max_delay_window]``, the synchronized arrival time
+    ``T_star = max(eta_now in prefix) + shift`` is evaluated.
+
+    Coalition member ``i`` has::
+
+        delay_i           = max(0, T_star - eta_now_i)
+        ships_at_launch_i = src_i.budget + src_i.production * delay_i
+
+    All members must reach ``T_star`` within ``cfg.sync_tolerance``
+    turns; otherwise the coalition is rejected.  The capture is
+    successful iff ``Σ ships_at_launch > defense_at_arrival(tgt, T_star)``.
+    """
+    eta_now: dict[int, float] = {}
+    for src in my_sources:
+        budget = int(src_budgets.get(src.id, 0))
+        if budget <= 0:
+            continue
+        launch = compute_launch(src, tgt, budget, planets, angular_velocity)
+        if launch is None:
+            continue
+        eta = float(launch["eta"])
+        if eta > cfg.eta_horizon:
+            continue
+        eta_now[src.id] = eta
+
+    if not eta_now:
+        return None
+
+    # Sort sources by their min eta to this target ascending.
+    sorted_srcs = [s for s in my_sources if s.id in eta_now]
+    sorted_srcs.sort(key=lambda s: eta_now[s.id])
+
+    max_size = min(len(sorted_srcs), int(cfg.max_coalition_size))
+    best: SyncCoalition | None = None
+
+    for size in range(1, max_size + 1):
+        coalition_srcs = sorted_srcs[:size]
+        T_min = max(eta_now[s.id] for s in coalition_srcs)
+        for shift in range(0, int(cfg.max_delay_window) + 1):
+            T_star = T_min + float(shift)
+            if T_star > cfg.eta_horizon + cfg.max_delay_window:
+                break
+            members: list[CoalitionMember] = []
+            ships_total = 0
+            ok = True
+            for src in coalition_srcs:
+                delay = max(0.0, T_star - eta_now[src.id])
+                # Production accumulated during the wait expands the budget.
+                budget = int(src_budgets.get(src.id, 0))
+                ships = budget + int(src.production * delay)
+                if ships <= 0:
+                    ok = False
+                    break
+                la = compute_launch_at(
+                    src, tgt, ships, planets, angular_velocity,
+                    t_offset=delay,
+                )
+                if la is None:
+                    ok = False
+                    break
+                actual_total = float(delay) + float(la["eta"])
+                if abs(actual_total - T_star) > cfg.sync_tolerance:
+                    ok = False
+                    break
+                members.append(CoalitionMember(
+                    src_id=src.id,
+                    ships_sent=int(la["ships"]),
+                    delay=int(round(delay)),
+                    angle=float(la["angle"]),
+                    actual_arrival=actual_total,
+                ))
+                ships_total += int(la["ships"])
+
+            if not ok:
+                continue
+
+            defense = _defense_at_arrival(tgt, T_star, player)
+            if ships_total <= defense:
+                # Insufficient firepower at arrival; skip.
+                continue
+            remaining = max(0, max_turns - current_turn - T_star)
+            production_gain = float(tgt.production) * float(remaining)
+            score = production_gain - float(defense)
+            if score <= 0:
+                continue
+            if best is None or score > best.score:
+                best = SyncCoalition(
+                    score=float(score),
+                    target_id=int(tgt.id),
+                    members=list(members),
+                    T_star=float(T_star),
+                    defense=int(defense),
+                    total_ships=int(ships_total),
+                    production_gain=float(production_gain),
+                )
+    return best
+
+
 class CaptureEfficiencyAgent:
     """Stateless scripted opponent.  ``act`` returns a list of env actions."""
 
@@ -243,54 +398,44 @@ class CaptureEfficiencyAgent:
         if not targets:
             return []
 
-        candidates: list[LaunchCandidate] = []
-        for src in my_planets:
-            if budgets.get(src.id, 0) <= 0:
-                continue
-            for tgt in targets:
-                if tgt.id == src.id:
-                    continue
-                for bin_idx, frac in enumerate(cfg.ship_bins):
-                    ships_sent = max(1, int(src.ships * float(frac)))
-                    if ships_sent > budgets[src.id]:
-                        continue
-                    launch = compute_launch(src, tgt, ships_sent, planets, omega)
-                    if launch is None:
-                        continue
-                    eta = float(launch["eta"])
-                    score, defense, prod_gain = score_capture_candidate(
-                        src, tgt, ships_sent, eta,
-                        current_turn=current_turn,
-                        max_turns=max_turns,
-                        player=player,
-                    )
-                    if not math.isfinite(score) or score <= 0:
-                        continue
-                    candidates.append(LaunchCandidate(
-                        score=score,
-                        eta=eta,
-                        src_id=src.id,
-                        tgt_id=tgt.id,
-                        bin_idx=bin_idx,
-                        ships_sent=ships_sent,
-                        angle=float(launch["angle"]),
-                        defense_at_arrival=defense,
-                        production_gain=prod_gain,
-                    ))
+        # Plan one synchronized coalition per target.
+        plans: list[SyncCoalition] = []
+        for tgt in targets:
+            plan = best_synchronized_coalition(
+                tgt, my_planets, budgets, planets, omega,
+                current_turn=current_turn,
+                max_turns=max_turns,
+                player=player,
+                cfg=cfg,
+            )
+            if plan is not None:
+                plans.append(plan)
 
-        candidates.sort(key=lambda c: (-c.score, c.eta, c.tgt_id, c.src_id))
+        # Global allocation: prefer high-score plans, but respect each
+        # source's budget across the union of plans.  Members with delay>0
+        # do not launch this turn; the agent re-derives next turn.
+        plans.sort(key=lambda p: (-p.score, p.T_star, p.target_id))
 
         actions: list[list] = []
-        used_pairs: set[tuple[int, int]] = set()
         remaining_budget = dict(budgets)
-        for c in candidates:
+        for plan in plans:
             if len(actions) >= cfg.max_launches:
                 break
-            if (c.src_id, c.tgt_id) in used_pairs:
+            active = [m for m in plan.members if m.delay == 0]
+            if not active:
+                # All members are still waiting; nothing to launch this turn.
                 continue
-            if remaining_budget.get(c.src_id, 0) < c.ships_sent:
+            # Verify all active members fit the remaining budget.
+            fits = all(
+                remaining_budget.get(m.src_id, 0) >= m.ships_sent
+                for m in active
+            )
+            if not fits:
                 continue
-            actions.append([int(c.src_id), float(c.angle), int(c.ships_sent)])
-            used_pairs.add((c.src_id, c.tgt_id))
-            remaining_budget[c.src_id] -= c.ships_sent
+            # Verify launching all active members will not exceed launch cap.
+            if len(actions) + len(active) > cfg.max_launches:
+                continue
+            for m in active:
+                actions.append([int(m.src_id), float(m.angle), int(m.ships_sent)])
+                remaining_budget[m.src_id] -= m.ships_sent
         return actions
