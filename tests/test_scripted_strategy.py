@@ -15,7 +15,9 @@ from scripted_strategy import (
     CaptureEfficiencyAgent,
     ScriptedConfig,
     SyncCoalition,
+    _build_fleets_by_target,
     _defense_at_arrival,
+    _own_fleets_capture_target,
     best_synchronized_coalition,
     compute_src_budgets,
     score_capture_candidate,
@@ -392,3 +394,91 @@ def test_agent_uses_coalition_for_hard_target():
         assert int(from_id) in (0, 1)
         assert int(ships) >= 1
         assert math.isfinite(float(angle))
+
+
+# ---------------------------------------------------------------------------
+# In-flight fleet awareness (skip targets already covered)
+# ---------------------------------------------------------------------------
+def _fleet_row(fid, owner, fx, fy, angle, from_id, ships):
+    """Helper to build a raw fleet observation row."""
+    return [int(fid), int(owner), float(fx), float(fy),
+            float(angle), int(from_id), int(ships)]
+
+
+def test_own_fleets_capture_target_sufficient():
+    """A 30-ship own fleet en route fully covers a 20-ship neutral."""
+    from feature_extraction import parse_fleets
+    tgt = _planet(2, -1, 35, 20, ships=20, prod=2)
+    src = _planet(0, 0, 20, 20, ships=10, prod=2)
+    obs = {"fleets": [_fleet_row(7, 0, 22, 20, 0.0, 0, 30)]}
+    fleets = parse_fleets(obs)
+    fbt = _build_fleets_by_target(fleets, [src, tgt], 0.0)
+    assert _own_fleets_capture_target(tgt, fbt, player=0) is True
+
+
+def test_own_fleets_capture_target_insufficient():
+    """A 10-ship own fleet does NOT cover a 20-ship neutral."""
+    from feature_extraction import parse_fleets
+    tgt = _planet(2, -1, 35, 20, ships=20, prod=2)
+    src = _planet(0, 0, 20, 20, ships=10, prod=2)
+    obs = {"fleets": [_fleet_row(7, 0, 22, 20, 0.0, 0, 10)]}
+    fleets = parse_fleets(obs)
+    fbt = _build_fleets_by_target(fleets, [src, tgt], 0.0)
+    assert _own_fleets_capture_target(tgt, fbt, player=0) is False
+
+
+def test_own_fleets_capture_target_enemy_reinforcement_neutralizes():
+    """Own 30 ships en route, but a closer 25-ship enemy fleet defeats it."""
+    from feature_extraction import parse_fleets
+    tgt = _planet(2, -1, 35, 20, ships=20, prod=2)
+    src = _planet(0, 0, 20, 20, ships=10, prod=2)
+    # Enemy fleet at (38, 20) heading left -> arrives before own (which is
+    # at (22, 20) heading right and has ~13 distance to tgt vs ~3 for enemy).
+    obs = {"fleets": [
+        _fleet_row(7, 0, 22, 20, 0.0, 0, 30),               # own, eta ~ 5
+        _fleet_row(8, 1, 38, 20, math.pi, 99, 25),          # enemy, eta ~ 1
+    ]}
+    fleets = parse_fleets(obs)
+    fbt = _build_fleets_by_target(fleets, [src, tgt], 0.0)
+    # 30 own vs 20 base + 25 enemy = 45 -> insufficient.
+    assert _own_fleets_capture_target(tgt, fbt, player=0) is False
+
+
+def test_agent_skips_target_already_covered_by_own_fleet():
+    """If an own fleet already suffices to capture a neutral, agent skips it.
+
+    Setup: two neutral targets; one (id=2) already has an own 30-ship fleet
+    en route, the other (id=3) does not.  Agent must direct ships to id=3.
+    """
+    obs = {
+        "planets": [
+            [0, 0, 20.0, 20.0, 2.0, 30, 2],   # mine, with ships
+            [2, -1, 35.0, 20.0, 2.0, 20, 2],  # neutral, already covered
+            [3, -1, 20.0, 35.0, 2.0, 20, 2],  # neutral, NOT covered
+        ],
+        "initial_planets": [
+            [0, 0, 20.0, 20.0, 2.0, 30, 2],
+            [2, -1, 35.0, 20.0, 2.0, 20, 2],
+            [3, -1, 20.0, 35.0, 2.0, 20, 2],
+        ],
+        "comet_planet_ids": [],
+        "comets": [],
+        # Own fleet already on its way to planet 2 with 30 ships.
+        "fleets": [_fleet_row(7, 0, 23.0, 20.0, 0.0, 0, 30)],
+        "angular_velocity": 0.0,
+    }
+    agent = CaptureEfficiencyAgent(ScriptedConfig())
+    actions = agent.act(obs, player=0, current_turn=0, max_turns=500)
+    # Some launch should happen (planet 3 is uncovered and reachable).
+    assert len(actions) >= 1
+    # NO launch should target planet 2: angle would point right (toward x=35).
+    # Planet 3 is up (toward y=35), so any new launch should aim ~+pi/2.
+    # Robust check: the action set must not contain a launch whose angle
+    # is within ~0.1 rad of pointing at planet 2 from src 0.
+    angle_to_p2 = math.atan2(20.0 - 20.0, 35.0 - 20.0)  # 0
+    for from_id, angle, ships in actions:
+        if int(from_id) == 0:
+            assert abs(float(angle) - angle_to_p2) > 0.2, (
+                f"agent launched toward already-covered planet 2 "
+                f"(angle={angle}, expected_to_p2={angle_to_p2})"
+            )

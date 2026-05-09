@@ -196,6 +196,62 @@ def compute_src_budgets(
     return budgets
 
 
+def _build_fleets_by_target(
+    fleets: list[Fleet],
+    planets: list[Planet],
+    angular_velocity: float,
+) -> dict[int, list[tuple[int, float, int]]]:
+    """One-shot ``predict_fleet_target`` over all fleets.
+
+    Returns ``{target_id: [(ships, eta, owner), ...]}``.  Use this once per
+    turn instead of re-predicting per (target, fleet) pair.
+    """
+    out: dict[int, list[tuple[int, float, int]]] = {}
+    for f in fleets:
+        pred = predict_fleet_target(f, planets, angular_velocity)
+        if pred is None:
+            continue
+        tid = int(pred["target_id"])
+        out.setdefault(tid, []).append(
+            (int(f.ships), float(pred["eta"]), int(f.owner))
+        )
+    return out
+
+
+def _own_fleets_capture_target(
+    tgt: Planet,
+    fleets_by_tgt: dict[int, list[tuple[int, float, int]]],
+    player: int,
+) -> bool:
+    """Return True if our already-in-flight fleets suffice to capture ``tgt``.
+
+    Evaluation point is the latest own-fleet ETA.  Defense at that time is
+    the planet's natural growth (``_defense_at_arrival``) plus the sum of
+    enemy fleets arriving by then (rough first-order approximation; battle
+    resolution order is intentionally simplified for v1).
+
+    When this returns True the agent should skip the target entirely:
+    redirecting current-turn launches elsewhere is strictly better.
+    """
+    rows = fleets_by_tgt.get(int(tgt.id))
+    if not rows:
+        return False
+    own_pending: list[tuple[int, float]] = []
+    enemy_pending: list[tuple[int, float]] = []
+    for ships, eta, owner in rows:
+        if owner == player:
+            own_pending.append((ships, eta))
+        else:
+            enemy_pending.append((ships, eta))
+    if not own_pending:
+        return False
+    own_total = sum(s for s, _ in own_pending)
+    latest_own_eta = max(e for _, e in own_pending)
+    enemy_by_then = sum(s for s, e in enemy_pending if e <= latest_own_eta)
+    raw_defense = _defense_at_arrival(tgt, latest_own_eta, player)
+    return own_total > raw_defense + enemy_by_then
+
+
 def _group_fleets_by_target(
     fleets: list[Fleet],
     planets: list[Planet],
@@ -384,6 +440,9 @@ class CaptureEfficiencyAgent:
             my_planets, my_to_my, enemy_to_my, cfg=cfg,
         )
 
+        # Predict every fleet's target once per turn (cache used below).
+        fleets_by_tgt = _build_fleets_by_target(fleets, planets, omega)
+
         targets: list[Planet] = []
         for p in planets:
             if p.owner == player:
@@ -393,6 +452,10 @@ class CaptureEfficiencyAgent:
             if p.owner == -1 and not cfg.target_neutrals:
                 continue
             if p.is_enemy(player) and not cfg.target_enemies:
+                continue
+            # Skip targets our already-in-flight fleets are sufficient to
+            # capture: any extra launch this turn would be wasted ships.
+            if _own_fleets_capture_target(p, fleets_by_tgt, player):
                 continue
             targets.append(p)
         if not targets:
