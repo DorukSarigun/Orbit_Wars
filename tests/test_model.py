@@ -21,7 +21,7 @@ from model import OrbitWarsPolicy, pack_observations
 from model_grouped_planet import (
     GroupedPlanetOrbitWarsPolicy,
     GroupedPlanetRelationEncoder,
-    PlanetFeatureGroupProjector,
+    PlanetProjector,
 )
 from model_planet_only import PlanetOnlyOrbitWarsPolicy
 
@@ -90,11 +90,9 @@ def test_grouped_planet_forward_pass_shapes(batch):
     net = GroupedPlanetRelationEncoder(p_max=8, f_max=4, d_model=32, n_heads=2, n_layers=2)
     out = net(**b)
     B = len(obs_list)
-    assert out["group_tokens"].shape == (B, 8, 6, 32)
     assert out["planet_tokens"].shape == (B, 8, 32)
-    assert out["group_summary_tokens"].shape == (B, 6, 32)
+    assert out["pool_seeds"].shape == (B, net.n_pool_seeds, 32)
     assert out["global_summary"].shape == (B, 32)
-    assert out["group_tokens"][:, 4:].abs().max().item() == 0.0
     assert out["planet_tokens"][:, 4:].abs().max().item() == 0.0
 
 
@@ -107,7 +105,7 @@ def test_grouped_planet_policy_forward_pass_shapes(batch):
     assert out.tgt_logits.shape == (B, 8, 8)
     assert out.ship_logits.shape == (B, 8, 8, 5)
     assert out.value.shape == (B,)
-    assert out.tokens.shape == (B, 8 * 6, 32)
+    assert out.tokens.shape == (B, 8, 32)
     assert out.aux_owner_logits.shape == (B, 8, 5)
 
 
@@ -128,7 +126,7 @@ def test_grouped_planet_policy_induced_forward_pass_shapes(batch):
     assert out.tgt_logits.shape == (B, 8, 8)
     assert out.ship_logits.shape == (B, 8, 8, 5)
     assert out.value.shape == (B,)
-    assert out.tokens.shape == (B, 8 * 6, 32)
+    assert out.tokens.shape == (B, 8, 32)
 
 
 def test_grouped_planet_policy_act_source_matches_eval(batch):
@@ -151,9 +149,9 @@ def test_grouped_planet_policy_act_source_matches_eval(batch):
 
 def test_grouped_planet_projector_output_shape(batch):
     _, b = batch
-    projector = PlanetFeatureGroupProjector(planet_dim=b["planet_feats"].shape[-1], d_model=32)
+    projector = PlanetProjector(planet_dim=b["planet_feats"].shape[-1], d_model=32)
     tokens = projector(b["planet_feats"])
-    assert tokens.shape == (b["planet_feats"].shape[0], b["planet_feats"].shape[1], 6, 32)
+    assert tokens.shape == (b["planet_feats"].shape[0], b["planet_feats"].shape[1], 32)
 
 
 def test_no_nan_in_logits(batch):

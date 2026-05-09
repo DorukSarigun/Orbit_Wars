@@ -10,25 +10,6 @@ from obs_builder import (
     GLOBAL_FEATURE_DIM,
     P_MAX_DEFAULT,
     PLANET_FEATURE_DIM,
-    PF_IDX_CAPTURE_VALUE,
-    PF_IDX_COS_THETA,
-    PF_IDX_DEFENSE_DEFICIT,
-    PF_IDX_INCOMING_ENEMY_LARGEST_ETA,
-    PF_IDX_INCOMING_ENEMY_LARGEST_SHIPS,
-    PF_IDX_INCOMING_ENEMY_MIN_ETA,
-    PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS,
-    PF_IDX_INCOMING_ENEMY_TOTAL,
-    PF_IDX_INCOMING_NET_THREAT,
-    PF_IDX_INCOMING_SELF_B0,
-    PF_IDX_INCOMING_SELF_MIN_ETA,
-    PF_IDX_INCOMING_SELF_TOTAL,
-    PF_IDX_IS_STATIC,
-    PF_IDX_LOG_SHIPS,
-    PF_IDX_OWNER_SELF,
-    PF_IDX_PRODUCTION,
-    PF_IDX_R_SUN,
-    PF_IDX_RADIUS,
-    PF_IDX_SHIPS,
 )
 from model import PolicyOutput, TransformerBlock
 
@@ -126,43 +107,40 @@ class InducedSetAttentionBlock(nn.Module):
         return self.project(x, h)
 
 
-class PlanetFeatureGroupProjector(nn.Module):
+class PlanetProjector(nn.Module):
+    """Project per-planet feature vector into d_model with a 2-layer MLP.
+
+    Single token per planet — no semantic group split.  All cross-feature
+    interactions are left to the transformer attention layers.
+    """
+
     def __init__(self, planet_dim: int = PLANET_FEATURE_DIM, d_model: int = 256):
         super().__init__()
         if planet_dim < PLANET_FEATURE_DIM:
             raise ValueError(f"planet_dim={planet_dim} is smaller than PLANET_FEATURE_DIM={PLANET_FEATURE_DIM}")
         self.planet_dim = int(planet_dim)
-        self.n_groups = 6
-        self.owner = nn.Sequential(nn.Linear(5, d_model), nn.GELU(), nn.LayerNorm(d_model))
-        self.economy = nn.Sequential(nn.Linear(4, d_model), nn.GELU(), nn.LayerNorm(d_model))
-        self.geometry = nn.Sequential(nn.Linear(3, d_model), nn.GELU(), nn.LayerNorm(d_model))
-        self.dynamics = nn.Sequential(nn.Linear(4, d_model), nn.GELU(), nn.LayerNorm(d_model))
-        self.incoming = nn.Sequential(nn.Linear(15, d_model), nn.GELU(), nn.Linear(d_model, d_model), nn.GELU(), nn.LayerNorm(d_model))
-        self.value = nn.Sequential(nn.Linear(3, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        self.proj = nn.Sequential(
+            nn.Linear(planet_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        owner = x[..., PF_IDX_OWNER_SELF:PF_IDX_OWNER_SELF + 5]
-        economy = torch.cat([
-            x[..., PF_IDX_SHIPS:PF_IDX_SHIPS + 1],
-            x[..., PF_IDX_PRODUCTION:PF_IDX_PRODUCTION + 1],
-            x[..., PF_IDX_RADIUS:PF_IDX_RADIUS + 1],
-            x[..., PF_IDX_LOG_SHIPS:PF_IDX_LOG_SHIPS + 1],
-        ], dim=-1)
-        geometry = x[..., PF_IDX_R_SUN:PF_IDX_COS_THETA + 2]
-        dynamics = x[..., PF_IDX_IS_STATIC:PF_IDX_IS_STATIC + 4]
-        incoming = x[..., PF_IDX_INCOMING_SELF_B0:PF_IDX_INCOMING_ENEMY_LARGEST_ETA + 1]
-        value = x[..., PF_IDX_INCOMING_NET_THREAT:PF_IDX_DEFENSE_DEFICIT + 1]
-        return torch.stack([
-            self.owner(owner),
-            self.economy(economy),
-            self.geometry(geometry),
-            self.dynamics(dynamics),
-            self.incoming(incoming),
-            self.value(value),
-        ], dim=2)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (..., planet_dim) -> (..., d_model)
+        return self.proj(x)
 
 
 class GroupedPlanetRelationEncoder(nn.Module):
+    """Planet-token relation encoder.
+
+    Each planet's feature vector is projected into a single d_model token.
+    Attention layers operate over P planet tokens directly (sequence length
+    = p_max), with planet-planet edge bias in `full` mode and induced
+    points in `induced` mode.  A small set of learned PMA seeds pools the
+    contextualized planet tokens into a global summary.
+    """
+
     def __init__(
         self,
         *,
@@ -176,6 +154,7 @@ class GroupedPlanetRelationEncoder(nn.Module):
         n_layers: int = 6,
         attention_type: str = "full",
         n_inducing_points: int = 32,
+        n_pool_seeds: int = 4,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -190,28 +169,21 @@ class GroupedPlanetRelationEncoder(nn.Module):
         self.n_heads = n_heads
         self.attention_type = attention_type
         self.n_inducing_points = n_inducing_points
-        self.planet_proj = PlanetFeatureGroupProjector(planet_dim=planet_dim, d_model=d_model)
-        self.n_planet_groups = self.planet_proj.n_groups
-        self.group_embed = nn.Embedding(self.n_planet_groups, d_model)
+        self.n_pool_seeds = n_pool_seeds
+        self.planet_proj = PlanetProjector(planet_dim=planet_dim, d_model=d_model)
         self.edge_proj = nn.Linear(edge_dim, n_heads)
-        block_cls = TransformerBlock if attention_type == "full" else InducedSetAttentionBlock
         if attention_type == "full":
             self.blocks = nn.ModuleList([
-                block_cls(d_model, n_heads, dropout=dropout)
+                TransformerBlock(d_model, n_heads, dropout=dropout)
                 for _ in range(n_layers)
             ])
         else:
             self.blocks = nn.ModuleList([
-                block_cls(d_model, n_heads, n_inducing_points=n_inducing_points, dropout=dropout)
+                InducedSetAttentionBlock(d_model, n_heads, n_inducing_points=n_inducing_points, dropout=dropout)
                 for _ in range(n_layers)
             ])
         self.norm = nn.LayerNorm(d_model)
-        self.group_fusion = nn.Sequential(
-            nn.Linear(self.n_planet_groups * d_model, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-        )
-        self.pool_seeds = nn.Parameter(torch.randn(self.n_planet_groups, d_model) * 0.02)
+        self.pool_seeds = nn.Parameter(torch.randn(n_pool_seeds, d_model) * 0.02)
         self.pool_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
@@ -220,7 +192,7 @@ class GroupedPlanetRelationEncoder(nn.Module):
         )
         self.pool_norm = nn.LayerNorm(d_model)
         self.summary_fusion = nn.Sequential(
-            nn.Linear(self.n_planet_groups * d_model, d_model),
+            nn.Linear(n_pool_seeds * d_model, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
@@ -231,27 +203,21 @@ class GroupedPlanetRelationEncoder(nn.Module):
         fleet_feats: torch.Tensor,
         global_feats: torch.Tensor,
     ) -> torch.Tensor:
-        B = planet_feats.shape[0]
-        group_tok = self.planet_proj(planet_feats)
-        group_tok = group_tok + self.group_embed.weight[None, None]
-        return group_tok.reshape(B, self.p_max * self.n_planet_groups, self.d_model)
+        return self.planet_proj(planet_feats)  # (B, P, d_model)
 
     def _build_attn_bias(self, edge_bias: torch.Tensor) -> torch.Tensor:
-        G = self.n_planet_groups
-        planet_pair = edge_bias[:, : self.p_max, : self.p_max]
-        planet_pair = planet_pair[:, :, None, :, None, :].expand(-1, -1, G, -1, G, -1)
-        planet_pair = planet_pair.reshape(edge_bias.shape[0], self.p_max * G, self.p_max * G, edge_bias.shape[-1])
+        # planet-planet sub-block only -> (B, H, P, P)
+        planet_pair = edge_bias[:, : self.p_max, : self.p_max, :]
         b = self.edge_proj(planet_pair)
         return b.permute(0, 3, 1, 2).contiguous()
 
     def _build_padding_mask(
         self, planet_mask: torch.Tensor, fleet_mask: torch.Tensor
     ) -> torch.Tensor:
-        B = planet_mask.shape[0]
-        group_real = planet_mask[:, :, None].expand(-1, -1, self.n_planet_groups)
-        return ~group_real.reshape(B, self.p_max * self.n_planet_groups)
+        # True = padded slot.  Mask shape (B, P).
+        return ~planet_mask
 
-    def _pool_groups(
+    def _pool(
         self,
         x: torch.Tensor,
         key_padding_mask: torch.Tensor,
@@ -266,7 +232,7 @@ class GroupedPlanetRelationEncoder(nn.Module):
             need_weights=False,
         )
         pooled = self.pool_norm(seeds + pooled)
-        global_summary = self.summary_fusion(pooled.reshape(B, self.n_planet_groups * self.d_model))
+        global_summary = self.summary_fusion(pooled.reshape(B, self.n_pool_seeds * self.d_model))
         return pooled, global_summary
 
     def encode_planets(
@@ -278,7 +244,6 @@ class GroupedPlanetRelationEncoder(nn.Module):
         planet_mask: torch.Tensor,
         fleet_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        B = planet_feats.shape[0]
         x = self._build_tokens(planet_feats, fleet_feats, global_feats)
         attn_bias = self._build_attn_bias(edge_bias) if self.attention_type == "full" else None
         kpm = self._build_padding_mask(planet_mask, fleet_mask)
@@ -286,19 +251,12 @@ class GroupedPlanetRelationEncoder(nn.Module):
         for blk in self.blocks:
             x = blk(x, attn_bias, kpm)
         x = self.norm(x)
-        group_summary, global_summary = self._pool_groups(x, kpm)
+        pool_seeds, global_summary = self._pool(x, kpm)
 
-        group_tok = x[:, : self.p_max * self.n_planet_groups]
-        group_tok = group_tok.reshape(B, self.p_max, self.n_planet_groups, self.d_model)
-        planet_tok = self.group_fusion(group_tok.reshape(B, self.p_max, self.n_planet_groups * self.d_model))
-        group_mask = planet_mask[:, :, None, None].to(group_tok.dtype)
-        planet_mask_f = planet_mask[:, :, None].to(planet_tok.dtype)
-        group_tok = group_tok * group_mask
-        planet_tok = planet_tok * planet_mask_f
+        planet_tok = x * planet_mask[:, :, None].to(x.dtype)
         return {
-            "group_tokens": group_tok,
             "planet_tokens": planet_tok,
-            "group_summary_tokens": group_summary,
+            "pool_seeds": pool_seeds,
             "global_summary": global_summary,
         }
 
@@ -448,7 +406,7 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         ship_logits = self.ship_head(ship_input)
         value = self.value_head(global_summary).squeeze(-1)
         aux_owner_logits = self.aux_owner_head(planet_tok)
-        tokens = enc["group_tokens"].reshape(B, self.p_max * self.encoder.n_planet_groups, self.d_model)
+        tokens = planet_tok
 
         return PolicyOutput(
             src_logits=src_logits,
