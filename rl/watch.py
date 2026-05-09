@@ -41,6 +41,7 @@ from .train import load_checkpoint as load_ppo_checkpoint
 from .dqn_train import load_dqn_checkpoint
 from model_q import OrbitWarsQNet
 from playground import render_board
+from scripted_strategy import CaptureEfficiencyAgent, ScriptedConfig
 
 MAX_LAUNCHES_PER_PLAYER_TURN = 8
 MAX_PAIR_CANDIDATES = 64
@@ -267,6 +268,28 @@ def _planet_counts_by_owner(env_obs: dict, num_agents: int) -> dict:
     return counts
 
 
+def _act_dispatch(net, env_obs, player: int, *, deterministic: bool,
+                  device: torch.device, opponent_indices: set,
+                  scripted_agent: Optional[CaptureEfficiencyAgent],
+                  current_turn: int, max_turns: int) -> tuple:
+    """Pick an action for `player`. Scripted slots get scripted actions;
+    everyone else uses the loaded policy/Q-net.
+
+    Returns the same tuple shape as `_act_all_sources` so callers can
+    treat both paths uniformly: `(actions, info_extra)`.
+    """
+    if player in opponent_indices and scripted_agent is not None:
+        actions = scripted_agent.act(
+            env_obs, player=player,
+            current_turn=int(current_turn), max_turns=int(max_turns),
+        )
+        return actions, {"scripted": True, "n_launches": len(actions)}
+    return _act_all_sources(
+        net, env_obs, player,
+        deterministic=deterministic, device=device,
+    )
+
+
 def play_self_play_game(
     policy: OrbitWarsPolicy,
     *,
@@ -278,6 +301,8 @@ def play_self_play_game(
     seed: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
+    opponent_indices: Optional[set[int]] = None,
+    scripted_cfg: Optional[ScriptedConfig] = None,
 ) -> dict:
     """Play one self-play game. Returns summary dict.
 
@@ -286,6 +311,10 @@ def play_self_play_game(
     """
     device = device or torch.device("cpu")
     policy.eval().to(device)
+    opponent_indices = set(opponent_indices) if opponent_indices else set()
+    scripted_agent: Optional[CaptureEfficiencyAgent] = (
+        CaptureEfficiencyAgent(scripted_cfg) if opponent_indices else None
+    )
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
@@ -300,9 +329,12 @@ def play_self_play_game(
 
     for t in range(max_steps):
         acted = [
-            _act_all_sources(
+            _act_dispatch(
                 policy, state[p]["observation"], p,
                 deterministic=deterministic, device=device,
+                opponent_indices=opponent_indices,
+                scripted_agent=scripted_agent,
+                current_turn=t, max_turns=max_steps,
             )
             for p in range(num_agents)
         ]
@@ -353,6 +385,8 @@ def record_game_html(
     seed: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
+    opponent_indices: Optional[set[int]] = None,
+    scripted_cfg: Optional[ScriptedConfig] = None,
 ) -> dict:
     """Play one game, write kaggle_environments' native interactive HTML
     replay to `out_path`, and return a summary dict.
@@ -362,6 +396,10 @@ def record_game_html(
     """
     device = device or torch.device("cpu")
     net.eval().to(device)
+    opponent_indices = set(opponent_indices) if opponent_indices else set()
+    scripted_agent: Optional[CaptureEfficiencyAgent] = (
+        CaptureEfficiencyAgent(scripted_cfg) if opponent_indices else None
+    )
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
@@ -371,9 +409,12 @@ def record_game_html(
 
     for t in range(max_steps):
         acted = [
-            _act_all_sources(
+            _act_dispatch(
                 net, state[p]["observation"], p,
                 deterministic=deterministic, device=device,
+                opponent_indices=opponent_indices,
+                scripted_agent=scripted_agent,
+                current_turn=t, max_turns=max_steps,
             )
             for p in range(num_agents)
         ]
@@ -422,11 +463,23 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--games", type=int, default=1,
                    help="Number of games to play/record (with --html, each "
                         "becomes a separate file PATH_NNN.html).")
+    p.add_argument("--opponent", choices=["self_play", "scripted"],
+                   default="self_play",
+                   help="self_play (default): all slots use the loaded "
+                        "policy. scripted: slot 0 = policy, all other "
+                        "slots = CaptureEfficiencyAgent (matches "
+                        "training-vs-scripted setup).")
     p.add_argument("--device", default="cpu")
     args = p.parse_args(argv)
 
     net, kind, _ = load_any_checkpoint(args.ckpt, device=torch.device(args.device))
     print(f"Loaded {kind.upper()} checkpoint: {sum(p.numel() for p in net.parameters()):,} params")
+
+    opponent_indices: set[int] = set()
+    if args.opponent == "scripted":
+        opponent_indices = set(range(1, args.num_agents))
+        print(f"Opponent slots (scripted): {sorted(opponent_indices)} | "
+              f"Policy slots: [0]")
 
     if args.html:
         base = Path(args.html)
@@ -440,6 +493,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 net, out, max_steps=args.max_steps,
                 deterministic=args.deterministic, num_agents=args.num_agents, seed=seed,
                 device=torch.device(args.device),
+                opponent_indices=opponent_indices,
             )
         return
 
@@ -452,6 +506,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         num_agents=args.num_agents,
         seed=args.seed,
         device=torch.device(args.device),
+        opponent_indices=opponent_indices,
     )
 
 
