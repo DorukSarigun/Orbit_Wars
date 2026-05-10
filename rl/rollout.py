@@ -21,7 +21,8 @@ from typing import Optional
 import torch
 from kaggle_environments import make
 
-from feature_extraction import parse_planets, parse_fleets, fleet_speed
+from feature_extraction import parse_planets, parse_fleets, fleet_speed, Planet, Fleet
+from navigation import predict_all_fleet_targets
 from obs_builder import (
     build_observation,
     decode_action_with_launch,
@@ -114,6 +115,103 @@ def _compute_source_defense_deficit_penalty(*, enemy_incoming: float,
                                             weight: float = 1.0) -> float:
     deficit = max(0.0, float(enemy_incoming) - float(max(0, int(ships_remaining_after_launch))))
     return -float(weight) * deficit
+
+
+def _compute_source_defense_shortfall(
+    *,
+    ships_remaining_after_launch: int,
+    production: float,
+    enemy_arrivals: list[tuple[float, float]],
+    self_arrivals: Optional[list[tuple[float, float]]] = None,
+) -> float:
+    """Simulate garrison evolution at a source planet and return the
+    total ship shortfall summed across all overwhelming enemy arrivals.
+
+    Per-fleet simulation (no ETA bucketing):
+        garrison0   = ships_remaining_after_launch
+        At each fleet arrival (sorted by ETA):
+            dt            = eta - prev_eta
+            garrison     += production * dt      (new ships produced)
+            garrison     += self_arrival_ships    (friendlies, if any)
+            shortfall_i   = max(0, enemy_ships - garrison)
+            total        += shortfall_i
+            garrison      = max(0, garrison - enemy_ships)
+
+    Returns the SUM of per-arrival shortfalls (in raw ship units).  Zero
+    means the planet survives every incoming enemy fleet given its
+    current garrison + production; positive means at least one arrival
+    overwhelms the garrison.
+
+    This replaces the older "sum all enemy buckets irrespective of ETA"
+    heuristic: distant threats no longer trigger a penalty when the
+    planet has enough time to produce a defense.
+
+    Args:
+        ships_remaining_after_launch: garrison after subtracting the
+            just-launched fleet's ships.
+        production: planet production per turn (>= 0).
+        enemy_arrivals: list of (eta, ships) for enemy fleets predicted
+            to hit this planet. ETAs may be float; order is irrelevant
+            (we sort).
+        self_arrivals: optional list of (eta, ships) for friendly fleets
+            arriving at this planet (reinforcements).
+    """
+    if not enemy_arrivals:
+        return 0.0
+    events: list[tuple[float, float, bool]] = [
+        (float(eta), float(ships), False) for eta, ships in enemy_arrivals
+    ]
+    if self_arrivals:
+        events.extend(
+            (float(eta), float(ships), True) for eta, ships in self_arrivals
+        )
+    events.sort(key=lambda ev: ev[0])
+
+    garrison = float(max(0, int(ships_remaining_after_launch)))
+    prev_eta = 0.0
+    total_shortfall = 0.0
+    for eta, ships, is_self in events:
+        dt = max(0.0, eta - prev_eta)
+        garrison += float(production) * dt
+        if is_self:
+            garrison += ships
+        else:
+            if ships > garrison:
+                total_shortfall += (ships - garrison)
+            garrison = max(0.0, garrison - ships)
+        prev_eta = eta
+    return total_shortfall
+
+
+def _enemy_self_arrivals_at_planet(
+    *,
+    planet_id: int,
+    player: int,
+    fleets: list[Fleet],
+    fleet_preds: dict[int, Optional[dict]],
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Partition predicted arrivals at `planet_id` into enemy and self
+    lists of (eta, ships).
+
+    `fleet_preds` is the output of `predict_all_fleet_targets`, keyed
+    by fleet id. Fleets with no prediction (leaving board / hitting sun
+    / beyond t_max) are skipped.
+    """
+    enemy: list[tuple[float, float]] = []
+    mine: list[tuple[float, float]] = []
+    for f in fleets:
+        pred = fleet_preds.get(f.id)
+        if pred is None:
+            continue
+        if int(pred["target_id"]) != int(planet_id):
+            continue
+        eta = float(pred["eta"])
+        ships = float(f.ships)
+        if f.owner == player:
+            mine.append((eta, ships))
+        elif f.owner != -1:
+            enemy.append((eta, ships))
+    return enemy, mine
 
 
 def _airborne_risk_multiplier(threat_intensity: float, *,
@@ -236,6 +334,15 @@ def _act_for_player(
                             max_turns=max_turns)
     parsed = parse_planets(env_obs)
     parsed_fleets = parse_fleets(env_obs)
+    # Cache per-fleet ETA / target predictions once per decision step.
+    # Used below to compute exact defense-shortfall per source planet
+    # (replaces ETA-bucket aggregation that lumped distant threats in
+    # with imminent ones).
+    fleet_preds = (
+        predict_all_fleet_targets(parsed_fleets, parsed, angular_velocity)
+        if parsed_fleets else {}
+    )
+    planet_prod_by_id = {int(p.id): float(p.production) for p in parsed}
     my_total_ships = sum(int(p.ships) for p in parsed if p.owner == player and not p.is_comet)
     my_total_ships += sum(int(f.ships) for f in parsed_fleets if f.owner == player)
     enemy_total_ships = sum(
@@ -397,6 +504,16 @@ def _act_for_player(
                 src_planet.ships = src_ships_remaining
             source_enemy_incoming = _enemy_incoming_ships(obs_decision, src_slot)
             source_threat = _source_threat_intensity(obs_decision, src_slot, src_ships_remaining)
+            enemy_arrivals, self_arrivals = _enemy_self_arrivals_at_planet(
+                planet_id=src_planet_id, player=player,
+                fleets=parsed_fleets, fleet_preds=fleet_preds,
+            )
+            source_defense_shortfall = _compute_source_defense_shortfall(
+                ships_remaining_after_launch=src_ships_remaining,
+                production=planet_prod_by_id.get(src_planet_id, 0.0),
+                enemy_arrivals=enemy_arrivals,
+                self_arrivals=self_arrivals,
+            )
             fleet_meta = {
                 "launch_turn": current_turn,
                 "player": player,
@@ -410,6 +527,7 @@ def _act_for_player(
                 "launch_tgt_ships": int(tgt_planet.ships) if tgt_planet else 0,
                 "source_had_enemy_incoming": _planet_under_enemy_attack(obs_decision, src_slot),
                 "source_enemy_incoming": float(source_enemy_incoming),
+                "source_defense_shortfall": float(source_defense_shortfall),
                 "source_ships_remaining_after_launch": int(src_ships_remaining),
                 "source_threat_intensity": float(source_threat),
                 "my_total_ships_at_launch": int(my_total_ships),
@@ -490,6 +608,16 @@ def _act_for_player(
             src_ships_remaining = max(0, src_ships_pre - int(sent_ships))
             source_enemy_incoming = _enemy_incoming_ships(obs_decision, src_slot)
             source_threat = _source_threat_intensity(obs_decision, src_slot, src_ships_remaining)
+            enemy_arrivals, self_arrivals = _enemy_self_arrivals_at_planet(
+                planet_id=src_planet_id, player=player,
+                fleets=parsed_fleets, fleet_preds=fleet_preds,
+            )
+            source_defense_shortfall = _compute_source_defense_shortfall(
+                ships_remaining_after_launch=src_ships_remaining,
+                production=planet_prod_by_id.get(src_planet_id, 0.0),
+                enemy_arrivals=enemy_arrivals,
+                self_arrivals=self_arrivals,
+            )
             # Prepare fleet tracking metadata for later reward assignment.
             fleet_meta = {
                 "launch_turn": current_turn,
@@ -504,6 +632,7 @@ def _act_for_player(
                 "launch_tgt_ships": int(tgt_planet.ships) if tgt_planet else 0,
                 "source_had_enemy_incoming": _planet_under_enemy_attack(obs_decision, src_slot),
                 "source_enemy_incoming": float(source_enemy_incoming),
+                "source_defense_shortfall": float(source_defense_shortfall),
                 "source_ships_remaining_after_launch": int(src_ships_remaining),
                 "source_threat_intensity": float(source_threat),
                 "my_total_ships_at_launch": int(my_total_ships),
@@ -743,10 +872,13 @@ def collect_episode(
                     ) * reward_cfg.reward_scale
                     buffer.add_reward(idx, airborne_cost)
                     if reward_cfg.reward_system == "production_simple":
-                        defense_deficit_penalty = _compute_source_defense_deficit_penalty(
-                            enemy_incoming=fleet_meta["source_enemy_incoming"],
-                            ships_remaining_after_launch=fleet_meta["source_ships_remaining_after_launch"],
-                            weight=reward_cfg.planet_loss_weight,
+                        # Use the ETA-exact shortfall: penalty reflects the
+                        # net ship deficit across all actually-incoming enemy
+                        # arrivals, after accounting for production + friendly
+                        # reinforcements. A distant threat that production can
+                        # cover contributes 0 shortfall.
+                        defense_deficit_penalty = -float(reward_cfg.planet_loss_weight) * float(
+                            fleet_meta["source_defense_shortfall"]
                         ) * reward_cfg.reward_scale
                         buffer.add_reward(idx, defense_deficit_penalty)
                     fleet_trackers[p].register_launch(

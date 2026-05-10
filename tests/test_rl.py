@@ -39,6 +39,7 @@ from rl.rollout import (
     _airborne_risk_multiplier,
     _compute_airborne_cost,
     _compute_source_defense_deficit_penalty,
+    _compute_source_defense_shortfall,
 )
 from rl.replay import ReplayBuffer, DQNTransition
 from rl.rewards import REWARD_SYSTEMS, RewardConfig, build_reward_config, compute_step_reward, normalize_terminal_rewards
@@ -1383,6 +1384,110 @@ class TestProductionRewardTracker:
             weight=0.5,
         )
         assert penalty == pytest.approx(-5.0, abs=1e-6)
+
+
+class TestSourceDefenseShortfall:
+    """Per-fleet ETA simulation: garrison evolves with production, each
+    incoming enemy fleet attacks the CURRENT garrison (not the final
+    total). Distant threats are auto-absorbed if production catches up
+    in time; only overwhelming arrivals contribute to the shortfall."""
+
+    def test_no_enemy_arrivals_returns_zero(self):
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=0,
+            production=2.0,
+            enemy_arrivals=[],
+        ) == pytest.approx(0.0, abs=1e-9)
+
+    def test_distant_threat_covered_by_production_contributes_zero(self):
+        # 3 ships remaining, production 2/turn, enemy 30 ships at ETA 80.
+        # By t=80 garrison = 3 + 2*80 = 163 >> 30. Zero shortfall.
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(80.0, 30.0)],
+        ) == pytest.approx(0.0, abs=1e-9)
+
+    def test_imminent_threat_exceeding_garrison_reports_exact_shortfall(self):
+        # 3 ships remaining, production 2/turn, enemy 30 ships at ETA 5.
+        # At t=5: garrison = 3 + 2*5 = 13. Deficit = 30 - 13 = 17.
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(5.0, 30.0)],
+        ) == pytest.approx(17.0, abs=1e-6)
+
+    def test_user_example_two_sequential_attacks(self):
+        # User's concrete example:
+        #   ships_remaining=3, production=2
+        #   Attack 1: 20 ships @ ETA 10
+        #     garrison = 3 + 2*10 = 23, deficit = max(0, 20-23) = 0
+        #     garrison after = 23 - 20 = 3
+        #   Attack 2: 100 ships @ ETA 35 (25 turns later)
+        #     garrison = 3 + 2*25 = 53, deficit = max(0, 100-53) = 47
+        #     garrison after = 0
+        # Total shortfall = 47.
+        shortfall = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(10.0, 20.0), (35.0, 100.0)],
+        )
+        assert shortfall == pytest.approx(47.0, abs=1e-6)
+
+    def test_arrivals_sorted_internally_independent_of_input_order(self):
+        unsorted_first = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(35.0, 100.0), (10.0, 20.0)],
+        )
+        sorted_first = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(10.0, 20.0), (35.0, 100.0)],
+        )
+        assert unsorted_first == pytest.approx(sorted_first, abs=1e-9)
+
+    def test_self_reinforcement_increases_garrison_before_attack(self):
+        # Enemy 50 ships @ ETA 20. Without help: garrison = 5 + 2*20 = 45,
+        # shortfall = 50-45 = 5.
+        # With self reinforcement 30 ships @ ETA 15: garrison at t=15 is
+        # 5 + 2*15 = 35 -> +30 reinforcement = 65. At t=20 garrison is
+        # 65 + 2*5 = 75 > 50 -> zero shortfall.
+        without_help = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=5,
+            production=2.0,
+            enemy_arrivals=[(20.0, 50.0)],
+        )
+        with_help = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=5,
+            production=2.0,
+            enemy_arrivals=[(20.0, 50.0)],
+            self_arrivals=[(15.0, 30.0)],
+        )
+        assert without_help == pytest.approx(5.0, abs=1e-6)
+        assert with_help == pytest.approx(0.0, abs=1e-9)
+
+    def test_zero_production_planet_only_uses_initial_garrison(self):
+        # Comet-like: no production. 10 ships remaining, enemy 15 @ ETA 50.
+        # Garrison never grows -> shortfall = 15 - 10 = 5.
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=10,
+            production=0.0,
+            enemy_arrivals=[(50.0, 15.0)],
+        ) == pytest.approx(5.0, abs=1e-6)
+
+    def test_multiple_small_enemies_chain_deplete_garrison(self):
+        # 10 ships remaining, production 1/turn, three small attacks at
+        # ETAs 5, 10, 15 (each 8 ships).
+        #   t=5 : garrison = 10 + 5 = 15, combat: 8 vs 15 -> 7 left, no deficit
+        #   t=10: garrison = 7 + 5  = 12, combat: 8 vs 12 -> 4 left, no deficit
+        #   t=15: garrison = 4 + 5  = 9,  combat: 8 vs 9  -> 1 left, no deficit
+        # Total shortfall = 0 (every attack is absorbed).
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=10,
+            production=1.0,
+            enemy_arrivals=[(5.0, 8.0), (10.0, 8.0), (15.0, 8.0)],
+        ) == pytest.approx(0.0, abs=1e-9)
 
 
 class TestPostCaptureReinforcement:
