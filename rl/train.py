@@ -500,11 +500,27 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--reward-scale", type=float, default=None)
     p.add_argument("--draw-terminal-reward", type=float, default=None)
     p.add_argument("--eligibility-trace-horizon", type=int, default=None,
-                   help="Deprecated; step rewards are no longer distributed backward.")
+                   help="Number of past turns to spread the per-step reward "
+                        "over (production_diff system only). 0 disables.")
     p.add_argument("--eligibility-trace-decay", type=float, default=None,
-                   help="Deprecated; step rewards are no longer distributed backward.")
+                   help="Exponential decay base for eligibility trace credit "
+                        "assignment (production_diff system only). "
+                        "0..1 typical.")
     p.add_argument("--noop-trace-weight", type=float, default=None,
-                   help="Deprecated; NO-OP trace reward distribution is disabled.")
+                   help="Per-NO-OP credit weight inside the trace (relative "
+                        "to launch transitions = 1.0). "
+                        "production_diff system only.")
+    p.add_argument("--eligibility-trace-reverse", action="store_true",
+                   default=None,
+                   help="Reverse eligibility trace: OLDER actions in the "
+                        "window get more credit, NEWER ones get less. "
+                        "Right default for delayed-effect domains where "
+                        "current production-diff is caused by launches "
+                        "made many turns ago. (production_diff default: True)")
+    p.add_argument("--no-eligibility-trace-reverse", action="store_false",
+                   dest="eligibility_trace_reverse",
+                   help="Disable reverse trace; use standard forward trace "
+                        "(newer actions get more credit).")
     p.add_argument("--resume-from", default=None,
                    help="Checkpoint path to resume from")
     return p
@@ -577,6 +593,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         eligibility_trace_horizon=args.eligibility_trace_horizon,
         eligibility_trace_decay=args.eligibility_trace_decay,
         noop_trace_weight=args.noop_trace_weight,
+        eligibility_trace_reverse=args.eligibility_trace_reverse,
     )
     train(train_cfg, ppo_cfg, reward_cfg, resume_from=args.resume_from)
 

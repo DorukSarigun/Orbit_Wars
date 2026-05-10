@@ -145,6 +145,15 @@ class RewardConfig:
     eligibility_trace_horizon: int = 0
     eligibility_trace_decay: float = 0.0
     noop_trace_weight: float = 0.0
+    # If True, the eligibility trace assigns MORE credit to OLDER actions in
+    # the trace window and LESS to the most recent ones. This is the right
+    # default for delayed-effect domains like Orbit Wars where a fleet
+    # launched ~30 turns ago is what's currently producing the
+    # production-diff signal, while a launch made this turn has not yet
+    # arrived. Weight at lookback k (0 = current, L-1 = oldest in window):
+    #   forward  : decay^k          -> recent gets max
+    #   reverse  : decay^(L-1-k)    -> oldest gets max
+    eligibility_trace_reverse: bool = False
 
     # ---- Legacy / backward-compatible ----
     # Un-weighted planet count differential (superseded by capture-value).
@@ -193,9 +202,12 @@ def build_reward_config(reward_system: str = "current", **overrides) -> RewardCo
             production_reinforcement_weight=0.0,
             invalid_action_penalty=0.0,
             planet_diff_weight=0.0,
-            # Eligibility trace defaults.
+            # Eligibility trace defaults. Reverse=True so older launches
+            # (whose fleets are arriving NOW and producing the current
+            # production-diff signal) receive the bulk of the credit.
             eligibility_trace_horizon=30,
             eligibility_trace_decay=0.9,
+            eligibility_trace_reverse=True,
             noop_trace_weight=1.0,
             delayed_reward_discount=1.0,
             reward_scale=0.001,

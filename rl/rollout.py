@@ -1040,21 +1040,42 @@ def collect_episode(
                 # Eligibility-trace distribution. Push current step's
                 # transitions to the rolling window, then add the current
                 # per-step reward `r` to ALL transitions in the window
-                # (including past turns) with exponential decay
-                # `lambda^k` where k=0 is the current turn and k=H the
-                # oldest. NO-OP transitions get a separate weight scale
-                # so we can up- or down-weight passive holds.
+                # with an exponential weight that depends on direction:
+                #   forward (default off):  decay^k        -> newer gets max
+                #   reverse (default ON):   decay^(L-1-k)  -> older gets max
+                # where k=0 is the current turn, L is current window length.
+                # Reverse is appropriate for delayed-effect domains:
+                # the production-diff at turn t is caused by launches
+                # made many turns ago whose fleets just arrived — those
+                # OLD actions deserve the bulk of the credit.
                 if new_indices:
                     trace_windows[p].append(list(new_indices))
                 decay = float(reward_cfg.eligibility_trace_decay)
                 noop_w = float(reward_cfg.noop_trace_weight)
-                # Iterate window from newest (k=0) to oldest (k=H).
+                reverse = bool(reward_cfg.eligibility_trace_reverse)
+                window_len = len(trace_windows[p])
+                # Iterate window from newest (k=0) to oldest (k=L-1).
                 for k, past_idxs in enumerate(reversed(trace_windows[p])):
                     if not past_idxs:
                         continue
-                    decay_k = decay ** k if decay > 0.0 else (1.0 if k == 0 else 0.0)
+                    if reverse:
+                        # Older = larger weight: decay^(L-1-k)
+                        exponent = (window_len - 1) - k
+                    else:
+                        # Newer = larger weight: decay^k
+                        exponent = k
+                    if decay > 0.0:
+                        decay_k = decay ** exponent
+                    else:
+                        decay_k = 1.0 if exponent == 0 else 0.0
                     if decay_k <= 0.0:
-                        break
+                        # Forward: oldest is decay^L ~ 0; can break.
+                        # Reverse: only fires for non-current with decay=0;
+                        # in that case skip but don't break (current may
+                        # have non-zero weight in forward only).
+                        if not reverse:
+                            break
+                        continue
                     weights = [
                         (noop_w if buffer.data[idx].is_noop else 1.0)
                         for idx in past_idxs
