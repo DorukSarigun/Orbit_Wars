@@ -26,13 +26,13 @@ from navigation import predict_all_fleet_targets
 from obs_builder import (
     build_observation,
     decode_action_with_launch,
-    DEFAULT_SHIP_BINS,
     INCOMING_ETA_BUCKETS,
     PF_IDX_SHIPS,
     PF_IDX_INCOMING_SELF_B0,
     PF_IDX_INCOMING_ENEMY_B0,
+    SHIP_REQUEST_CAP,
 )
-from model import OrbitWarsPolicy, pack_observations
+from model import OrbitWarsPolicy, pack_observations, _make_ship_dist
 
 from .buffer import RolloutBuffer, Transition
 from .rewards import RewardConfig, compute_step_reward, normalize_terminal_rewards
@@ -40,6 +40,7 @@ from .fleet_tracker import FleetTracker, compute_fleet_reward, compute_productio
 from .defense_tracker import DefenseTracker, compute_defense_reward
 from .planet_loss_tracker import PlanetLossTracker, compute_planet_loss_launch_penalty
 from .planet_defense_tracker import PlanetDefenseTracker
+from .defense_kills_tracker import DefenseKillsTracker
 from .production_reward_tracker import (
     ProductionRewardTracker,
     compute_production_capture_reward,
@@ -290,28 +291,31 @@ def _scripted_neutral_expansion_action(
     )[:max(1, int(nearest_k))]
     scored = []
     for tgt in nearest:
-        valid_bins = [
-            idx for idx, frac in enumerate(DEFAULT_SHIP_BINS)
-            if max(1, int(src.ships * float(frac))) > int(tgt.ships)
-        ]
-        if not valid_bins:
+        # Scripted heuristic: must send strictly more than tgt.ships to
+        # capture, must not exceed src.ships (otherwise no valid launch),
+        # and must fit within SHIP_REQUEST_CAP (the continuous head's
+        # absolute scale).
+        needed_ships = int(tgt.ships) + 1
+        if needed_ships > int(src.ships) or needed_ships > SHIP_REQUEST_CAP:
             continue
         distance = math.hypot(src.x - tgt.x, src.y - tgt.y)
         score = float(tgt.production) / max(1.0, float(tgt.ships))
-        scored.append((score, -distance, int(tgt.production), -int(tgt.ships), tgt.id, valid_bins[0]))
+        # Convert needed ship count to the [0, 1] fraction the Beta head emits.
+        ship_value = float(needed_ships) / float(SHIP_REQUEST_CAP)
+        scored.append((score, -distance, int(tgt.production), -int(tgt.ships), tgt.id, ship_value))
     if not scored:
         return None
-    _, _, _, _, target_id, ship_bin = max(scored)
+    _, _, _, _, target_id, ship_value = max(scored)
     src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
     tgt_tensor = torch.tensor([slot_by_planet_id[int(target_id)]], device=device, dtype=torch.long)
-    ship_tensor = torch.tensor([ship_bin], device=device, dtype=torch.long)
+    ship_tensor = torch.tensor([ship_value], device=device, dtype=torch.float32)
     noop_tensor = torch.tensor([False], device=device, dtype=torch.bool)
     with torch.no_grad():
         ev = policy.evaluate_source_actions(out, src_tensor, tgt_tensor, ship_tensor, noop_tensor)
     return {
         "src": src_tensor,
         "tgt": tgt_tensor,
-        "ship_bin": ship_tensor,
+        "ship_value": ship_tensor,
         "is_noop": noop_tensor,
         "log_prob": ev["log_prob"],
     }
@@ -396,10 +400,10 @@ def _act_for_player(
                         action = scripted_action
                         src_slot = int(action["src"][0])
                         tgt_slot = int(action["tgt"][0])
-                        ship_bin = int(action["ship_bin"][0])
+                        ship_value = float(action["ship_value"][0])
                         is_noop = bool(action["is_noop"][0])
                         decoded = decode_action_with_launch(
-                            obs_decision, src_slot, tgt_slot, ship_bin,
+                            obs_decision, src_slot, tgt_slot, ship_value,
                             planets=parsed, angular_velocity=angular_velocity, no_op=is_noop,
                         )
                         if decoded is not None:
@@ -432,43 +436,48 @@ def _act_for_player(
                         continue
                     if not bool(available_pairs[src_slot, tgt_slot]):
                         continue
-                    ship_order = torch.argsort(out.ship_logits[0, src_slot, tgt_slot], descending=True).tolist()
-                    for ship_bin in ship_order:
-                        decoded = decode_action_with_launch(
-                            obs_decision, src_slot, tgt_slot, int(ship_bin),
-                            planets=parsed, angular_velocity=angular_velocity, no_op=False,
-                        )
-                        if decoded is None:
-                            continue
-                        src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
-                        tgt_tensor = torch.tensor([tgt_slot], device=device, dtype=torch.long)
-                        ship_tensor = torch.tensor([int(ship_bin)], device=device, dtype=torch.long)
-                        noop_tensor = torch.tensor([False], device=device, dtype=torch.bool)
-                        with torch.no_grad():
-                            ev = policy.evaluate_source_actions(out, src_tensor, tgt_tensor, ship_tensor, noop_tensor)
-                        action = {
-                            "src": src_tensor,
-                            "tgt": tgt_tensor,
-                            "ship_bin": ship_tensor,
-                            "is_noop": noop_tensor,
-                            "log_prob": ev["log_prob"],
-                        }
-                        selected = (action, decoded)
-                        break
-                    if selected is not None:
-                        break
+                    # Sample a single ship_value from the Beta head for
+                    # this (src, tgt) pair. If decoding fails (invalid
+                    # trajectory), fall through to the next pair.
+                    ship_params_pair = out.ship_params[0, src_slot, tgt_slot]
+                    ship_dist_pair = _make_ship_dist(ship_params_pair)
+                    with torch.no_grad():
+                        ship_value_sample = float(ship_dist_pair.sample().item())
+                    decoded = decode_action_with_launch(
+                        obs_decision, src_slot, tgt_slot, ship_value_sample,
+                        planets=parsed, angular_velocity=angular_velocity, no_op=False,
+                    )
+                    if decoded is None:
+                        continue
+                    src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
+                    tgt_tensor = torch.tensor([tgt_slot], device=device, dtype=torch.long)
+                    ship_tensor = torch.tensor([ship_value_sample], device=device, dtype=torch.float32)
+                    noop_tensor = torch.tensor([False], device=device, dtype=torch.bool)
+                    with torch.no_grad():
+                        ev = policy.evaluate_source_actions(out, src_tensor, tgt_tensor, ship_tensor, noop_tensor)
+                    action = {
+                        "src": src_tensor,
+                        "tgt": tgt_tensor,
+                        "ship_value": ship_tensor,
+                        "is_noop": noop_tensor,
+                        "log_prob": ev["log_prob"],
+                    }
+                    selected = (action, decoded)
+                    break
             if selected is None:
                 with torch.no_grad():
                     for src_slot in [int(i) for i, ok in enumerate(obs_decision.source_mask) if ok]:
                         src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
                         tgt_tensor = torch.tensor([0], device=device, dtype=torch.long)
-                        ship_tensor = torch.tensor([0], device=device, dtype=torch.long)
+                        # NO-OP rows: store a degenerate ship_value (0.5);
+                        # the log_prob path masks ship contributions for noops.
+                        ship_tensor = torch.tensor([0.5], device=device, dtype=torch.float32)
                         noop_tensor = torch.tensor([True], device=device, dtype=torch.bool)
                         ev = policy.evaluate_source_actions(out, src_tensor, tgt_tensor, ship_tensor, noop_tensor)
                         decisions.append((obs_decision, {
                             "src": src_tensor,
                             "tgt": tgt_tensor,
-                            "ship_bin": ship_tensor,
+                            "ship_value": ship_tensor,
                             "is_noop": noop_tensor,
                             "log_prob": ev["log_prob"],
                         }, out, False, False, None))
@@ -532,6 +541,11 @@ def _act_for_player(
                 "source_threat_intensity": float(source_threat),
                 "my_total_ships_at_launch": int(my_total_ships),
                 "enemy_total_ships_at_launch": int(enemy_total_ships),
+                # Continuous Beta head: how many ships the policy *requested*
+                # beyond the source's available garrison (>=0). Drives the
+                # overflow penalty in the reward step.
+                "overflow_ships": float(launch_info.get("overflow_ships", 0.0)) if launch_info is not None else 0.0,
+                "raw_request": float(launch_info.get("raw_request", float(sent_ships))) if launch_info is not None else float(sent_ships),
             }
             obs_work.source_mask[src_slot] = obs_work.planet_feats[src_slot, PF_IDX_SHIPS] > 0.01
             available_pairs[src_slot, tgt_slot] = False
@@ -574,10 +588,10 @@ def _act_for_player(
         last_out = out
 
         tgt_slot = int(action["tgt"][0])
-        ship_bin = int(action["ship_bin"][0])
+        ship_value = float(action["ship_value"][0])
         is_noop = bool(action["is_noop"][0])
         decoded = decode_action_with_launch(
-            obs_decision, src_slot, tgt_slot, ship_bin,
+            obs_decision, src_slot, tgt_slot, ship_value,
             planets=parsed, angular_velocity=angular_velocity, no_op=is_noop,
         )
         move = None if decoded is None else decoded[0]
@@ -637,6 +651,8 @@ def _act_for_player(
                 "source_threat_intensity": float(source_threat),
                 "my_total_ships_at_launch": int(my_total_ships),
                 "enemy_total_ships_at_launch": int(enemy_total_ships),
+                "overflow_ships": float(launch_info.get("overflow_ships", 0.0)) if launch_info is not None else 0.0,
+                "raw_request": float(launch_info.get("raw_request", float(sent_ships))) if launch_info is not None else float(sent_ships),
             }
         else:
             fleet_meta = None
@@ -721,6 +737,7 @@ def collect_episode(
             hold_share=reward_cfg.planet_defense_hold_share,
             max_turns=reward_cfg.max_turns,
             num_opponents=max(1, num_agents - 1),
+            capture_time_curvature=reward_cfg.capture_time_curvature,
         )
         for _ in range(num_agents)
     ]
@@ -728,6 +745,18 @@ def collect_episode(
         DefenseTracker(
             horizon=reward_cfg.defense_hold_horizon,
             arrival_window=reward_cfg.defense_arrival_window,
+        )
+        for _ in range(num_agents)
+    ]
+    # Defense Kills tracker: rewards launches that defended my planets and
+    # contributed to killing enemy ships (threat-aware replacement for the
+    # legacy production_reinforcement bonus).
+    initial_obs0 = state[0]["observation"]
+    angular_velocity = float(initial_obs0.get("angular_velocity", 0.0) or 0.0)
+    defense_kills_trackers = [
+        DefenseKillsTracker(
+            max_turns=reward_cfg.max_turns,
+            angular_velocity=angular_velocity,
         )
         for _ in range(num_agents)
     ]
@@ -849,7 +878,7 @@ def collect_episode(
                     source_mask=obs.source_mask,
                     src=int(act["src"][0]),
                     tgt=int(act["tgt"][0]),
-                    ship_bin=int(act["ship_bin"][0]),
+                    ship_value=float(act["ship_value"][0]),
                     is_noop=bool(act["is_noop"][0]),
                     log_prob=float(act["log_prob"][0].item()),
                     value=float(out.value[0].item()),
@@ -871,6 +900,20 @@ def collect_episode(
                         risk_multiplier=risk_mult,
                     ) * reward_cfg.reward_scale
                     buffer.add_reward(idx, airborne_cost)
+                    # Continuous Beta ship head: penalize over-allocation
+                    # whenever ship_value * SHIP_REQUEST_CAP exceeded the
+                    # source garrison. Always wired (not just for
+                    # production_simple), so the head learns to respect
+                    # the available ship constraint regardless of the
+                    # active reward system.
+                    overflow_ships = float(fleet_meta.get("overflow_ships", 0.0))
+                    if overflow_ships > 0.0:
+                        overflow_penalty = (
+                            -float(reward_cfg.ship_overflow_weight)
+                            * overflow_ships
+                            * reward_cfg.reward_scale
+                        )
+                        buffer.add_reward(idx, overflow_penalty)
                     if reward_cfg.reward_system == "production_simple":
                         # Use the ETA-exact shortfall: penalty reflects the
                         # net ship deficit across all actually-incoming enemy
@@ -917,6 +960,26 @@ def collect_episode(
                             launch_target_ships=fleet_meta["launch_tgt_ships"],
                             my_total_ships_at_launch=fleet_meta["my_total_ships_at_launch"],
                         )
+                        # Defense Kills: if I'm targeting one of my own
+                        # planets that is currently under attack, register
+                        # this launch as a defender. Reward is paid out
+                        # later when the combat resolves.
+                        if (
+                            int(fleet_meta["launch_tgt_owner"]) == int(fleet_meta["player"])
+                            and defense_kills_trackers[p].is_under_attack(
+                                fleet_meta["player"], fleet_meta["tgt_planet_id"]
+                            )
+                        ):
+                            defense_kills_trackers[p].register_defender_launch(
+                                buffer_idx=idx,
+                                player=fleet_meta["player"],
+                                target_planet_id=fleet_meta["tgt_planet_id"],
+                                launch_turn=fleet_meta["launch_turn"],
+                                ships_sent=fleet_meta["ships_sent"],
+                                est_arrival_turn=int(round(
+                                    fleet_meta["launch_turn"] + fleet_meta["eta"]
+                                )),
+                            )
                     else:
                         planet_loss_trackers[p].register_launch(
                             buffer_idx=idx,
@@ -985,6 +1048,24 @@ def collect_episode(
                         event_turn=t,
                         discount=reward_cfg.delayed_reward_discount,
                     )
+                # Defense Kills: tag/untag under-attack episodes, detect
+                # enemy fleet arrivals, and pay out kills credit to
+                # eligible defenders. Must run AFTER register_defender_launch
+                # for this turn (which already happened above) so that
+                # defenders are registered before episode finalization can
+                # complete in the same step (rare same-turn close).
+                defense_kills_trackers[p].observe_turn(
+                    t, env_obs[p], new_obs[p], p,
+                    defense_kills_weight=reward_cfg.defense_kills_weight,
+                    reward_scale=reward_cfg.reward_scale,
+                )
+                for buffer_idx, signed_reward, event_turn in defense_kills_trackers[p].pop_resolved(p):
+                    buffer.add_delayed_reward(
+                        buffer_idx,
+                        signed_reward,
+                        event_turn=event_turn,
+                        discount=reward_cfg.delayed_reward_discount,
+                    )
                 production_trackers[p].observe_turn(t, env_obs[p], new_obs[p], p)
                 for buffer_idx, outcome in production_trackers[p].pop_capture_resolved(p):
                     buffer.add_delayed_reward(
@@ -994,6 +1075,7 @@ def collect_episode(
                             reward_scale=reward_cfg.reward_scale,
                             production_reward_beta=reward_cfg.production_reward_beta,
                             production_reward_reference=reward_cfg.production_reward_reference,
+                            capture_time_curvature=reward_cfg.capture_time_curvature,
                         ),
                         event_turn=t,
                         discount=reward_cfg.delayed_reward_discount,

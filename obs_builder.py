@@ -538,20 +538,48 @@ def build_observation(
 # -----------------------------------------------------------------------------
 # Action decoding
 # -----------------------------------------------------------------------------
+# Discrete bin fractions retained for legacy callers (e.g., scripted strategy
+# search and tooling). The PPO policy now emits a continuous `ship_value` in
+# [0, 1] which is multiplied by SHIP_REQUEST_CAP to obtain an absolute ship
+# request; see decode_action_with_launch for the overflow contract.
 DEFAULT_SHIP_BINS = (0.1, 0.25, 0.5, 0.75, 1.0)
+SHIP_REQUEST_CAP = 200
+"""Maximum ship count the continuous Beta head can request in one launch.
+
+The Beta head produces a value in [0, 1]; we scale to [0, SHIP_REQUEST_CAP]
+to get an absolute ship request. A request larger than the source planet's
+current garrison is clamped to `available` and the difference is exposed as
+`launch_info["overflow_ships"]` so the rollout can attach an overflow
+penalty during reward shaping. The cap (200) is comfortably above typical
+mid-game garrisons and avoids near-boundary saturation in the Beta sample.
+"""
 
 
 def decode_action_with_launch(
     obs: Observation,
     src_slot: int,
     tgt_slot: int,
-    ship_bin: int,
+    ship_value: float,
     *,
-    ship_bins: tuple = DEFAULT_SHIP_BINS,
     planets: Optional[list[Planet]] = None,
     angular_velocity: float = 0.0,
     no_op: bool = False,
+    ship_request_cap: int = SHIP_REQUEST_CAP,
 ) -> Optional[tuple[list, dict]]:
+    """Decode a (src_slot, tgt_slot, ship_value) choice into an env action.
+
+    Args:
+        ship_value: continuous Beta sample in [0, 1]. Scaled by
+            ``ship_request_cap`` to yield the absolute ship request.
+
+    Returns:
+        ``(env_action, launch_info)`` on success, ``None`` on invalid
+        choice. ``launch_info`` includes ``overflow_ships`` (>= 0): if the
+        scaled request exceeded the source's current garrison, the request
+        was clamped to ``available`` and ``overflow_ships`` records the
+        excess so rollout can apply a learning signal that discourages
+        over-allocation.
+    """
     if no_op:
         return None
     src_id = int(obs.planet_ids[src_slot])
@@ -574,13 +602,20 @@ def decode_action_with_launch(
     if src is None or tgt is None:
         return None
 
-    available = src.ships
-    fraction = ship_bins[ship_bin]
-    ships = max(1, int(available * fraction))
+    available = int(src.ships)
+    # Clamp ship_value defensively (Beta sampler returns [0,1] but a noisy
+    # caller could pass something outside that range without us crashing).
+    fraction = max(0.0, min(1.0, float(ship_value)))
+    raw_request = fraction * float(ship_request_cap)
+    overflow_ships = max(0.0, raw_request - float(available))
+    ships = max(1, min(available, int(round(raw_request))))
 
     launch = compute_launch(src, tgt, ships, planets, angular_velocity)
     if launch is None:
         return None
+    launch["raw_request"] = float(raw_request)
+    launch["overflow_ships"] = float(overflow_ships)
+    launch["available_at_launch"] = int(available)
     return [src.id, launch["angle"], launch["ships"]], launch
 
 
@@ -588,14 +623,14 @@ def decode_action(
     obs: Observation,
     src_slot: int,
     tgt_slot: int,
-    ship_bin: int,
+    ship_value: float,
     *,
-    ship_bins: tuple = DEFAULT_SHIP_BINS,
     planets: Optional[list[Planet]] = None,
     angular_velocity: float = 0.0,
     no_op: bool = False,
+    ship_request_cap: int = SHIP_REQUEST_CAP,
 ) -> Optional[list]:
-    """Convert a (src_slot, tgt_slot, ship_bin) policy choice into the
+    """Convert a (src_slot, tgt_slot, ship_value) policy choice into the
     env's action format `[from_id, angle, ships]`.
 
     Returns None if the action is a no-op or invalid (e.g., target == source,
@@ -610,11 +645,11 @@ def decode_action(
         obs,
         src_slot,
         tgt_slot,
-        ship_bin,
-        ship_bins=ship_bins,
+        ship_value,
         planets=planets,
         angular_velocity=angular_velocity,
         no_op=no_op,
+        ship_request_cap=ship_request_cap,
     )
     if decoded is None:
         return None

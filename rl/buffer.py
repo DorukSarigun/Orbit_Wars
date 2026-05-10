@@ -30,10 +30,12 @@ class Transition:
     planet_mask: np.ndarray
     fleet_mask: np.ndarray
     source_mask: np.ndarray
-    # Action triple + flags.
+    # Action triple + flags. ship_value is the continuous Beta sample
+    # in [0, 1]; the absolute ship request is computed downstream as
+    # ship_value * SHIP_REQUEST_CAP (see obs_builder.decode_action_with_launch).
     src: int
     tgt: int
-    ship_bin: int
+    ship_value: float
     is_noop: bool
     # Old-policy log-prob and value estimate (used by PPO).
     log_prob: float
@@ -116,7 +118,7 @@ class RolloutBuffer:
         Each batch is a dict with stacked tensors keyed by:
           planet_feats, fleet_feats, global_feats, edge_bias,
           planet_mask, fleet_mask, source_mask,
-          src, tgt, ship_bin, is_noop,
+          src, tgt, ship_value, is_noop,
           old_log_prob, old_value, returns, advantages
         """
         assert self._advantages is not None, "Call compute_gae() first"
@@ -159,7 +161,7 @@ class RolloutBuffer:
             "source_mask":  torch.from_numpy(np.stack([t.source_mask for t in sub])),
             "src":          torch.tensor([t.src for t in sub], dtype=torch.long),
             "tgt":          torch.tensor([t.tgt for t in sub], dtype=torch.long),
-            "ship_bin":     torch.tensor([t.ship_bin for t in sub], dtype=torch.long),
+            "ship_value":   torch.tensor([t.ship_value for t in sub], dtype=torch.float32),
             "is_noop":      torch.tensor([t.is_noop for t in sub], dtype=torch.bool),
             "player":       torch.tensor([t.player for t in sub], dtype=torch.long),
             "old_log_prob": torch.tensor([t.log_prob for t in sub], dtype=torch.float32),

@@ -92,7 +92,7 @@ class TestEvaluateActions:
             out = net(**batch)
             action = net.act(out, deterministic=False)
 
-        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_bin"])
+        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_value"])
         assert torch.allclose(ev["log_prob"], action["log_prob"], atol=1e-5)
 
     def test_entropy_is_nonnegative(self):
@@ -102,7 +102,7 @@ class TestEvaluateActions:
         batch = pack_observations([obs])
         out = net(**batch)
         action = net.act(out)
-        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_bin"])
+        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_value"])
         assert (ev["entropy"] >= 0).all()
 
     def test_gradient_flows(self):
@@ -113,7 +113,7 @@ class TestEvaluateActions:
         batch = pack_observations([obs])
         out = net(**batch)
         action = net.act(out)
-        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_bin"])
+        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_value"])
         loss = -ev["log_prob"].sum()
         loss.backward()
         any_grad = any(p.grad is not None and p.grad.abs().sum() > 0
@@ -130,8 +130,8 @@ class TestEvaluateActions:
         # Force a NO-OP action.
         src = torch.tensor([net.p_max], dtype=torch.long)
         tgt = torch.tensor([0], dtype=torch.long)
-        ship = torch.tensor([0], dtype=torch.long)
-        ev = net.evaluate_actions(out, src, tgt, ship)
+        ship_value = torch.tensor([0.5], dtype=torch.float32)
+        ev = net.evaluate_actions(out, src, tgt, ship_value)
         # log_prob should equal log_softmax(src_logits)[NOOP].
         from torch.distributions import Categorical
         expected = Categorical(logits=out.src_logits).log_prob(src)
@@ -149,7 +149,7 @@ def _dummy_transition(reward: float = 0.0, done: bool = False, p_max: int = 4,
         global_feats=obs.global_feats, edge_bias=obs.edge_bias,
         planet_mask=obs.planet_mask, fleet_mask=obs.fleet_mask,
         source_mask=obs.source_mask,
-        src=0, tgt=1, ship_bin=2, is_noop=False,
+        src=0, tgt=1, ship_value=0.5, is_noop=False,
         log_prob=-1.5, value=0.1,
         reward=reward, done=done,
     )
@@ -2224,7 +2224,7 @@ class TestMetrics:
         # Pull every head into the loss directly by summing all logits + value.
         loss = (out.src_logits.sum()
                 + out.tgt_logits.sum()
-                + out.ship_logits.sum()
+                + out.ship_params.sum()
                 + out.value.pow(2).sum())
         return net, loss
 

@@ -124,11 +124,58 @@ class TransformerBlock(nn.Module):
 # =============================================================================
 # Full policy / value network
 # =============================================================================
+_BETA_MIN_CONCENTRATION = 1.0
+_BETA_MAX_CONCENTRATION = 30.0
+_BETA_SAMPLE_EPS = 1e-6
+
+
+def _beta_concentrations(ship_params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map raw (alpha, beta) logits to Beta concentrations in [1, MAX].
+
+    Adding _BETA_MIN_CONCENTRATION after softplus guarantees both
+    concentration parameters are >= 1, which keeps the Beta unimodal
+    (avoids the bimodal U-shape that arises when alpha,beta < 1 and
+    encourages either-extreme launches).
+
+    The soft cap at _BETA_MAX_CONCENTRATION (via tanh) prevents the
+    distribution from collapsing into a delta function during PPO
+    updates: unbounded concentrations lead to log-prob ratios that
+    explode beyond the clip range and effectively destroy the trust
+    region (observed: KL > 100, clip_fraction > 0.9, polL spikes >>
+    1e3).  With the cap, log p_Beta(sigma) is bounded across the
+    [1, MAX] x [1, MAX] grid, so importance ratios stay well-behaved.
+    """
+    raw_alpha = ship_params[..., 0]
+    raw_beta = ship_params[..., 1]
+    alpha_unbounded = F.softplus(raw_alpha)
+    beta_unbounded = F.softplus(raw_beta)
+    span = _BETA_MAX_CONCENTRATION - _BETA_MIN_CONCENTRATION
+    alpha = _BETA_MIN_CONCENTRATION + span * torch.tanh(alpha_unbounded / span)
+    beta = _BETA_MIN_CONCENTRATION + span * torch.tanh(beta_unbounded / span)
+    return alpha, beta
+
+
+def _make_ship_dist(ship_params: torch.Tensor) -> torch.distributions.Beta:
+    alpha, beta = _beta_concentrations(ship_params)
+    return torch.distributions.Beta(alpha, beta)
+
+
+def _clamp_for_log_prob(value: torch.Tensor) -> torch.Tensor:
+    """Clamp Beta samples away from {0, 1} before computing log_prob.
+
+    Beta is defined on the open interval (0, 1); values exactly at the
+    boundary produce -inf log_prob. We clamp by EPS to keep gradients
+    well-defined while preserving the action's float identity for
+    downstream decoding.
+    """
+    return value.clamp(min=_BETA_SAMPLE_EPS, max=1.0 - _BETA_SAMPLE_EPS)
+
+
 @dataclass
 class PolicyOutput:
     src_logits: torch.Tensor       # (B, P_max + 1)  last slot = NO-OP
     tgt_logits: torch.Tensor       # (B, P_max, P_max)  per-source target logits
-    ship_logits: torch.Tensor      # (B, P_max, n_ship_bins)  per-source ship choice
+    ship_params: torch.Tensor      # (B, P_max, 2)  per-source Beta(alpha, beta) raw logits
     value: torch.Tensor            # (B,)
     tokens: torch.Tensor           # (B, T, d_model) for debugging/inspection
     aux_owner_logits: Optional[torch.Tensor] = None  # (B, P_max, 3) optional auxiliary head
@@ -138,9 +185,14 @@ class OrbitWarsPolicy(nn.Module):
     """Set Transformer with masked pointer policy and value head.
 
     Action factorization:
-        src_slot ~ Categorical(src_logits)         # P_max + 1 (incl. NO-OP)
-        tgt_slot ~ Categorical(tgt_logits[src])    # P_max
-        ship_bin ~ Categorical(ship_logits[src])   # n_ship_bins
+        src_slot   ~ Categorical(src_logits)        # P_max + 1 (incl. NO-OP)
+        tgt_slot   ~ Categorical(tgt_logits[src])   # P_max
+        ship_value ~ Beta(alpha, beta)              # continuous in (0, 1)
+
+    The Beta sample is decoded by ``obs_builder.decode_action_with_launch``
+    into an absolute ship request via ``ship_value * SHIP_REQUEST_CAP``;
+    overflow above the source garrison is reported back so the rollout
+    can apply a learning signal that discourages over-allocation.
     """
 
     def __init__(
@@ -155,14 +207,12 @@ class OrbitWarsPolicy(nn.Module):
         d_model: int = 128,
         n_heads: int = 4,
         n_layers: int = 4,
-        n_ship_bins: int = 5,
         dropout: float = 0.0,
     ):
         super().__init__()
         self.p_max = p_max
         self.f_max = f_max
         self.planet_dim = planet_dim
-        self.n_ship_bins = n_ship_bins
         self.d_model = d_model
         self.n_heads = n_heads
 
@@ -195,8 +245,11 @@ class OrbitWarsPolicy(nn.Module):
         self.tgt_query = nn.Linear(d_model, d_model)
         self.tgt_key = nn.Linear(d_model, d_model)
 
-        # Ship-bin head: per planet slot.
-        self.ship_head = nn.Linear(d_model, n_ship_bins)
+        # Ship Beta head: per planet slot, outputs raw (alpha, beta)
+        # logits which are mapped through softplus + 1.0 in
+        # _beta_concentrations to produce a unimodal Beta distribution
+        # on (0, 1) per source planet.
+        self.ship_head = nn.Linear(d_model, 2)
 
         # Value head: pooled global token through MLP.
         self.value_head = nn.Sequential(
@@ -282,8 +335,8 @@ class OrbitWarsPolicy(nn.Module):
         tgt_pad = ~planet_mask                          # (B, P) True=pad
         tgt_logits = tgt_logits.masked_fill(tgt_pad[:, None, :], very_neg)
 
-        # ---- Ship bins (per source) ----
-        ship_logits = self.ship_head(planet_tok)        # (B, P, n_ship_bins)
+        # ---- Ship Beta params (per source) ----
+        ship_params = self.ship_head(planet_tok)        # (B, P, 2)
 
         # ---- Value ----
         value = self.value_head(global_tok).squeeze(-1) # (B,)
@@ -291,7 +344,7 @@ class OrbitWarsPolicy(nn.Module):
         return PolicyOutput(
             src_logits=src_logits,
             tgt_logits=tgt_logits,
-            ship_logits=ship_logits,
+            ship_params=ship_params,
             value=value,
             tokens=x,
         )
@@ -304,9 +357,12 @@ class OrbitWarsPolicy(nn.Module):
         deterministic: bool = False,
     ) -> dict:
         """Sample (or argmax) one action per batch element from a policy
-        output. Returns dict with src, tgt, ship_bin, is_noop, log_prob.
+        output. Returns dict with src, tgt, ship_value (float in [0,1]),
+        is_noop, log_prob.
 
-        The factorization conditions tgt and ship on the chosen src.
+        The factorization conditions tgt and ship_value on the chosen src.
+        For deterministic mode the Beta head returns its mean
+        ``alpha / (alpha + beta)``.
         """
         src_dist = torch.distributions.Categorical(logits=out.src_logits)
         if deterministic:
@@ -328,23 +384,26 @@ class OrbitWarsPolicy(nn.Module):
         else:
             tgt = tgt_dist.sample()
 
-        ship_idx = src_idx[:, None, None].expand(-1, 1, self.n_ship_bins)
-        ship_logits_sel = out.ship_logits.gather(1, ship_idx).squeeze(1)  # (B, n)
-        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+        ship_params_sel = out.ship_params.gather(
+            1, src_idx[:, None, None].expand(-1, 1, 2)
+        ).squeeze(1)  # (B, 2)
+        ship_dist = _make_ship_dist(ship_params_sel)
         if deterministic:
-            ship = ship_logits_sel.argmax(dim=-1)
+            alpha, beta = _beta_concentrations(ship_params_sel)
+            ship_value = alpha / (alpha + beta)
         else:
-            ship = ship_dist.sample()
+            ship_value = ship_dist.sample()
 
         log_prob = src_dist.log_prob(src)
         # Don't credit tgt/ship for NO-OP rows (they're degenerate).
         valid = (~is_noop).float()
-        log_prob = log_prob + valid * (tgt_dist.log_prob(tgt) + ship_dist.log_prob(ship))
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value))
+        log_prob = log_prob + valid * (tgt_dist.log_prob(tgt) + ship_logp)
 
         return {
             "src": src,
             "tgt": tgt,
-            "ship_bin": ship,
+            "ship_value": ship_value,
             "is_noop": is_noop,
             "log_prob": log_prob,
         }
@@ -386,25 +445,25 @@ class OrbitWarsPolicy(nn.Module):
             masked_logits[is_noop, 0] = 0.0  # Ensure valid distribution for NO-OP rows
             tgt = torch.distributions.Categorical(logits=masked_logits).sample()
 
-        ship_idx = source_slot[:, None, None].expand(-1, 1, self.n_ship_bins)
-        ship_logits_sel = out.ship_logits.gather(1, ship_idx).squeeze(1)
+        ship_params_sel = out.ship_params.gather(
+            1, source_slot[:, None, None].expand(-1, 1, 2)
+        ).squeeze(1)  # (B, 2)
+        ship_dist = _make_ship_dist(ship_params_sel)
         if deterministic:
-            ship = ship_logits_sel.argmax(dim=-1)
+            alpha, beta = _beta_concentrations(ship_params_sel)
+            ship_value = alpha / (alpha + beta)
         else:
-            masked_ship = ship_logits_sel.clone()
-            masked_ship[is_noop] = float("-inf")
-            masked_ship[is_noop, 0] = 0.0
-            ship = torch.distributions.Categorical(logits=masked_ship).sample()
+            ship_value = ship_dist.sample()
 
         # Conditional log_prob: only add tgt/ship terms when not NO-OP.
         tgt_logp = torch.distributions.Categorical(logits=tgt_logits_sel).log_prob(tgt)
-        ship_logp = torch.distributions.Categorical(logits=ship_logits_sel).log_prob(ship)
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value))
         log_prob = launch_dist.log_prob(launch) + valid * (tgt_logp + ship_logp)
 
         return {
             "src": source_slot,
             "tgt": tgt,
-            "ship_bin": ship,
+            "ship_value": ship_value,
             "is_noop": is_noop,
             "log_prob": log_prob,
         }
@@ -415,7 +474,7 @@ class OrbitWarsPolicy(nn.Module):
         out: "PolicyOutput",
         src: torch.Tensor,         # (B,) long
         tgt: torch.Tensor,         # (B,) long
-        ship_bin: torch.Tensor,    # (B,) long
+        ship_value: torch.Tensor,  # (B,) float in [0, 1]
     ) -> dict:
         """Re-evaluate stored actions under the current policy distribution.
 
@@ -435,17 +494,26 @@ class OrbitWarsPolicy(nn.Module):
         tgt_logits_sel = out.tgt_logits.gather(1, gather_idx).squeeze(1)
         tgt_dist = torch.distributions.Categorical(logits=tgt_logits_sel)
 
-        ship_idx = src_idx[:, None, None].expand(-1, 1, self.n_ship_bins)
-        ship_logits_sel = out.ship_logits.gather(1, ship_idx).squeeze(1)
-        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+        ship_params_sel = out.ship_params.gather(
+            1, src_idx[:, None, None].expand(-1, 1, 2)
+        ).squeeze(1)
+        ship_dist = _make_ship_dist(ship_params_sel)
 
         valid = (~is_noop).float()
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value.float()))
         log_prob = src_dist.log_prob(src) + valid * (
-            tgt_dist.log_prob(tgt) + ship_dist.log_prob(ship_bin)
+            tgt_dist.log_prob(tgt) + ship_logp
         )
-        # Entropy: sum src + (only if not noop) tgt + ship; matches the
-        # log-prob factorization so it's mathematically consistent.
-        entropy = src_dist.entropy() + valid * (tgt_dist.entropy() + ship_dist.entropy())
+        # Entropy: H_src + Pr(not NOOP) * (H_tgt + H_ship). The conditional
+        # weight is the *current policy's* probability of choosing a launch
+        # action (last src slot is NO-OP), not the realized 0/1 flag from
+        # the buffer. This is the population-level entropy of the joint
+        # discrete-continuous policy and gives a stable entropy bonus.
+        src_probs = torch.softmax(out.src_logits, dim=-1)
+        p_nonnoop = 1.0 - src_probs[..., self.p_max]
+        entropy = src_dist.entropy() + p_nonnoop * (
+            tgt_dist.entropy() + ship_dist.entropy()
+        )
 
         return {"log_prob": log_prob, "entropy": entropy, "value": out.value}
 
@@ -454,12 +522,12 @@ class OrbitWarsPolicy(nn.Module):
         out: "PolicyOutput",
         src: torch.Tensor,
         tgt: torch.Tensor,
-        ship_bin: torch.Tensor,
+        ship_value: torch.Tensor,
         is_noop: torch.Tensor,
     ) -> dict:
         src = src.long()
         tgt = tgt.long()
-        ship_bin = ship_bin.long()
+        ship_value = ship_value.float()
         is_noop = is_noop.bool()
 
         B = out.src_logits.shape[0]
@@ -477,15 +545,26 @@ class OrbitWarsPolicy(nn.Module):
         tgt_logits_sel = out.tgt_logits.gather(1, gather_idx).squeeze(1)
         tgt_dist = torch.distributions.Categorical(logits=tgt_logits_sel)
 
-        ship_idx = src[:, None, None].expand(-1, 1, self.n_ship_bins)
-        ship_logits_sel = out.ship_logits.gather(1, ship_idx).squeeze(1)
-        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+        ship_params_sel = out.ship_params.gather(
+            1, src[:, None, None].expand(-1, 1, 2)
+        ).squeeze(1)
+        ship_dist = _make_ship_dist(ship_params_sel)
 
         valid = (~is_noop).float()
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value))
         log_prob = launch_dist.log_prob(launch) + valid * (
-            tgt_dist.log_prob(tgt) + ship_dist.log_prob(ship_bin)
+            tgt_dist.log_prob(tgt) + ship_logp
         )
-        entropy = launch_dist.entropy() + valid * (
+        # Per-source entropy: H(launch) + Pr(launch) * (H_tgt + H_ship).
+        # `launch_sel` columns are [noop_logit, src_logit] for this row;
+        # softmax index 1 is the launch probability under the current
+        # policy. Using this marginal (instead of the realized launch
+        # flag from the buffer) keeps the entropy bonus a population
+        # average and prevents the realized-flag bias from skewing the
+        # gradient when the policy's noop rate shifts during PPO epochs.
+        launch_probs = torch.softmax(launch_sel, dim=-1)
+        p_launch = launch_probs[..., 1]
+        entropy = launch_dist.entropy() + p_launch * (
             tgt_dist.entropy() + ship_dist.entropy()
         )
 

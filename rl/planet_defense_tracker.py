@@ -29,6 +29,8 @@ from typing import Iterator
 
 from feature_extraction import parse_planets
 
+from .rewards import curved_time_factor
+
 
 @dataclass
 class _PendingAction:
@@ -52,12 +54,16 @@ class PlanetDefenseTracker:
                  depart_share: float = 0.7,
                  hold_share: float = 0.3,
                  max_turns: int = 500,
-                 num_opponents: int = 1) -> None:
+                 num_opponents: int = 1,
+                 capture_time_curvature: float = 1.0) -> None:
         self.horizon = int(horizon)
         self.depart_share = float(depart_share)
         self.hold_share = float(hold_share)
         self.max_turns = int(max_turns)
         self.num_opponents = max(1, int(num_opponents))
+        # Symmetric with capture_reward: power-curved remaining-time
+        # factor (curvature=1.0 reproduces the legacy linear (T-t)).
+        self.capture_time_curvature = float(capture_time_curvature)
         # (player, planet_id) -> list of _PendingAction (chronological)
         self._actions: dict[tuple[int, int], list[_PendingAction]] = {}
         # player -> deque of (buffer_idx, signed_reward)
@@ -115,7 +121,10 @@ class PlanetDefenseTracker:
             ]
             if not actions:
                 continue
-            remaining = max(0, self.max_turns - int(turn))
+            remaining = curved_time_factor(
+                self.max_turns, int(turn),
+                curvature=self.capture_time_curvature,
+            )
             opp_mult = _opponent_count_multiplier(self.num_opponents)
             loss_value = (float(prev.production) * float(remaining)
                           * opp_mult * float(reward_scale)

@@ -26,14 +26,12 @@ class PlanetOnlyOrbitWarsPolicy(OrbitWarsPolicy):
         d_model: int = 256,
         n_heads: int = 4,
         n_layers: int = 6,
-        n_ship_bins: int = 5,
         dropout: float = 0.0,
     ):
         nn.Module.__init__(self)
         self.p_max = p_max
         self.f_max = f_max
         self.planet_dim = planet_dim
-        self.n_ship_bins = n_ship_bins
         self.d_model = d_model
         self.n_heads = n_heads
         self.model_variant = "planet_only"
@@ -53,7 +51,8 @@ class PlanetOnlyOrbitWarsPolicy(OrbitWarsPolicy):
         self.noop_logit = nn.Parameter(torch.zeros(1))
         self.tgt_query = nn.Linear(d_model, d_model)
         self.tgt_key = nn.Linear(d_model, d_model)
-        self.ship_head = nn.Linear(d_model, n_ship_bins)
+        # Ship Beta head: outputs raw (alpha, beta) logits.
+        self.ship_head = nn.Linear(d_model, 2)
         self.value_head = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.GELU(),
@@ -133,12 +132,12 @@ class PlanetOnlyOrbitWarsPolicy(OrbitWarsPolicy):
         tgt_logits = tgt_logits.masked_fill(eye[None], very_neg)
         tgt_logits = tgt_logits.masked_fill((~planet_mask)[:, None, :], very_neg)
 
-        ship_logits = self.ship_head(planet_tok)
+        ship_params = self.ship_head(planet_tok)        # (B, P, 2)
 
         return PolicyOutput(
             src_logits=src_logits,
             tgt_logits=tgt_logits,
-            ship_logits=ship_logits,
+            ship_params=ship_params,
             value=value,
             tokens=x,
             aux_owner_logits=aux_owner_logits,

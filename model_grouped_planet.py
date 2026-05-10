@@ -11,7 +11,13 @@ from obs_builder import (
     P_MAX_DEFAULT,
     PLANET_FEATURE_DIM,
 )
-from model import PolicyOutput, TransformerBlock
+from model import (
+    PolicyOutput,
+    TransformerBlock,
+    _beta_concentrations,
+    _clamp_for_log_prob,
+    _make_ship_dist,
+)
 
 
 class CrossMultiHeadAttention(nn.Module):
@@ -292,7 +298,6 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         d_model: int = 256,
         n_heads: int = 4,
         n_layers: int = 6,
-        n_ship_bins: int = 5,
         attention_type: str = "full",
         n_inducing_points: int = 32,
         dropout: float = 0.0,
@@ -305,7 +310,6 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         self.edge_dim = edge_dim
         self.d_model = d_model
         self.n_heads = n_heads
-        self.n_ship_bins = n_ship_bins
         self.model_variant = "grouped_planet"
         self.attention_type = attention_type
         self.n_inducing_points = n_inducing_points
@@ -344,10 +348,15 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         )
         self.tgt_query = nn.Linear(d_model, d_model)
         self.tgt_key = nn.Linear(d_model, d_model)
+        # Ship Beta head: per (src, tgt) pair, outputs raw (alpha, beta)
+        # logits which are mapped through softplus + 1.0 in
+        # _beta_concentrations to produce a unimodal Beta distribution
+        # on (0, 1). The decoded ship request is `ship_value *
+        # SHIP_REQUEST_CAP` (see obs_builder.decode_action_with_launch).
         self.ship_head = nn.Sequential(
             nn.Linear(3 * d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_model, n_ship_bins),
+            nn.Linear(d_model, 2),
         )
         self.value_head = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -403,7 +412,7 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         tgt_pair = planet_tok[:, None, :, :].expand(-1, self.p_max, -1, -1)
         global_pair = global_summary[:, None, None, :].expand(-1, self.p_max, self.p_max, -1)
         ship_input = torch.cat([src_pair, tgt_pair, global_pair], dim=-1)
-        ship_logits = self.ship_head(ship_input)
+        ship_params = self.ship_head(ship_input)         # (B, P, P, 2)
         value = self.value_head(global_summary).squeeze(-1)
         aux_owner_logits = self.aux_owner_head(planet_tok)
         tokens = planet_tok
@@ -411,7 +420,7 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         return PolicyOutput(
             src_logits=src_logits,
             tgt_logits=tgt_logits,
-            ship_logits=ship_logits,
+            ship_params=ship_params,
             value=value,
             tokens=tokens,
             aux_owner_logits=aux_owner_logits,
@@ -437,22 +446,25 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         src = pair_idx // self.p_max
         tgt = pair_idx % self.p_max
 
-        ship_logits_sel = out.ship_logits[torch.arange(B, device=out.tgt_logits.device), src, tgt]
-        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+        ship_params_sel = out.ship_params[torch.arange(B, device=out.tgt_logits.device), src, tgt]
+        ship_dist = _make_ship_dist(ship_params_sel)
         if deterministic:
-            ship = ship_logits_sel.argmax(dim=-1)
+            alpha, beta = _beta_concentrations(ship_params_sel)
+            ship_value = alpha / (alpha + beta)
         else:
-            ship = ship_dist.sample()
+            ship_value = ship_dist.sample()
 
         src = torch.where(is_noop, torch.full_like(src, self.p_max), src)
         tgt = torch.where(is_noop, torch.zeros_like(tgt), tgt)
-        ship = torch.where(is_noop, torch.zeros_like(ship), ship)
+        # NO-OP rows: clamp ship_value to 0.5 (degenerate, log_prob masked).
+        ship_value = torch.where(is_noop, torch.full_like(ship_value, 0.5), ship_value)
         valid = (~is_noop).float()
-        log_prob = action_dist.log_prob(action_idx) + valid * ship_dist.log_prob(ship)
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value))
+        log_prob = action_dist.log_prob(action_idx) + valid * ship_logp
         return {
             "src": src,
             "tgt": tgt,
-            "ship_bin": ship,
+            "ship_value": ship_value,
             "is_noop": is_noop,
             "log_prob": log_prob,
         }
@@ -478,21 +490,20 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         valid = (~is_noop).float()
         tgt = torch.clamp(action_idx - 1, min=0)
 
-        ship_logits_sel = out.ship_logits[torch.arange(B, device=source_slot.device), source_slot, tgt]
+        ship_params_sel = out.ship_params[torch.arange(B, device=source_slot.device), source_slot, tgt]
+        ship_dist = _make_ship_dist(ship_params_sel)
         if deterministic:
-            ship = ship_logits_sel.argmax(dim=-1)
+            alpha, beta = _beta_concentrations(ship_params_sel)
+            ship_value = alpha / (alpha + beta)
         else:
-            masked_ship = ship_logits_sel.clone()
-            masked_ship[is_noop] = float("-inf")
-            masked_ship[is_noop, 0] = 0.0
-            ship = torch.distributions.Categorical(logits=masked_ship).sample()
+            ship_value = ship_dist.sample()
 
-        ship_logp = torch.distributions.Categorical(logits=ship_logits_sel).log_prob(ship)
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value))
         log_prob = action_dist.log_prob(action_idx) + valid * ship_logp
         return {
             "src": source_slot,
             "tgt": tgt,
-            "ship_bin": ship,
+            "ship_value": ship_value,
             "is_noop": is_noop,
             "log_prob": log_prob,
         }
@@ -502,11 +513,11 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         out: PolicyOutput,
         src: torch.Tensor,
         tgt: torch.Tensor,
-        ship_bin: torch.Tensor,
+        ship_value: torch.Tensor,
     ) -> dict:
         src = src.long()
         tgt = tgt.long()
-        ship_bin = ship_bin.long()
+        ship_value = ship_value.float()
         is_noop = src == self.p_max
         B = out.tgt_logits.shape[0]
         flat_pair = out.tgt_logits.reshape(B, self.p_max * self.p_max)
@@ -517,12 +528,20 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         tgt_idx = torch.where(is_noop, torch.zeros_like(tgt), tgt)
         action_idx = torch.where(is_noop, torch.zeros_like(src), src_idx * self.p_max + tgt_idx + 1)
 
-        ship_logits_sel = out.ship_logits[torch.arange(B, device=src.device), src_idx, tgt_idx]
-        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+        ship_params_sel = out.ship_params[torch.arange(B, device=src.device), src_idx, tgt_idx]
+        ship_dist = _make_ship_dist(ship_params_sel)
 
         valid = (~is_noop).float()
-        log_prob = action_dist.log_prob(action_idx) + valid * ship_dist.log_prob(ship_bin)
-        entropy = action_dist.entropy() + valid * ship_dist.entropy()
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value))
+        log_prob = action_dist.log_prob(action_idx) + valid * ship_logp
+        # Entropy: H(action) + Pr(not NOOP) * H(ship | action). Action 0 is
+        # NOOP, so 1 - softmax[..., 0] is the marginal launch probability
+        # under the current policy. Using this marginal (instead of the
+        # realized {0,1} flag from the buffer) keeps the entropy bonus
+        # population-correct and stable across PPO epochs.
+        action_probs = torch.softmax(action_logits, dim=-1)
+        p_nonnoop = 1.0 - action_probs[..., 0]
+        entropy = action_dist.entropy() + p_nonnoop * ship_dist.entropy()
         return {"log_prob": log_prob, "entropy": entropy, "value": out.value}
 
     def evaluate_source_actions(
@@ -530,12 +549,12 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         out: PolicyOutput,
         src: torch.Tensor,
         tgt: torch.Tensor,
-        ship_bin: torch.Tensor,
+        ship_value: torch.Tensor,
         is_noop: torch.Tensor,
     ) -> dict:
         src = src.long()
         tgt = tgt.long()
-        ship_bin = ship_bin.long()
+        ship_value = ship_value.float()
         is_noop = is_noop.bool()
         B = out.src_logits.shape[0]
         noop_sel = out.src_logits[torch.arange(B, device=src.device), src].unsqueeze(-1)
@@ -545,10 +564,19 @@ class GroupedPlanetOrbitWarsPolicy(nn.Module):
         action_idx = torch.where(is_noop, torch.zeros_like(tgt), tgt + 1)
 
         tgt_idx = torch.where(is_noop, torch.zeros_like(tgt), tgt)
-        ship_logits_sel = out.ship_logits[torch.arange(B, device=src.device), src, tgt_idx]
-        ship_dist = torch.distributions.Categorical(logits=ship_logits_sel)
+        ship_params_sel = out.ship_params[torch.arange(B, device=src.device), src, tgt_idx]
+        ship_dist = _make_ship_dist(ship_params_sel)
 
         valid = (~is_noop).float()
-        log_prob = action_dist.log_prob(action_idx) + valid * ship_dist.log_prob(ship_bin)
-        entropy = action_dist.entropy() + valid * ship_dist.entropy()
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value))
+        log_prob = action_dist.log_prob(action_idx) + valid * ship_logp
+        # Entropy: H(action | src) + Pr(launch | src) * H(ship | src, tgt).
+        # Action 0 is NOOP, so 1 - softmax[..., 0] is the conditional
+        # launch probability under the current policy. Population-level
+        # entropy is the right bonus signal; the realized {0,1} flag from
+        # the buffer would bias the gradient toward whichever decision
+        # the *old* policy happened to sample.
+        action_probs = torch.softmax(action_logits, dim=-1)
+        p_nonnoop = 1.0 - action_probs[..., 0]
+        entropy = action_dist.entropy() + p_nonnoop * ship_dist.entropy()
         return {"log_prob": log_prob, "entropy": entropy, "value": out.value}

@@ -69,7 +69,8 @@ def test_forward_pass_shapes(batch):
     B = len(obs_list)
     assert out.src_logits.shape == (B, 8 + 1)        # +1 NO-OP
     assert out.tgt_logits.shape == (B, 8, 8)
-    assert out.ship_logits.shape == (B, 8, 5)
+    # Continuous Beta head: (alpha, beta) per source.
+    assert out.ship_params.shape == (B, 8, 2)
     assert out.value.shape == (B,)
 
 
@@ -80,7 +81,7 @@ def test_planet_only_forward_pass_shapes(batch):
     B = len(obs_list)
     assert out.src_logits.shape == (B, 8 + 1)
     assert out.tgt_logits.shape == (B, 8, 8)
-    assert out.ship_logits.shape == (B, 8, 5)
+    assert out.ship_params.shape == (B, 8, 2)
     assert out.value.shape == (B,)
     assert out.tokens.shape == (B, 8 + 1, 32)
 
@@ -103,7 +104,8 @@ def test_grouped_planet_policy_forward_pass_shapes(batch):
     B = len(obs_list)
     assert out.src_logits.shape == (B, 8 + 1)
     assert out.tgt_logits.shape == (B, 8, 8)
-    assert out.ship_logits.shape == (B, 8, 8, 5)
+    # Grouped variant: (alpha, beta) per (src, tgt) pair.
+    assert out.ship_params.shape == (B, 8, 8, 2)
     assert out.value.shape == (B,)
     assert out.tokens.shape == (B, 8, 32)
     assert out.aux_owner_logits.shape == (B, 8, 5)
@@ -124,7 +126,7 @@ def test_grouped_planet_policy_induced_forward_pass_shapes(batch):
     B = len(obs_list)
     assert out.src_logits.shape == (B, 8 + 1)
     assert out.tgt_logits.shape == (B, 8, 8)
-    assert out.ship_logits.shape == (B, 8, 8, 5)
+    assert out.ship_params.shape == (B, 8, 8, 2)
     assert out.value.shape == (B,)
     assert out.tokens.shape == (B, 8, 32)
 
@@ -141,7 +143,7 @@ def test_grouped_planet_policy_act_source_matches_eval(batch):
         out,
         action["src"],
         action["tgt"],
-        action["ship_bin"],
+        action["ship_value"],
         action["is_noop"],
     )
     assert torch.allclose(ev["log_prob"], action["log_prob"], atol=1e-5)
@@ -158,7 +160,7 @@ def test_no_nan_in_logits(batch):
     _, b = batch
     net = _net()
     out = net(**b)
-    for name in ("src_logits", "tgt_logits", "ship_logits", "value"):
+    for name in ("src_logits", "tgt_logits", "ship_params", "value"):
         t = getattr(out, name)
         # We mask invalid slots to a very-negative finite value, so finite
         # check should pass everywhere.
@@ -210,13 +212,14 @@ def test_act_returns_correct_shapes(batch):
     B = b["planet_feats"].shape[0]
     assert action["src"].shape == (B,)
     assert action["tgt"].shape == (B,)
-    assert action["ship_bin"].shape == (B,)
+    # Continuous Beta head: ship_value is a float in [0, 1].
+    assert action["ship_value"].shape == (B,)
+    assert action["ship_value"].dtype == torch.float32
     assert action["is_noop"].shape == (B,) and action["is_noop"].dtype == torch.bool
     assert action["log_prob"].shape == (B,)
-    # Sampled bins are in valid ranges.
     assert action["src"].min() >= 0 and action["src"].max() <= net.p_max
     assert action["tgt"].max() < net.p_max
-    assert action["ship_bin"].max() < net.n_ship_bins
+    assert (action["ship_value"] >= 0).all() and (action["ship_value"] <= 1).all()
 
 
 def test_act_deterministic_is_argmax(batch):
@@ -227,7 +230,7 @@ def test_act_deterministic_is_argmax(batch):
     a2 = net.act(out, deterministic=True)
     assert torch.equal(a1["src"], a2["src"])
     assert torch.equal(a1["tgt"], a2["tgt"])
-    assert torch.equal(a1["ship_bin"], a2["ship_bin"])
+    assert torch.allclose(a1["ship_value"], a2["ship_value"])
 
 
 def test_act_source_returns_fixed_source_and_matches_eval(batch):
@@ -239,13 +242,13 @@ def test_act_source_returns_fixed_source_and_matches_eval(batch):
     action = net.act_source(out, src, deterministic=False)
     assert torch.equal(action["src"], src)
     assert action["tgt"].shape == src.shape
-    assert action["ship_bin"].shape == src.shape
+    assert action["ship_value"].shape == src.shape
     assert action["is_noop"].shape == src.shape
     ev = net.evaluate_source_actions(
         out,
         action["src"],
         action["tgt"],
-        action["ship_bin"],
+        action["ship_value"],
         action["is_noop"],
     )
     assert torch.allclose(ev["log_prob"], action["log_prob"], atol=1e-5)

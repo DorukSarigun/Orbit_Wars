@@ -35,7 +35,7 @@ from obs_builder import (
     PF_IDX_SHIPS,
     PF_IDX_INCOMING_SELF_B0,
 )
-from model import OrbitWarsPolicy, pack_observations
+from model import OrbitWarsPolicy, pack_observations, _beta_concentrations
 
 from .train import load_checkpoint as load_ppo_checkpoint
 from .dqn_train import load_dqn_checkpoint
@@ -86,23 +86,28 @@ def _act(net, env_obs, player: int, *,
         info_extra["v_state"] = (
             float(out.v_state[0].item()) if out.v_state is not None else None
         )
+        # DQN keeps a discrete ship_bin head; map bin -> ship_value [0,1]
+        # so it can call the (now continuous) decode_action.
+        n_bins = max(1, int(net.n_ship_bins))
+        ship_bin = int(action["ship_bin"][0])
+        ship_value = float(min(n_bins, ship_bin + 1)) / float(n_bins)
     else:
         with torch.no_grad():
             out = net(**batch)
             action = net.act(out, deterministic=deterministic)
         info_extra["value"] = float(out.value[0].item())
+        ship_value = float(action["ship_value"][0])
 
     src_slot = int(action["src"][0])
     tgt_slot = int(action["tgt"][0])
-    ship_bin = int(action["ship_bin"][0])
     is_noop = bool(action["is_noop"][0])
 
     parsed = parse_planets(env_obs)
-    move = decode_action(obs, src_slot, tgt_slot, ship_bin,
+    move = decode_action(obs, src_slot, tgt_slot, ship_value,
                          planets=parsed, angular_velocity=omega, no_op=is_noop)
     return [move] if move is not None else [], {
         "src_slot": src_slot, "tgt_slot": tgt_slot,
-        "ship_bin": ship_bin, "is_noop": is_noop,
+        "ship_value": ship_value, "is_noop": is_noop,
         **info_extra,
     }
 
@@ -156,20 +161,27 @@ def _act_all_sources(net, env_obs, player: int, *,
                     continue
                 if not bool(available_pairs[src_slot, tgt_slot]):
                     continue
-                ship_order = torch.argsort(out.ship_logits[0, src_slot, tgt_slot], descending=True).tolist()
-                for ship_bin in ship_order:
-                    decoded = decode_action_with_launch(
-                        obs_decision, src_slot, tgt_slot, int(ship_bin),
-                        planets=parsed, angular_velocity=omega, no_op=False,
-                    )
-                    if decoded is not None:
-                        selected = (src_slot, tgt_slot, int(ship_bin), decoded)
-                        break
-                if selected is not None:
+                # Continuous Beta head: sample ship_value once per pair.
+                # Use the deterministic mean alpha/(alpha+beta) for replay
+                # so episodes are reproducible. ship_params is either
+                # (B, p_max, p_max, 2) for grouped variants or (B, p_max, 2)
+                # for the source-only full variant.
+                if out.ship_params.dim() == 4:
+                    ship_params_sel = out.ship_params[0, src_slot, tgt_slot]
+                else:
+                    ship_params_sel = out.ship_params[0, src_slot]
+                alpha, beta = _beta_concentrations(ship_params_sel)
+                ship_value_sample = float((alpha / (alpha + beta)).item())
+                decoded = decode_action_with_launch(
+                    obs_decision, src_slot, tgt_slot, ship_value_sample,
+                    planets=parsed, angular_velocity=omega, no_op=False,
+                )
+                if decoded is not None:
+                    selected = (src_slot, tgt_slot, ship_value_sample, decoded)
                     break
             if selected is None:
                 break
-            src_slot, tgt_slot, ship_bin, decoded = selected
+            src_slot, tgt_slot, ship_value, decoded = selected
             move, launch_info = decoded
             env_actions.append(move)
             sent_ships = float(move[2])
@@ -196,7 +208,7 @@ def _act_all_sources(net, env_obs, player: int, *,
             infos.append({
                 "src_slot": src_slot,
                 "tgt_slot": tgt_slot,
-                "ship_bin": ship_bin,
+                "ship_value": ship_value,
                 "is_noop": False,
                 "value": float(out.value[0].item()),
             })
@@ -218,10 +230,10 @@ def _act_all_sources(net, env_obs, player: int, *,
             )
 
         tgt_slot = int(action["tgt"][0])
-        ship_bin = int(action["ship_bin"][0])
+        ship_value = float(action["ship_value"][0])
         is_noop = bool(action["is_noop"][0])
         move = decode_action(
-            obs_decision, src_slot, tgt_slot, ship_bin,
+            obs_decision, src_slot, tgt_slot, ship_value,
             planets=parsed, angular_velocity=omega, no_op=is_noop,
         )
         if move is not None:
@@ -244,7 +256,7 @@ def _act_all_sources(net, env_obs, player: int, *,
         infos.append({
             "src_slot": src_slot,
             "tgt_slot": tgt_slot,
-            "ship_bin": ship_bin,
+            "ship_value": ship_value,
             "is_noop": is_noop,
             "value": float(out.value[0].item()),
         })

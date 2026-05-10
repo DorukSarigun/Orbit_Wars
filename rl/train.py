@@ -17,7 +17,7 @@ import json
 import math
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -69,6 +69,12 @@ class TrainConfig:
     #   "scripted"   -> slot 0 runs the live policy, all other slots run
     #                   the CaptureEfficiencyAgent.
     opponent: str = "self_play"
+    # Entropy schedule (linear anneal from PPOConfig.entropy_coef -> entropy_coef_final
+    # over the first `entropy_anneal_iters` iterations; held constant afterwards).
+    # If entropy_coef_final is None or entropy_anneal_iters <= 0, the schedule is
+    # disabled and PPOConfig.entropy_coef is used as a constant.
+    entropy_coef_final: Optional[float] = None
+    entropy_anneal_iters: int = 0
 
 
 def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
@@ -121,7 +127,6 @@ def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int
             "d_model": policy.d_model,
             "n_heads": policy.n_heads,
             "n_layers": len(policy.encoder.blocks) if getattr(policy, "model_variant", "full") == "grouped_planet" else len(policy.blocks),
-            "n_ship_bins": policy.n_ship_bins,
             "model_variant": getattr(policy, "model_variant", "full"),
             "attention_type": getattr(policy, "attention_type", "full"),
             "n_inducing_points": getattr(policy, "n_inducing_points", 32),
@@ -164,7 +169,7 @@ def load_checkpoint(path: str | Path, device: torch.device | None = None) -> tup
         arch.get("model_variant", "full"),
         p_max=arch["p_max"], f_max=arch["f_max"], planet_dim=planet_dim,
         d_model=arch["d_model"], n_heads=arch["n_heads"],
-        n_layers=arch["n_layers"], n_ship_bins=arch["n_ship_bins"],
+        n_layers=arch["n_layers"],
         attention_type=arch.get("attention_type", "full"),
         n_inducing_points=arch.get("n_inducing_points", 32),
     )
@@ -275,7 +280,20 @@ def train(
                 )
         # Snapshot weights before PPO so we can compute per-module update norms.
         snap = WeightSnapshot(policy)
-        ppo_stats = ppo_update(policy, buffer, optimizer, ppo_cfg, device=device)
+        # Linear entropy anneal: ppo_cfg.entropy_coef -> train_cfg.entropy_coef_final
+        # over the first train_cfg.entropy_anneal_iters iterations.
+        if (train_cfg.entropy_coef_final is not None
+                and train_cfg.entropy_anneal_iters > 0):
+            anneal_iters = int(train_cfg.entropy_anneal_iters)
+            progress = min(1.0, max(0.0, float(it) / float(anneal_iters)))
+            entropy_now = (
+                (1.0 - progress) * float(ppo_cfg.entropy_coef)
+                + progress * float(train_cfg.entropy_coef_final)
+            )
+            iter_ppo_cfg = replace(ppo_cfg, entropy_coef=entropy_now)
+        else:
+            iter_ppo_cfg = ppo_cfg
+        ppo_stats = ppo_update(policy, buffer, optimizer, iter_ppo_cfg, device=device)
         # Per-module post-update stats.
         weight_norms = weight_norms_by_module(policy)
         update_norms = snap.compute_update_norms(policy)
@@ -314,8 +332,15 @@ def train(
             "policy_loss": round(ppo_stats.policy_loss, 5),
             "value_loss": round(ppo_stats.value_loss, 5),
             "entropy": round(ppo_stats.entropy, 4),
+            "entropy_coef": round(float(iter_ppo_cfg.entropy_coef), 5),
             "approx_kl": round(ppo_stats.approx_kl, 5),
             "clip_fraction": round(ppo_stats.clip_fraction, 4),
+            "ratio_q05": round(ppo_stats.ratio_q05, 4),
+            "ratio_q50": round(ppo_stats.ratio_q50, 4),
+            "ratio_q95": round(ppo_stats.ratio_q95, 4),
+            "ship_alpha": round(ppo_stats.ship_alpha_mean, 3),
+            "ship_beta": round(ppo_stats.ship_beta_mean, 3),
+            "ppo_epochs_run": ppo_stats.epochs_run,
             "elapsed_sec": round(elapsed, 1),
             # Hyperparameters in effect this iter.
             "learning_rate": current_lr,
@@ -337,7 +362,11 @@ def train(
               f"{wins_str} D={draws} | "
               f"polL={log['policy_loss']:+.4f} valL={log['value_loss']:.3f} "
               f"H={log['entropy']:.3f} KL={log['approx_kl']:.4f} "
-              f"clip={log['clip_fraction']:.2f} ur={ur_mean:.2e} "
+              f"clip={log['clip_fraction']:.2f} "
+              f"r=[{log['ratio_q05']:.2f},{log['ratio_q50']:.2f},{log['ratio_q95']:.2f}] "
+              f"αβ=({log['ship_alpha']:.1f},{log['ship_beta']:.1f}) "
+              f"e={ppo_stats.epochs_run}/{ppo_cfg.epochs} "
+              f"ur={ur_mean:.2e} "
               f"({elapsed:.1f}s)")
 
         with log_path.open("a") as fp:
@@ -402,7 +431,21 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Number of optimization epochs over each rollout buffer "
                         "(inner PPO update; not the outer training-epoch count)")
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--entropy-coef", type=float, default=0.05)
+    p.add_argument("--entropy-coef", type=float, default=0.05,
+                   help="Initial entropy bonus coefficient. With --entropy-coef-final "
+                        "and --entropy-anneal-iters, linearly anneals to the final value.")
+    p.add_argument("--entropy-coef-final", type=float, default=None,
+                   help="Target entropy bonus after annealing. Leave unset for constant "
+                        "--entropy-coef.")
+    p.add_argument("--entropy-anneal-iters", type=int, default=0,
+                   help="Number of training iterations to linearly anneal entropy_coef "
+                        "from --entropy-coef to --entropy-coef-final. 0 disables anneal.")
+    p.add_argument("--target-kl", type=float, default=0.05,
+                   help="Per-rollout PPO KL early-stopping threshold. If the "
+                        "average approx_kl on an epoch's minibatches exceeds "
+                        "this value, the remaining inner PPO epochs are "
+                        "skipped. Set negative to disable. Recommended ~0.05 "
+                        "for Beta+Categorical action spaces.")
     p.add_argument("--reward-system", choices=REWARD_SYSTEMS, default="current",
                    help="Reward preset to start from; individual reward flags override it.")
     p.add_argument("--capture-value-weight", type=float, default=None,
@@ -429,6 +472,21 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--enemy-capture-radius-weight", type=float, default=None)
     p.add_argument("--planet-loss-weight", type=float, default=None)
     p.add_argument("--planet-loss-credit-horizon", type=int, default=None)
+    p.add_argument("--defense-kills-weight", type=float, default=None,
+                   help="Per enemy ship killed at MY planet, distributed across "
+                        "my launches that defended it (registered while planet "
+                        "was tagged under-attack). Threat-aware replacement for "
+                        "the deprecated production_reinforcement_weight.")
+    p.add_argument("--production-reinforcement-weight", type=float, default=None,
+                   help="Legacy post-capture reinforcement bonus (DEPRECATED). "
+                        "Default 0; setting > 0 re-enables the legacy behavior.")
+    p.add_argument("--capture-time-curvature", type=float, default=None,
+                   help="Power applied to ((max_turns - turn) / max_turns) "
+                        "in capture/loss/defense-window time factor. "
+                        "1.0 = legacy linear; >1 amplifies early/late ratio.")
+    p.add_argument("--ship-overflow-weight", type=float, default=None,
+                   help="Per-ship penalty when the continuous Beta head requests more ships "
+                        "than the source garrison (penalty = -w * overflow_ships * reward_scale).")
     p.add_argument("--defense-hold-weight", type=float, default=None)
     p.add_argument("--defense-hold-horizon", type=int, default=None)
     p.add_argument("--defense-arrival-window", type=float, default=None)
@@ -476,12 +534,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         scripted_expansion_turns=args.scripted_expansion_turns,
         scripted_expansion_nearest_k=args.scripted_expansion_nearest_k,
         opponent=args.opponent,
+        entropy_coef_final=args.entropy_coef_final,
+        entropy_anneal_iters=args.entropy_anneal_iters,
     )
     ppo_cfg = PPOConfig(
         clip_range=args.clip_range,
         epochs=args.epochs,
         batch_size=args.batch_size,
         entropy_coef=args.entropy_coef,
+        target_kl=args.target_kl if args.target_kl is not None and args.target_kl > 0 else None,
     )
     reward_cfg = build_reward_config(
         args.reward_system,
@@ -500,6 +561,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         enemy_capture_radius_weight=args.enemy_capture_radius_weight,
         planet_loss_weight=args.planet_loss_weight,
         planet_loss_credit_horizon=args.planet_loss_credit_horizon,
+        capture_time_curvature=args.capture_time_curvature,
+        defense_kills_weight=args.defense_kills_weight,
+        production_reinforcement_weight=args.production_reinforcement_weight,
+        ship_overflow_weight=args.ship_overflow_weight,
         defense_hold_weight=args.defense_hold_weight,
         defense_hold_horizon=args.defense_hold_horizon,
         defense_arrival_window=args.defense_arrival_window,

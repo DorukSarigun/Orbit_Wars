@@ -14,17 +14,18 @@ from .train import load_checkpoint
 
 
 _COMPONENT_RANGES = (
-    ((798, 803), "fleet_combat"),
-    ((873, 873), "airborne"),
-    ((883, 883), "defense_deficit"),
-    ((943, 943), "step_reward"),
-    ((950, 955), "defense_hold"),
-    ((982, 987), "planet_defense"),        # Tasarım 2 Defense Window
-    ((990, 1000), "capture"),
-    ((1002, 1012), "neutral_gift"),
-    ((1015, 1027), "reinforcement"),       # Sorun 1: post-capture reinforcement
-    ((1030, 1040), "capture_clawback"),    # Sorun 2: capture-then-lose
-    ((1048, 1053), "planet_loss"),         # legacy PlanetLossTracker (current/aggressive)
+    ((798, 815), "fleet_combat"),
+    ((828, 832), "step_reward"),
+    ((882, 888), "airborne"),
+    ((895, 902), "overflow"),              # continuous Beta head over-allocation
+    ((909, 912), "defense_deficit"),
+    ((970, 980), "defense_hold"),
+    ((1005, 1015), "planet_defense"),      # Tasarım 2 Defense Window
+    ((1018, 1029), "capture"),
+    ((1030, 1041), "neutral_gift"),
+    ((1042, 1056), "reinforcement"),       # Sorun 1: post-capture reinforcement
+    ((1057, 1070), "capture_clawback"),    # Sorun 2: capture-then-lose
+    ((1071, 1085), "planet_loss"),         # legacy PlanetLossTracker (current/aggressive)
 )
 
 

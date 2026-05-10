@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 from feature_extraction import parse_planets
 
+from .rewards import curved_time_factor
+
 
 @dataclass
 class ProductionCaptureLaunch:
@@ -531,11 +533,18 @@ def compute_production_capture_reward(
     reward_scale: float = 0.001,
     production_reward_beta: float = 0.0,
     production_reward_reference: float = 3.0,
+    capture_time_curvature: float = 1.0,
 ) -> float:
     if outcome.total_ships_sent <= 0:
         return 0.0
     max_turns = max(1, int(outcome.max_turns))
-    time_factor = remaining_steps(max_turns, outcome.capture_turn)
+    # Power-curved remaining-time factor (curvature=1.0 == legacy linear).
+    # Peak at t=0 stays at max_turns so absolute reward scale is preserved
+    # across curvature values; only the early/late ratio changes.
+    time_factor = curved_time_factor(
+        max_turns, outcome.capture_turn,
+        curvature=capture_time_curvature,
+    )
     reward = production_reward_value(
         outcome.planet_production,
         production_reward_beta=production_reward_beta,
@@ -644,6 +653,7 @@ def compute_production_planet_loss_penalty(
     reward_scale: float = 0.001,
     production_reward_beta: float = 0.0,
     production_reward_reference: float = 3.0,
+    capture_time_curvature: float = 1.0,
 ) -> float:
     """Per-launch planet-loss penalty.
 
@@ -659,7 +669,12 @@ def compute_production_planet_loss_penalty(
     if outcome.total_ships_sent <= 0:
         return 0.0
     max_turns = max(1, int(outcome.max_turns))
-    time_factor = remaining_steps(max_turns, outcome.loss_turn)
+    # Symmetric with capture_reward: same curvature so an early loss
+    # is penalized as severely as an early capture is rewarded.
+    time_factor = curved_time_factor(
+        max_turns, outcome.loss_turn,
+        curvature=capture_time_curvature,
+    )
     penalty = -production_reward_value(
         outcome.planet_production,
         production_reward_beta=production_reward_beta,
