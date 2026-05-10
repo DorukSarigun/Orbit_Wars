@@ -15,6 +15,7 @@ which is fine for a symmetric zero-sum game.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -763,6 +764,15 @@ def collect_episode(
         )
         for _ in range(num_agents)
     ]
+    # Per-player rolling window of recent transition indices, used by the
+    # `production_diff` reward system to retro-distribute the per-step
+    # production-differential reward via eligibility traces. Each entry
+    # is the list of transition buffer indices written for that turn.
+    # `maxlen = horizon + 1` so we keep the current step plus H past steps.
+    _trace_horizon = max(0, int(reward_cfg.eligibility_trace_horizon))
+    trace_windows: list[deque] = [
+        deque(maxlen=_trace_horizon + 1) for _ in range(num_agents)
+    ]
 
     for t in range(max_steps):
         env_obs = [state[p]["observation"] for p in range(num_agents)]
@@ -842,16 +852,39 @@ def collect_episode(
             )
             if terminal else [0.0 for _ in range(num_agents)]
         )
-        rewards = [
-            compute_step_reward(
-                env_obs[p], new_obs[p], p,
-                terminal=terminal,
-                env_terminal_reward=terminal_rewards[p],
-                cfg=reward_cfg,
-                invalid_actions=0,
-            )
-            for p in range(num_agents)
-        ]
+        if reward_cfg.reward_system == "production_diff":
+            # Pure production-differential per-step reward. NO shaping, NO
+            # tracker channels. Terminal step uses the +/-1 env signal.
+            rewards = []
+            opp_count = max(1, num_agents - 1)
+            for p in range(num_agents):
+                if terminal:
+                    rewards.append(float(terminal_rewards[p]))
+                    continue
+                planets = parse_planets(new_obs[p])
+                my_prod = sum(
+                    float(planet.production) for planet in planets
+                    if planet.owner == p and not getattr(planet, "is_comet", False)
+                )
+                opp_prod = sum(
+                    float(planet.production) for planet in planets
+                    if planet.owner != p and planet.owner != -1
+                    and not getattr(planet, "is_comet", False)
+                )
+                rewards.append(
+                    (my_prod - opp_prod / opp_count) * reward_cfg.reward_scale
+                )
+        else:
+            rewards = [
+                compute_step_reward(
+                    env_obs[p], new_obs[p], p,
+                    terminal=terminal,
+                    env_terminal_reward=terminal_rewards[p],
+                    cfg=reward_cfg,
+                    invalid_actions=0,
+                )
+                for p in range(num_agents)
+            ]
         for p, r in enumerate(rewards):
             if p in opponent_indices:
                 continue
@@ -1003,6 +1036,39 @@ def collect_episode(
                         hold_turn=t,
                         ships_held=ships_held,
                     )
+            if reward_cfg.reward_system == "production_diff":
+                # Eligibility-trace distribution. Push current step's
+                # transitions to the rolling window, then add the current
+                # per-step reward `r` to ALL transitions in the window
+                # (including past turns) with exponential decay
+                # `lambda^k` where k=0 is the current turn and k=H the
+                # oldest. NO-OP transitions get a separate weight scale
+                # so we can up- or down-weight passive holds.
+                if new_indices:
+                    trace_windows[p].append(list(new_indices))
+                decay = float(reward_cfg.eligibility_trace_decay)
+                noop_w = float(reward_cfg.noop_trace_weight)
+                # Iterate window from newest (k=0) to oldest (k=H).
+                for k, past_idxs in enumerate(reversed(trace_windows[p])):
+                    if not past_idxs:
+                        continue
+                    decay_k = decay ** k if decay > 0.0 else (1.0 if k == 0 else 0.0)
+                    if decay_k <= 0.0:
+                        break
+                    weights = [
+                        (noop_w if buffer.data[idx].is_noop else 1.0)
+                        for idx in past_idxs
+                    ]
+                    total_w = sum(weights)
+                    if total_w <= 0.0:
+                        continue
+                    for idx, w in zip(past_idxs, weights):
+                        share = r * decay_k * (w / total_w)
+                        if share != 0.0:
+                            buffer.add_reward(idx, share)
+                # Skip all legacy tracker observe/pop blocks below; the
+                # production_diff system uses NO trackers.
+                continue
             if new_indices:
                 reward = r / len(new_indices)
                 for idx in new_indices:

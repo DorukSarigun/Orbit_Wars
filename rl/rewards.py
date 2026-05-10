@@ -155,12 +155,52 @@ class RewardConfig:
     shape_on_terminal: bool = False
 
 
-REWARD_SYSTEMS: tuple[str, ...] = ("current", "aggressive", "production_simple")
+REWARD_SYSTEMS: tuple[str, ...] = (
+    "current", "aggressive", "production_simple", "production_diff",
+)
 
 
 def build_reward_config(reward_system: str = "current", **overrides) -> RewardConfig:
     if reward_system == "current":
         cfg = RewardConfig(reward_system="current")
+    elif reward_system == "production_diff":
+        # Minimal "production differential + eligibility trace" system.
+        # Per-step reward = (sum_my_production - sum_opp_production / num_opp)
+        #                   * reward_scale
+        # That single scalar is then distributed back to launch transitions
+        # over the last `eligibility_trace_horizon` turns with exponential
+        # decay (`eligibility_trace_decay`). NO-OP credit is scaled by
+        # `noop_trace_weight`. ALL legacy tracker channels (capture, defense
+        # kills, planet defense, fleet combat, airborne, overflow,
+        # defense_deficit, ...) are disabled here so the reward landscape
+        # is exactly: dense production diff + terminal +/-1.
+        cfg = RewardConfig(
+            reward_system="production_diff",
+            # All shaping channels off.
+            capture_value_weight=0.0,
+            denial_value_weight=0.0,
+            ship_diff_weight=0.0,
+            ship_loss_weight=0.0,
+            fleet_airborne_weight=0.0,
+            fleet_capture_weight=0.0,
+            fleet_kill_weight=0.0,
+            fleet_waste_weight=0.0,
+            enemy_capture_radius_weight=0.0,
+            planet_loss_weight=0.0,
+            defense_hold_weight=0.0,
+            ship_overflow_weight=0.0,
+            defense_kills_weight=0.0,
+            production_reinforcement_weight=0.0,
+            invalid_action_penalty=0.0,
+            planet_diff_weight=0.0,
+            # Eligibility trace defaults.
+            eligibility_trace_horizon=30,
+            eligibility_trace_decay=0.9,
+            noop_trace_weight=1.0,
+            delayed_reward_discount=1.0,
+            reward_scale=0.001,
+            draw_terminal_reward=0.0,
+        )
     elif reward_system == "aggressive":
         cfg = RewardConfig(
             reward_system="aggressive",
