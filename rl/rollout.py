@@ -925,7 +925,12 @@ def collect_episode(
                 new_indices.append(idx)
                 # Register fleet launch for delayed reward tracking.
                 if launched and fleet_meta is not None:
-                    defense_trackers[p].cancel_planet(fleet_meta["src_planet_id"])
+                    # In production_diff the reward landscape is exactly
+                    # "production-diff + eligibility trace + terminal +/-1";
+                    # NO trackers are observed/popped so any register call
+                    # here would just leak memory across the episode.
+                    if reward_cfg.reward_system != "production_diff":
+                        defense_trackers[p].cancel_planet(fleet_meta["src_planet_id"])
                     risk_mult = _airborne_risk_multiplier(
                         fleet_meta["source_threat_intensity"],
                     )
@@ -1016,7 +1021,11 @@ def collect_episode(
                                     fleet_meta["launch_turn"] + fleet_meta["eta"]
                                 )),
                             )
-                    else:
+                    elif reward_cfg.reward_system in ("current", "aggressive"):
+                        # Legacy systems use PlanetLossTracker for the
+                        # "launched-then-lost" penalty. Skipped for
+                        # production_simple (replaced by PlanetDefenseTracker)
+                        # and for production_diff (no trackers at all).
                         planet_loss_trackers[p].register_launch(
                             buffer_idx=idx,
                             launch_turn=fleet_meta["launch_turn"],
@@ -1025,7 +1034,15 @@ def collect_episode(
                             ships_sent=fleet_meta["ships_sent"],
                             source_had_enemy_incoming=fleet_meta["source_had_enemy_incoming"],
                         )
-                elif bool(act["is_noop"][0]) and not invalid:
+                elif (
+                    bool(act["is_noop"][0])
+                    and not invalid
+                    and reward_cfg.reward_system != "production_diff"
+                ):
+                    # NO-OP holds are tracked for DefenseTracker (defense_hold
+                    # reward in legacy systems, defense_kills resolution in
+                    # production_simple). production_diff does not observe
+                    # this tracker at all, so skip the register here too.
                     src_slot = int(act["src"][0])
                     planet_id = int(obs.planet_ids[src_slot])
                     ships_held = int(round(float(obs.planet_feats[src_slot, PF_IDX_SHIPS]) * 100.0))
