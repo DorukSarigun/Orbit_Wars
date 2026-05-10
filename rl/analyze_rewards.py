@@ -14,18 +14,19 @@ from .train import load_checkpoint
 
 
 _COMPONENT_RANGES = (
-    ((798, 815), "fleet_combat"),
-    ((828, 832), "step_reward"),
-    ((882, 888), "airborne"),
-    ((895, 902), "overflow"),              # continuous Beta head over-allocation
-    ((909, 912), "defense_deficit"),
-    ((970, 980), "defense_hold"),
-    ((1005, 1015), "planet_defense"),      # Tasarım 2 Defense Window
-    ((1018, 1029), "capture"),
-    ((1030, 1041), "neutral_gift"),
-    ((1042, 1056), "reinforcement"),       # Sorun 1: post-capture reinforcement
-    ((1057, 1070), "capture_clawback"),    # Sorun 2: capture-then-lose
-    ((1071, 1085), "planet_loss"),         # legacy PlanetLossTracker (current/aggressive)
+    ((828, 836), "fleet_combat"),          # FleetTracker resolved (capture/loss attribution)
+    ((903, 908), "airborne"),              # ship_airborne_weight per-step opportunity cost
+    ((915, 921), "overflow"),              # continuous Beta head over-allocation
+    ((922, 932), "defense_deficit"),       # ETA-exact source defense shortfall penalty
+    ((1005, 1012), "step_reward"),         # legacy step shaping reward distribution
+    ((1014, 1022), "defense_hold"),        # legacy DefenseTracker hold reward
+    ((1043, 1054), "planet_defense"),      # Tasarım 2 Defense Window
+    ((1062, 1072), "defense_kills"),       # Threat-aware defense kill reward
+    ((1073, 1086), "capture"),             # production capture reward
+    ((1087, 1098), "neutral_gift"),        # neutral_gift penalty
+    ((1099, 1113), "reinforcement"),       # Sorun 1: post-capture reinforcement
+    ((1114, 1126), "capture_clawback"),    # Sorun 2: capture-then-lose
+    ((1127, 1140), "planet_loss"),         # legacy PlanetLossTracker (current/aggressive)
 )
 
 

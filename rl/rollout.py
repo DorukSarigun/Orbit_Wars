@@ -757,6 +757,9 @@ def collect_episode(
         DefenseKillsTracker(
             max_turns=reward_cfg.max_turns,
             angular_velocity=angular_velocity,
+            production_reward_beta=reward_cfg.production_reward_beta,
+            production_reward_reference=reward_cfg.production_reward_reference,
+            capture_time_curvature=reward_cfg.capture_time_curvature,
         )
         for _ in range(num_agents)
     ]

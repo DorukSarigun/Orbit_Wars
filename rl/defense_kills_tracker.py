@@ -1,7 +1,7 @@
 """Defense Kills Tracker — credit defending launches when enemy attacks fail.
 
-Mechanism (episode-end resolution)
-----------------------------------
+Mechanism (per-arrival incremental resolution)
+----------------------------------------------
 1. Each turn, every enemy fleet in flight whose predicted target is one of
    MY planets tags that planet as 'under attack'. An *attack episode* is
    opened on first sighting and stays active as long as at least one enemy
@@ -9,30 +9,35 @@ Mechanism (episode-end resolution)
 2. While an episode is active, every launch I make TARGETING that planet
    is registered as a defender (with its est_arrival_turn).
 3. As enemy fleets arrive during the episode:
-     - Planet still mine after combat: that fleet's ships are accumulated
-       into `enemy_killed_total` for the episode (and `last_combat_turn`
-       is advanced).
+     - Planet still mine after combat: that fleet's ships are credited
+       IMMEDIATELY to all eligible defenders (defenders whose
+       est_arrival_turn <= current turn). Reward is queued via
+       `_resolved` for this turn.
      - Planet flipped to the enemy: the episode is dropped immediately
        (defense failed → no reward; the planet-loss tracker handles the
        loss penalty separately).
-4. When the planet is no longer under attack (no more enemy fleets in
-   flight to it) AND it is still mine, the episode is finalized and the
-   accumulated kills are distributed across eligible defenders.
+4. The episode stays in `_active` while any enemy fleet remains en route
+   so that incoming defenders can still be registered. Once no more enemy
+   fleets target this planet, the episode is dropped (no extra reward).
 
-Reward formula (per defender)::
+Reward formula (per arrival event)::
 
     share  = ships_sent / sum(eligible_defender_ships)
-    reward = enemy_killed_total * share
+    reward = arrived_enemy_ships * share
              * defense_kills_weight * reward_scale
 
-Eligible defenders = those whose est_arrival_turn <= last_combat_turn
-(i.e. they had already landed by the time the last enemy fleet was
-repelled). Defenders that miss the combat get nothing.
+Eligible defenders at arrival turn t = those whose est_arrival_turn <= t
+(i.e. they had already landed by the time the enemy fleet arrived).
+Defenders that arrive after a given combat earn nothing for that combat
+but remain eligible for any later combats in the same episode.
 
-Why this design
----------------
-- Reward is paid once per attack episode, when the under-attack tag
-  clears — the natural "we survived the wave" moment.
+Why per-arrival (not episode-end)
+---------------------------------
+- In high-launch-rate rollouts, attack waves overlap continuously and an
+  episode may never become "fully resolved" within an episode horizon,
+  starving the reward channel.
+- Crediting at each arrival ties the reward to the actual combat moment,
+  giving denser learning signal.
 - Kills are bounded and proportional to actual enemy losses (not arbitrary
   ships_sent like the legacy reinforcement reward).
 - Solves the "blue team passes fleets back and forth" exploit: launches
@@ -45,6 +50,8 @@ from dataclasses import dataclass, field
 
 from feature_extraction import parse_planets, parse_fleets
 from navigation import predict_all_fleet_targets
+from .production_reward_tracker import production_reward_value
+from .rewards import curved_time_factor
 
 
 @dataclass
@@ -67,9 +74,18 @@ class _AttackEpisode:
 class DefenseKillsTracker:
     """Per-(player, planet) under-attack state machine + defender registry."""
 
-    def __init__(self, *, max_turns: int = 500, angular_velocity: float = 0.0) -> None:
+    def __init__(self, *, max_turns: int = 500, angular_velocity: float = 0.0,
+                 production_reward_beta: float = 0.0,
+                 production_reward_reference: float = 3.0,
+                 capture_time_curvature: float = 1.0) -> None:
         self.max_turns = int(max_turns)
         self.angular_velocity = float(angular_velocity)
+        # Production-symmetric reward shaping (matches capture reward
+        # formula so a successful defense at high-prod planet is comparable
+        # in magnitude to a high-prod capture).
+        self.production_reward_beta = float(production_reward_beta)
+        self.production_reward_reference = float(production_reward_reference)
+        self.capture_time_curvature = float(capture_time_curvature)
         # (player, planet_id) -> active episode
         self._active: dict[tuple[int, int], _AttackEpisode] = {}
         # player -> deque[(buffer_idx, reward, event_turn)]
@@ -149,7 +165,9 @@ class DefenseKillsTracker:
                     started_turn=int(turn),
                 )
 
-        # 2. Detect enemy fleet arrivals at my planets this step.
+        # 2. Detect enemy fleet arrivals at my planets this step. Per-arrival
+        #    credit: pay eligible defenders for THIS specific kill event
+        #    immediately, instead of waiting for episode end.
         for f_id, prev_fl in prev_fleets.items():
             if prev_fl.owner == player or prev_fl.owner == -1:
                 continue
@@ -168,39 +186,39 @@ class DefenseKillsTracker:
                 # Target vanished (comet etc.). Drop episode.
                 self._active.pop(key, None)
                 continue
-            if curr_planet.owner == player:
-                # Defense held against this fleet.
-                episode.enemy_killed_total += float(prev_fl.ships)
-                episode.last_combat_turn = int(turn)
-            else:
-                # Planet flipped during combat → defense failed.
+            if curr_planet.owner != player:
+                # Planet flipped during combat → defense failed; drop.
                 self._active.pop(key, None)
-
-        # 3. Finalize episodes whose enemy attacks are fully resolved.
-        for key in list(self._active.keys()):
-            ep_player, planet_id = key
-            if ep_player != player:
                 continue
-            if planet_id in my_under_attack:
-                continue  # still ongoing (more enemy fleets en route)
-            episode = self._active.pop(key)
-            curr_planet = curr_planets.get(planet_id)
-            if curr_planet is None or curr_planet.owner != player:
-                continue
-            if episode.enemy_killed_total <= 0.0:
+            # Defense held against this fleet → distribute credit now.
+            arrived_kills = float(prev_fl.ships)
+            episode.enemy_killed_total += arrived_kills
+            episode.last_combat_turn = int(turn)
+            if arrived_kills <= 0.0:
                 continue
             eligible = [
                 d for d in episode.defenders
-                if d.est_arrival_turn <= episode.last_combat_turn
+                if d.est_arrival_turn <= int(turn)
             ]
             total_ships = sum(d.ships_sent for d in eligible)
             if total_ships <= 0:
                 continue
-            kills = episode.enemy_killed_total
+            # Production-symmetric reward (matches capture formula). A
+            # successful defense at a hi-prod planet is comparable in
+            # magnitude to a hi-prod capture.
+            production_value = production_reward_value(
+                float(curr_planet.production),
+                production_reward_beta=self.production_reward_beta,
+                production_reward_reference=self.production_reward_reference,
+            )
+            time_factor = curved_time_factor(
+                self.max_turns, int(turn),
+                curvature=self.capture_time_curvature,
+            )
             for d in eligible:
                 share = d.ships_sent / total_ships
                 reward = (
-                    kills * share
+                    production_value * time_factor * arrived_kills * share
                     * float(defense_kills_weight)
                     * float(reward_scale)
                 )
@@ -208,8 +226,19 @@ class DefenseKillsTracker:
                     self._resolved.setdefault(int(player), deque()).append(
                         (int(d.buffer_idx),
                          float(reward),
-                         int(episode.last_combat_turn))
+                         int(turn))
                     )
+
+        # 3. Drop episodes whose attack wave has fully passed (no more
+        #    enemy fleets targeting this planet). No payout here — credit
+        #    has already been distributed per arrival in step 2.
+        for key in list(self._active.keys()):
+            ep_player, planet_id = key
+            if ep_player != player:
+                continue
+            if planet_id in my_under_attack:
+                continue  # still under attack
+            self._active.pop(key, None)
 
     def pop_resolved(self, player: int):
         """Yield (buffer_idx, reward, event_turn) tuples ready for credit."""
