@@ -24,6 +24,7 @@ from typing import Optional
 import torch
 
 from model import OrbitWarsPolicy
+from model_grouped_planet_edge import EdgeAwareGroupedPlanetOrbitWarsPolicy
 from model_grouped_planet import GroupedPlanetOrbitWarsPolicy
 from model_planet_only import PlanetOnlyOrbitWarsPolicy
 
@@ -80,6 +81,8 @@ class TrainConfig:
 def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
     if variant == "grouped_planet":
         return GroupedPlanetOrbitWarsPolicy(**kwargs)
+    if variant == "grouped_planet_edge":
+        return EdgeAwareGroupedPlanetOrbitWarsPolicy(**kwargs)
     kwargs.pop("attention_type", None)
     kwargs.pop("n_inducing_points", None)
     if variant == "planet_only":
@@ -126,7 +129,7 @@ def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int
             "planet_dim": policy.planet_dim,
             "d_model": policy.d_model,
             "n_heads": policy.n_heads,
-            "n_layers": len(policy.encoder.blocks) if getattr(policy, "model_variant", "full") == "grouped_planet" else len(policy.blocks),
+            "n_layers": len(policy.encoder.blocks) if getattr(policy, "model_variant", "full") in ("grouped_planet", "grouped_planet_edge") else len(policy.blocks),
             "model_variant": getattr(policy, "model_variant", "full"),
             "attention_type": getattr(policy, "attention_type", "full"),
             "n_inducing_points": getattr(policy, "n_inducing_points", 32),
@@ -210,14 +213,14 @@ def train(
     optimizer = torch.optim.Adam(policy.parameters(), lr=train_cfg.learning_rate)
     n_params = sum(p.numel() for p in policy.parameters())
     variant = getattr(policy, "model_variant", "full")
-    if variant == "grouped_planet":
+    if variant in ("grouped_planet", "grouped_planet_edge"):
         token_count = policy.p_max
     elif variant == "planet_only":
         token_count = policy.p_max + 1
     else:
         token_count = policy.p_max + policy.f_max + 1
     attention_info = ""
-    if variant == "grouped_planet":
+    if variant in ("grouped_planet", "grouped_planet_edge"):
         attention_info = f", attention={policy.attention_type}, M={policy.n_inducing_points}"
     print(f"Policy[{variant}]: {n_params:,} params, T={token_count}{attention_info}, device={device}")
 
@@ -415,7 +418,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--grouped-attention-type", choices=("full", "induced"), default="full")
     p.add_argument("--n-inducing-points", type=int, default=32)
-    p.add_argument("--model-variant", choices=("full", "planet_only", "grouped_planet"), default="planet_only")
+    p.add_argument("--model-variant", choices=("full", "planet_only", "grouped_planet", "grouped_planet_edge"), default="planet_only")
     p.add_argument("--save-game-batches", action="store_true",
                    help="Save one .pt rollout/training batch per self-play game after GAE")
     p.add_argument("--batch-save-dir", default="checkpoints/game_batches")

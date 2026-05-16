@@ -130,7 +130,7 @@ def _act_all_sources(net, env_obs, player: int, *,
         source_mask=obs.source_mask.copy(),
     )
 
-    if getattr(net, "model_variant", "") == "grouped_planet":
+    if getattr(net, "model_variant", "") in ("grouped_planet", "grouped_planet_edge"):
         available_pairs = obs.planet_mask[None, :].repeat(net.p_max, axis=0)
         available_pairs &= obs.source_mask[:, None]
         available_pairs &= ~torch.eye(net.p_max, dtype=torch.bool).numpy()

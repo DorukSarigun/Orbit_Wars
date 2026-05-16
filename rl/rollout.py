@@ -368,7 +368,7 @@ def _act_for_player(
     source_slots = [int(i) for i, ok in enumerate(obs.source_mask) if ok]
     last_out = None
 
-    if getattr(policy, "model_variant", "") == "grouped_planet":
+    if getattr(policy, "model_variant", "") in ("grouped_planet", "grouped_planet_edge"):
         available_pairs = obs.planet_mask[None, :].repeat(policy.p_max, axis=0)
         available_pairs &= obs.source_mask[:, None]
         available_pairs &= ~torch.eye(policy.p_max, dtype=torch.bool).numpy()

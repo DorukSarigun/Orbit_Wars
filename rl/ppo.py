@@ -83,6 +83,7 @@ def ppo_update(
 
     for _epoch in range(cfg.epochs):
         epoch_kls: list[float] = []
+        stop_ppo = False
         for batch in buffer.iter_minibatches(cfg.batch_size, device=device):
             out = policy(
                 planet_feats=batch["planet_feats"],
@@ -106,7 +107,22 @@ def ppo_update(
 
             adv = batch["advantages"]
             old_logp = batch["old_log_prob"]
-            ratio = torch.exp(new_logp - old_logp)
+            log_ratio = new_logp - old_logp
+            if not (
+                torch.isfinite(log_ratio).all()
+                and torch.isfinite(new_value).all()
+                and torch.isfinite(entropy).all()
+            ):
+                stop_ppo = True
+                break
+            with torch.no_grad():
+                approx_kl = 0.5 * log_ratio.pow(2).mean().item()
+            if cfg.target_kl is not None and approx_kl > cfg.target_kl:
+                kls.append(approx_kl)
+                epoch_kls.append(approx_kl)
+                stop_ppo = True
+                break
+            ratio = torch.exp(log_ratio.clamp(min=-20.0, max=20.0))
 
             # Clipped surrogate objective.
             unclipped = ratio * adv
@@ -138,10 +154,6 @@ def ppo_update(
             optimizer.step()
 
             with torch.no_grad():
-                # `approx_kl` here is Schulman's (k1) estimator: 0.5 * E[(Δlogp)^2].
-                # It's noisier than k3 (E[exp(Δ)-1-Δ]) but cheaper and
-                # consistent with the rest of this codebase's logs.
-                approx_kl = 0.5 * (old_logp - new_logp).pow(2).mean().item()
                 clip_frac = ((ratio - 1.0).abs() > cfg.clip_range).float().mean().item()
                 # Importance ratio quantiles — diagnose trust-region health.
                 if ratio.numel() >= 20:
@@ -155,12 +167,18 @@ def ppo_update(
                 # Beta head mean concentrations on the chosen pair (non-noop only).
                 B = out.ship_params.shape[0]
                 src_idx = batch["src"].long().clamp(max=out.ship_params.shape[1] - 1)
-                tgt_idx = batch["tgt"].long().clamp(max=out.ship_params.shape[2] - 1)
-                chosen_params = out.ship_params[
-                    torch.arange(B, device=out.ship_params.device),
-                    src_idx,
-                    tgt_idx,
-                ]
+                if out.ship_params.dim() == 4:
+                    tgt_idx = batch["tgt"].long().clamp(max=out.ship_params.shape[2] - 1)
+                    chosen_params = out.ship_params[
+                        torch.arange(B, device=out.ship_params.device),
+                        src_idx,
+                        tgt_idx,
+                    ]
+                else:
+                    chosen_params = out.ship_params[
+                        torch.arange(B, device=out.ship_params.device),
+                        src_idx,
+                    ]
                 a_chosen, b_chosen = _beta_concentrations(chosen_params)
                 non_noop_mask = (~batch["is_noop"].bool())
                 if non_noop_mask.any():
@@ -176,6 +194,8 @@ def ppo_update(
             n_updates += 1
 
         epochs_run += 1
+        if stop_ppo:
+            break
 
         # KL early stopping: if the average approx_kl on this epoch's
         # minibatches blew past `target_kl`, the policy has already
