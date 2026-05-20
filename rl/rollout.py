@@ -37,7 +37,12 @@ from model import OrbitWarsPolicy, pack_observations, _make_ship_dist
 
 from .buffer import RolloutBuffer, Transition
 from .rewards import RewardConfig, compute_step_reward, normalize_terminal_rewards
-from .fleet_tracker import FleetTracker, compute_fleet_reward, compute_production_simple_fleet_combat_reward
+from .fleet_tracker import (
+    FleetTracker,
+    compute_fleet_reward,
+    compute_production_only_fleet_kill_reward,
+    compute_production_simple_fleet_combat_reward,
+)
 from .defense_tracker import DefenseTracker, compute_defense_reward
 from .planet_loss_tracker import PlanetLossTracker, compute_planet_loss_launch_penalty
 from .planet_defense_tracker import PlanetDefenseTracker
@@ -45,6 +50,7 @@ from .defense_kills_tracker import DefenseKillsTracker
 from .production_reward_tracker import (
     ProductionRewardTracker,
     compute_production_capture_reward,
+    compute_production_upstream_capture_reward,
     compute_production_neutral_gift_penalty,
     compute_production_reinforcement_reward,
     compute_production_capture_clawback,
@@ -60,6 +66,23 @@ def _incoming_bucket_idx(eta: float) -> int:
         if eta <= upper:
             return i
     return len(INCOMING_ETA_BUCKETS) - 1
+
+
+def _production_trace_reward(env_obs, player: int, num_agents: int, reward_cfg: RewardConfig) -> float:
+    planets = parse_planets(env_obs)
+    my_prod = sum(
+        float(planet.production) for planet in planets
+        if planet.owner == player and not getattr(planet, "is_comet", False)
+    )
+    if reward_cfg.reward_system == "production_only":
+        return my_prod * reward_cfg.reward_scale
+    opp_count = max(1, num_agents - 1)
+    opp_prod = sum(
+        float(planet.production) for planet in planets
+        if planet.owner != player and planet.owner != -1
+        and not getattr(planet, "is_comet", False)
+    )
+    return (my_prod - opp_prod / opp_count) * reward_cfg.reward_scale
 
 
 def _compute_airborne_cost(*, ships_sent: int, est_distance: float, weight: float,
@@ -368,7 +391,7 @@ def _act_for_player(
     source_slots = [int(i) for i, ok in enumerate(obs.source_mask) if ok]
     last_out = None
 
-    if getattr(policy, "model_variant", "") in ("grouped_planet", "grouped_planet_edge"):
+    if getattr(policy, "model_variant", "") in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"):
         available_pairs = obs.planet_mask[None, :].repeat(policy.p_max, axis=0)
         available_pairs &= obs.source_mask[:, None]
         available_pairs &= ~torch.eye(policy.p_max, dtype=torch.bool).numpy()
@@ -719,6 +742,8 @@ def collect_episode(
         ProductionRewardTracker(
             max_turns=reward_cfg.max_turns,
             num_agents=num_agents,
+            upstream_credit_window=reward_cfg.production_upstream_credit_window,
+            upstream_credit_weight=reward_cfg.production_upstream_credit_weight,
             reinforcement_decay_window=reward_cfg.production_reinforcement_decay_window,
             capture_clawback_window=reward_cfg.production_capture_clawback_window,
             capture_clawback_fraction=reward_cfg.production_capture_clawback_fraction,
@@ -822,7 +847,25 @@ def collect_episode(
             fleet_trackers[p].observe_turn(t, new_obs[p], p)
             for buffer_idx, outcome in fleet_trackers[p].pop_resolved(p):
                 if reward_cfg.reward_system == "production_simple":
+                    actual_tgt = int(getattr(outcome, "actual_tgt_planet_id", -1))
+                    intended_tgt = int(getattr(outcome, "intended_tgt_planet_id", -1))
+                    if actual_tgt >= 0 and intended_tgt >= 0 and actual_tgt != intended_tgt:
+                        production_trackers[p].retarget_capture_launch(
+                            buffer_idx=buffer_idx,
+                            player=p,
+                            target_planet_id=actual_tgt,
+                            launch_target_owner=int(getattr(outcome, "actual_tgt_owner", -2)),
+                            launch_target_ships=int(getattr(outcome, "actual_tgt_ships", 0)),
+                        )
+                if reward_cfg.reward_system == "production_simple":
                     fleet_reward = compute_production_simple_fleet_combat_reward(
+                        outcome,
+                        kill_weight=reward_cfg.fleet_kill_weight,
+                        waste_weight=reward_cfg.fleet_waste_weight,
+                        reward_scale=reward_cfg.reward_scale,
+                    )
+                elif reward_cfg.reward_system == "production_only":
+                    fleet_reward = compute_production_only_fleet_kill_reward(
                         outcome,
                         kill_weight=reward_cfg.fleet_kill_weight,
                         reward_scale=reward_cfg.reward_scale,
@@ -852,28 +895,15 @@ def collect_episode(
             )
             if terminal else [0.0 for _ in range(num_agents)]
         )
-        if reward_cfg.reward_system == "production_diff":
+        if reward_cfg.reward_system in ("production_diff", "production_only"):
             # Pure production-differential per-step reward. NO shaping, NO
             # tracker channels. Terminal step uses the +/-1 env signal.
             rewards = []
-            opp_count = max(1, num_agents - 1)
             for p in range(num_agents):
                 if terminal:
                     rewards.append(float(terminal_rewards[p]))
                     continue
-                planets = parse_planets(new_obs[p])
-                my_prod = sum(
-                    float(planet.production) for planet in planets
-                    if planet.owner == p and not getattr(planet, "is_comet", False)
-                )
-                opp_prod = sum(
-                    float(planet.production) for planet in planets
-                    if planet.owner != p and planet.owner != -1
-                    and not getattr(planet, "is_comet", False)
-                )
-                rewards.append(
-                    (my_prod - opp_prod / opp_count) * reward_cfg.reward_scale
-                )
+                rewards.append(_production_trace_reward(new_obs[p], p, num_agents, reward_cfg))
         else:
             rewards = [
                 compute_step_reward(
@@ -994,12 +1024,23 @@ def collect_episode(
                             buffer_idx=idx,
                             launch_turn=fleet_meta["launch_turn"],
                             player=fleet_meta["player"],
+                            src_planet_id=fleet_meta["src_planet_id"],
                             target_planet_id=fleet_meta["tgt_planet_id"],
                             ships_sent=fleet_meta["ships_sent"],
                             est_arrival_turn=fleet_meta["launch_turn"] + fleet_meta["eta"],
                             launch_target_owner=fleet_meta["launch_tgt_owner"],
                             launch_target_ships=fleet_meta["launch_tgt_ships"],
                             my_total_ships_at_launch=fleet_meta["my_total_ships_at_launch"],
+                        )
+                        production_trackers[p].register_source_support_launch(
+                            buffer_idx=idx,
+                            launch_turn=fleet_meta["launch_turn"],
+                            player=fleet_meta["player"],
+                            src_planet_id=fleet_meta["src_planet_id"],
+                            target_planet_id=fleet_meta["tgt_planet_id"],
+                            ships_sent=fleet_meta["ships_sent"],
+                            est_arrival_turn=fleet_meta["launch_turn"] + fleet_meta["eta"],
+                            launch_target_owner=fleet_meta["launch_tgt_owner"],
                         )
                         # Defense Kills: if I'm targeting one of my own
                         # planets that is currently under attack, register
@@ -1037,7 +1078,7 @@ def collect_episode(
                 elif (
                     bool(act["is_noop"][0])
                     and not invalid
-                    and reward_cfg.reward_system != "production_diff"
+                    and reward_cfg.reward_system not in ("production_diff", "production_only")
                 ):
                     # NO-OP holds are tracked for DefenseTracker (defense_hold
                     # reward in legacy systems, defense_kills resolution in
@@ -1053,7 +1094,7 @@ def collect_episode(
                         hold_turn=t,
                         ships_held=ships_held,
                     )
-            if reward_cfg.reward_system == "production_diff":
+            if reward_cfg.reward_system in ("production_diff", "production_only"):
                 # Eligibility-trace distribution. Push current step's
                 # transitions to the rolling window, then add the current
                 # per-step reward `r` to ALL transitions in the window
@@ -1183,6 +1224,21 @@ def collect_episode(
                             production_reward_beta=reward_cfg.production_reward_beta,
                             production_reward_reference=reward_cfg.production_reward_reference,
                             capture_time_curvature=reward_cfg.capture_time_curvature,
+                            ship_overcommit_weight=reward_cfg.fleet_overcommit_weight,
+                        ),
+                        event_turn=t,
+                        discount=reward_cfg.delayed_reward_discount,
+                    )
+                for buffer_idx, outcome in production_trackers[p].pop_upstream_capture_resolved(p):
+                    buffer.add_delayed_reward(
+                        buffer_idx,
+                        compute_production_upstream_capture_reward(
+                            outcome,
+                            reward_scale=reward_cfg.reward_scale,
+                            production_reward_beta=reward_cfg.production_reward_beta,
+                            production_reward_reference=reward_cfg.production_reward_reference,
+                            capture_time_curvature=reward_cfg.capture_time_curvature,
+                            ship_overcommit_weight=reward_cfg.fleet_overcommit_weight,
                         ),
                         event_turn=t,
                         discount=reward_cfg.delayed_reward_discount,
@@ -1223,6 +1279,7 @@ def collect_episode(
                             reward_scale=reward_cfg.reward_scale,
                             production_reward_beta=reward_cfg.production_reward_beta,
                             production_reward_reference=reward_cfg.production_reward_reference,
+                            ship_overcommit_weight=reward_cfg.fleet_overcommit_weight,
                         ),
                         event_turn=t,
                         discount=reward_cfg.delayed_reward_discount,

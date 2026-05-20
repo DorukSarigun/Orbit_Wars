@@ -24,7 +24,7 @@ from typing import Optional
 import torch
 
 from model import OrbitWarsPolicy
-from model_grouped_planet_edge import EdgeAwareGroupedPlanetOrbitWarsPolicy
+from model_grouped_planet_edge import EdgeAwareGroupedPlanetOrbitWarsPolicy, PairwiseEdgeGroupedPlanetOrbitWarsPolicy
 from model_grouped_planet import GroupedPlanetOrbitWarsPolicy
 from model_planet_only import PlanetOnlyOrbitWarsPolicy
 
@@ -83,6 +83,8 @@ def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
         return GroupedPlanetOrbitWarsPolicy(**kwargs)
     if variant == "grouped_planet_edge":
         return EdgeAwareGroupedPlanetOrbitWarsPolicy(**kwargs)
+    if variant == "grouped_planet_edge_pair":
+        return PairwiseEdgeGroupedPlanetOrbitWarsPolicy(**kwargs)
     kwargs.pop("attention_type", None)
     kwargs.pop("n_inducing_points", None)
     if variant == "planet_only":
@@ -129,7 +131,7 @@ def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int
             "planet_dim": policy.planet_dim,
             "d_model": policy.d_model,
             "n_heads": policy.n_heads,
-            "n_layers": len(policy.encoder.blocks) if getattr(policy, "model_variant", "full") in ("grouped_planet", "grouped_planet_edge") else len(policy.blocks),
+            "n_layers": len(policy.encoder.blocks) if getattr(policy, "model_variant", "full") in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair") else len(policy.blocks),
             "model_variant": getattr(policy, "model_variant", "full"),
             "attention_type": getattr(policy, "attention_type", "full"),
             "n_inducing_points": getattr(policy, "n_inducing_points", 32),
@@ -213,14 +215,14 @@ def train(
     optimizer = torch.optim.Adam(policy.parameters(), lr=train_cfg.learning_rate)
     n_params = sum(p.numel() for p in policy.parameters())
     variant = getattr(policy, "model_variant", "full")
-    if variant in ("grouped_planet", "grouped_planet_edge"):
+    if variant in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"):
         token_count = policy.p_max
     elif variant == "planet_only":
         token_count = policy.p_max + 1
     else:
         token_count = policy.p_max + policy.f_max + 1
     attention_info = ""
-    if variant in ("grouped_planet", "grouped_planet_edge"):
+    if variant in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"):
         attention_info = f", attention={policy.attention_type}, M={policy.n_inducing_points}"
     print(f"Policy[{variant}]: {n_params:,} params, T={token_count}{attention_info}, device={device}")
 
@@ -418,7 +420,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--grouped-attention-type", choices=("full", "induced"), default="full")
     p.add_argument("--n-inducing-points", type=int, default=32)
-    p.add_argument("--model-variant", choices=("full", "planet_only", "grouped_planet", "grouped_planet_edge"), default="planet_only")
+    p.add_argument("--model-variant", choices=("full", "planet_only", "grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"), default="planet_only")
     p.add_argument("--save-game-batches", action="store_true",
                    help="Save one .pt rollout/training batch per self-play game after GAE")
     p.add_argument("--batch-save-dir", default="checkpoints/game_batches")
@@ -472,6 +474,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--fleet-capture-weight", type=float, default=None)
     p.add_argument("--fleet-kill-weight", type=float, default=None)
     p.add_argument("--fleet-waste-weight", type=float, default=None)
+    p.add_argument("--fleet-overcommit-weight", type=float, default=None)
     p.add_argument("--enemy-capture-radius-weight", type=float, default=None)
     p.add_argument("--planet-loss-weight", type=float, default=None)
     p.add_argument("--planet-loss-credit-horizon", type=int, default=None)
@@ -483,6 +486,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--production-reinforcement-weight", type=float, default=None,
                    help="Legacy post-capture reinforcement bonus (DEPRECATED). "
                         "Default 0; setting > 0 re-enables the legacy behavior.")
+    p.add_argument("--production-upstream-credit-weight", type=float, default=None,
+                   help="1-hop upstream capture-credit weight for launches that reinforced "
+                        "a source planet before it launched a successful capture attack.")
+    p.add_argument("--production-upstream-credit-window", type=int, default=None,
+                   help="Max turns between support arrival and direct capture-launch turn "
+                        "for 1-hop upstream credit.")
     p.add_argument("--capture-time-curvature", type=float, default=None,
                    help="Power applied to ((max_turns - turn) / max_turns) "
                         "in capture/loss/defense-window time factor. "
@@ -577,12 +586,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         fleet_capture_weight=args.fleet_capture_weight,
         fleet_kill_weight=args.fleet_kill_weight,
         fleet_waste_weight=args.fleet_waste_weight,
+        fleet_overcommit_weight=args.fleet_overcommit_weight,
         enemy_capture_radius_weight=args.enemy_capture_radius_weight,
         planet_loss_weight=args.planet_loss_weight,
         planet_loss_credit_horizon=args.planet_loss_credit_horizon,
         capture_time_curvature=args.capture_time_curvature,
         defense_kills_weight=args.defense_kills_weight,
         production_reinforcement_weight=args.production_reinforcement_weight,
+        production_upstream_credit_weight=args.production_upstream_credit_weight,
+        production_upstream_credit_window=args.production_upstream_credit_window,
         ship_overflow_weight=args.ship_overflow_weight,
         defense_hold_weight=args.defense_hold_weight,
         defense_hold_horizon=args.defense_hold_horizon,

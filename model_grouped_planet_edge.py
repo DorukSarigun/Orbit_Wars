@@ -281,3 +281,102 @@ class EdgeAwareGroupedPlanetOrbitWarsPolicy(GroupedPlanetOrbitWarsPolicy):
             tokens=planet_tok,
             aux_owner_logits=aux_owner_logits,
         )
+
+
+class PairwiseEdgeGroupedPlanetOrbitWarsPolicy(EdgeAwareGroupedPlanetOrbitWarsPolicy):
+    def __init__(
+        self,
+        *,
+        p_max: int = P_MAX_DEFAULT,
+        f_max: int = 0,
+        planet_dim: int = PLANET_FEATURE_DIM,
+        global_dim: int = GLOBAL_FEATURE_DIM,
+        edge_dim: int = EDGE_FEATURE_DIM,
+        d_model: int = 256,
+        n_heads: int = 4,
+        n_layers: int = 6,
+        attention_type: str = "full",
+        n_inducing_points: int = 32,
+        dropout: float = 0.0,
+    ):
+        super().__init__(
+            p_max=p_max,
+            f_max=f_max,
+            planet_dim=planet_dim,
+            global_dim=global_dim,
+            edge_dim=edge_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            attention_type=attention_type,
+            n_inducing_points=n_inducing_points,
+            dropout=dropout,
+        )
+        self.model_variant = "grouped_planet_edge_pair"
+        del self.tgt_query
+        del self.tgt_key
+        del self.pair_edge_score
+        self.pair_score_head = nn.Sequential(
+            nn.Linear(4 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(
+        self,
+        planet_feats: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        global_feats: torch.Tensor,
+        edge_bias: torch.Tensor,
+        planet_mask: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        source_mask: torch.Tensor,
+    ) -> PolicyOutput:
+        enc = self.encoder.encode_planets(
+            planet_feats=planet_feats,
+            fleet_feats=fleet_feats,
+            global_feats=global_feats,
+            edge_bias=edge_bias,
+            planet_mask=planet_mask,
+            fleet_mask=fleet_mask,
+        )
+        planet_tok = enc["planet_tokens"]
+        global_summary = self.summary_head(torch.cat([
+            enc["global_summary"],
+            self.global_feat_proj(global_feats),
+        ], dim=-1))
+        global_per_planet = global_summary[:, None, :].expand(-1, self.p_max, -1)
+        src_input = torch.cat([planet_tok, global_per_planet], dim=-1)
+        source_launch = self.src_head(src_input).squeeze(-1)
+        noop_raw = self.noop_head(src_input).squeeze(-1)
+        very_neg = torch.finfo(noop_raw.dtype).min
+        source_launch = source_launch.masked_fill(~source_mask, very_neg)
+        noop_raw = noop_raw.masked_fill(~source_mask, very_neg)
+        noop = noop_raw.max(dim=1, keepdim=True).values
+        src_logits = torch.cat([noop_raw, noop], dim=1)
+
+        edge_pair = edge_bias[:, : self.p_max, : self.p_max, :]
+        edge_tok = self.pair_edge_proj(edge_pair)
+        src_pair = planet_tok[:, :, None, :].expand(-1, -1, self.p_max, -1)
+        tgt_pair = planet_tok[:, None, :, :].expand(-1, self.p_max, -1, -1)
+        global_pair = global_summary[:, None, None, :].expand(-1, self.p_max, self.p_max, -1)
+        pair_input = torch.cat([src_pair, tgt_pair, edge_tok, global_pair], dim=-1)
+        tgt_logits = self.pair_score_head(pair_input).squeeze(-1)
+        tgt_logits = tgt_logits + source_launch[:, :, None]
+        eye = torch.eye(self.p_max, dtype=torch.bool, device=planet_tok.device)
+        tgt_logits = tgt_logits.masked_fill(eye[None], very_neg)
+        tgt_logits = tgt_logits.masked_fill((~planet_mask)[:, None, :], very_neg)
+        tgt_logits = tgt_logits.masked_fill((~source_mask)[:, :, None], very_neg)
+
+        ship_params = self.ship_head(pair_input)
+        value = self.value_head(global_summary).squeeze(-1)
+        aux_owner_logits = self.aux_owner_head(planet_tok)
+
+        return PolicyOutput(
+            src_logits=src_logits,
+            tgt_logits=tgt_logits,
+            ship_params=ship_params,
+            value=value,
+            tokens=planet_tok,
+            aux_owner_logits=aux_owner_logits,
+        )

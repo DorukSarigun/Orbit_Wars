@@ -87,6 +87,7 @@ class RewardConfig:
     fleet_capture_weight: float = 0.05
     fleet_kill_weight: float = 0.001
     fleet_waste_weight: float = 0.0015
+    fleet_overcommit_weight: float = 0.0
     enemy_capture_radius_weight: float = 0.02
     planet_loss_weight: float = 0.05
     planet_loss_credit_horizon: int = 30
@@ -107,6 +108,8 @@ class RewardConfig:
     # a threat-aware replacement.
     production_reinforcement_weight: float = 0.0
     production_reinforcement_decay_window: int = 30
+    production_upstream_credit_weight: float = 0.2
+    production_upstream_credit_window: int = 50
     # Defense kills reward (threat-aware replacement for the legacy
     # reinforcement bonus). Tags my planets that have at least one enemy
     # fleet en route as 'under attack', then distributes the enemy ships
@@ -165,7 +168,7 @@ class RewardConfig:
 
 
 REWARD_SYSTEMS: tuple[str, ...] = (
-    "current", "aggressive", "production_simple", "production_diff",
+    "current", "aggressive", "production_simple", "production_diff", "production_only",
 )
 
 
@@ -194,6 +197,7 @@ def build_reward_config(reward_system: str = "current", **overrides) -> RewardCo
             fleet_capture_weight=0.0,
             fleet_kill_weight=0.0,
             fleet_waste_weight=0.0,
+            fleet_overcommit_weight=0.0,
             enemy_capture_radius_weight=0.0,
             planet_loss_weight=0.0,
             defense_hold_weight=0.0,
@@ -205,6 +209,34 @@ def build_reward_config(reward_system: str = "current", **overrides) -> RewardCo
             # Eligibility trace defaults. Reverse=True so older launches
             # (whose fleets are arriving NOW and producing the current
             # production-diff signal) receive the bulk of the credit.
+            eligibility_trace_horizon=30,
+            eligibility_trace_decay=0.9,
+            eligibility_trace_reverse=True,
+            noop_trace_weight=1.0,
+            delayed_reward_discount=1.0,
+            reward_scale=0.001,
+            draw_terminal_reward=0.0,
+        )
+    elif reward_system == "production_only":
+        cfg = RewardConfig(
+            reward_system="production_only",
+            capture_value_weight=0.0,
+            denial_value_weight=0.0,
+            ship_diff_weight=0.0,
+            ship_loss_weight=0.0,
+            fleet_airborne_weight=0.0,
+            fleet_capture_weight=0.0,
+            fleet_kill_weight=1.0,
+            fleet_waste_weight=0.0,
+            fleet_overcommit_weight=0.0,
+            enemy_capture_radius_weight=0.0,
+            planet_loss_weight=0.0,
+            defense_hold_weight=0.0,
+            ship_overflow_weight=0.0,
+            defense_kills_weight=0.0,
+            production_reinforcement_weight=0.0,
+            invalid_action_penalty=0.0,
+            planet_diff_weight=0.0,
             eligibility_trace_horizon=30,
             eligibility_trace_decay=0.9,
             eligibility_trace_reverse=True,
@@ -235,13 +267,17 @@ def build_reward_config(reward_system: str = "current", **overrides) -> RewardCo
             ship_loss_weight=0.0,
             # NOTE: airborne is risk-aware in rollout and intentionally
             # uses an unnormalized base weight in production_simple.
-            fleet_airborne_weight=1.0,
+            fleet_airborne_weight=2.0,
             fleet_capture_weight=0.0,
             fleet_kill_weight=1.0,
             fleet_waste_weight=1.0,
+            fleet_overcommit_weight=0.0,
             enemy_capture_radius_weight=0.0,
             planet_loss_weight=1.0,
             defense_hold_weight=0.0,
+            defense_kills_weight=0.05,
+            production_upstream_credit_weight=0.2,
+            production_upstream_credit_window=50,
             delayed_reward_discount=1.0,
             reward_scale=0.001,
             draw_terminal_reward=-1.0,

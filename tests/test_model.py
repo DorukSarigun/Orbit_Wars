@@ -23,7 +23,7 @@ from model_grouped_planet import (
     GroupedPlanetRelationEncoder,
     PlanetProjector,
 )
-from model_grouped_planet_edge import EdgeAwareGroupedPlanetOrbitWarsPolicy
+from model_grouped_planet_edge import EdgeAwareGroupedPlanetOrbitWarsPolicy, PairwiseEdgeGroupedPlanetOrbitWarsPolicy
 from model_planet_only import PlanetOnlyOrbitWarsPolicy
 
 
@@ -149,6 +149,34 @@ def test_edge_aware_grouped_planet_policy_forward_pass_shapes(batch):
 def test_edge_aware_grouped_planet_policy_rejects_induced_attention():
     with pytest.raises(ValueError, match="grouped_planet_edge supports only full attention"):
         EdgeAwareGroupedPlanetOrbitWarsPolicy(
+            p_max=8,
+            f_max=4,
+            d_model=32,
+            n_heads=2,
+            n_layers=2,
+            attention_type="induced",
+            n_inducing_points=4,
+        )
+
+
+def test_pairwise_edge_grouped_planet_policy_forward_pass_shapes(batch):
+    obs_list, b = batch
+    net = PairwiseEdgeGroupedPlanetOrbitWarsPolicy(p_max=8, f_max=4, d_model=32, n_heads=2, n_layers=2)
+    out = net(**b)
+    B = len(obs_list)
+    assert net.model_variant == "grouped_planet_edge_pair"
+    assert out.src_logits.shape == (B, 8 + 1)
+    assert out.tgt_logits.shape == (B, 8, 8)
+    assert out.ship_params.shape == (B, 8, 8, 2)
+    assert out.value.shape == (B,)
+    assert out.tokens.shape == (B, 8, 32)
+    assert out.aux_owner_logits.shape == (B, 8, 5)
+    assert "pair_score_head" in dict(net.named_modules())
+
+
+def test_pairwise_edge_grouped_planet_policy_rejects_induced_attention():
+    with pytest.raises(ValueError, match="grouped_planet_edge supports only full attention"):
+        PairwiseEdgeGroupedPlanetOrbitWarsPolicy(
             p_max=8,
             f_max=4,
             d_model=32,
