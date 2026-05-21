@@ -30,16 +30,21 @@ from feature_extraction import parse_planets, fleet_speed
 from obs_builder import (
     build_observation,
     decode_action,
+    decode_action_with_launch,
     INCOMING_ETA_BUCKETS,
     PF_IDX_SHIPS,
     PF_IDX_INCOMING_SELF_B0,
 )
-from model import OrbitWarsPolicy, pack_observations
+from model import OrbitWarsPolicy, pack_observations, _beta_concentrations
 
 from .train import load_checkpoint as load_ppo_checkpoint
 from .dqn_train import load_dqn_checkpoint
 from model_q import OrbitWarsQNet
 from playground import render_board
+from scripted_strategy import CaptureEfficiencyAgent, ScriptedConfig
+
+MAX_LAUNCHES_PER_PLAYER_TURN = 8
+MAX_PAIR_CANDIDATES = 64
 
 
 def _incoming_bucket_idx(eta: float) -> int:
@@ -81,23 +86,28 @@ def _act(net, env_obs, player: int, *,
         info_extra["v_state"] = (
             float(out.v_state[0].item()) if out.v_state is not None else None
         )
+        # DQN keeps a discrete ship_bin head; map bin -> ship_value [0,1]
+        # so it can call the (now continuous) decode_action.
+        n_bins = max(1, int(net.n_ship_bins))
+        ship_bin = int(action["ship_bin"][0])
+        ship_value = float(min(n_bins, ship_bin + 1)) / float(n_bins)
     else:
         with torch.no_grad():
             out = net(**batch)
             action = net.act(out, deterministic=deterministic)
         info_extra["value"] = float(out.value[0].item())
+        ship_value = float(action["ship_value"][0])
 
     src_slot = int(action["src"][0])
     tgt_slot = int(action["tgt"][0])
-    ship_bin = int(action["ship_bin"][0])
     is_noop = bool(action["is_noop"][0])
 
     parsed = parse_planets(env_obs)
-    move = decode_action(obs, src_slot, tgt_slot, ship_bin,
+    move = decode_action(obs, src_slot, tgt_slot, ship_value,
                          planets=parsed, angular_velocity=omega, no_op=is_noop)
     return [move] if move is not None else [], {
         "src_slot": src_slot, "tgt_slot": tgt_slot,
-        "ship_bin": ship_bin, "is_noop": is_noop,
+        "ship_value": ship_value, "is_noop": is_noop,
         **info_extra,
     }
 
@@ -120,6 +130,90 @@ def _act_all_sources(net, env_obs, player: int, *,
         source_mask=obs.source_mask.copy(),
     )
 
+    if getattr(net, "model_variant", "") in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"):
+        available_pairs = obs.planet_mask[None, :].repeat(net.p_max, axis=0)
+        available_pairs &= obs.source_mask[:, None]
+        available_pairs &= ~torch.eye(net.p_max, dtype=torch.bool).numpy()
+        while len(env_actions) < MAX_LAUNCHES_PER_PLAYER_TURN and any(bool(ok) for ok in obs_work.source_mask):
+            obs_decision = replace(
+                obs_work,
+                planet_feats=obs_work.planet_feats.copy(),
+                source_mask=obs_work.source_mask.copy(),
+            )
+            batch = pack_observations([obs_decision], device=device)
+            with torch.no_grad():
+                out = net(**batch)
+            selected = None
+            pair_logits = out.tgt_logits[0].clone()
+            pair_logits[~torch.as_tensor(available_pairs, device=pair_logits.device)] = torch.finfo(pair_logits.dtype).min
+            ranked = torch.topk(
+                pair_logits.reshape(-1),
+                k=min(MAX_PAIR_CANDIDATES, pair_logits.numel()),
+            ).indices.tolist()
+            for pair_idx in ranked:
+                src_slot = int(pair_idx // net.p_max)
+                tgt_slot = int(pair_idx % net.p_max)
+                if not bool(obs_decision.source_mask[src_slot]):
+                    continue
+                if not bool(obs_decision.planet_mask[tgt_slot]):
+                    continue
+                if src_slot == tgt_slot:
+                    continue
+                if not bool(available_pairs[src_slot, tgt_slot]):
+                    continue
+                # Continuous Beta head: sample ship_value once per pair.
+                # Use the deterministic mean alpha/(alpha+beta) for replay
+                # so episodes are reproducible. ship_params is either
+                # (B, p_max, p_max, 2) for grouped variants or (B, p_max, 2)
+                # for the source-only full variant.
+                if out.ship_params.dim() == 4:
+                    ship_params_sel = out.ship_params[0, src_slot, tgt_slot]
+                else:
+                    ship_params_sel = out.ship_params[0, src_slot]
+                alpha, beta = _beta_concentrations(ship_params_sel)
+                ship_value_sample = float((alpha / (alpha + beta)).item())
+                decoded = decode_action_with_launch(
+                    obs_decision, src_slot, tgt_slot, ship_value_sample,
+                    planets=parsed, angular_velocity=omega, no_op=False,
+                )
+                if decoded is not None:
+                    selected = (src_slot, tgt_slot, ship_value_sample, decoded)
+                    break
+            if selected is None:
+                break
+            src_slot, tgt_slot, ship_value, decoded = selected
+            move, launch_info = decoded
+            env_actions.append(move)
+            sent_ships = float(move[2])
+            obs_work.planet_feats[src_slot, PF_IDX_SHIPS] = max(
+                0.0, obs_work.planet_feats[src_slot, PF_IDX_SHIPS] - sent_ships / 100.0
+            )
+            src_planet_id = int(obs_decision.planet_ids[src_slot])
+            src_planet = next((p for p in parsed if p.id == src_planet_id), None)
+            if src_planet is not None:
+                src_planet.ships = max(0, int(round(float(obs_work.planet_feats[src_slot, PF_IDX_SHIPS]) * 100.0)))
+            eta = float(launch_info["eta"]) if launch_info is not None else 0.0
+            if eta <= 0.0:
+                tgt_planet_id = int(obs_decision.planet_ids[tgt_slot])
+                tgt_planet = next((p for p in parsed if p.id == tgt_planet_id), None)
+                if src_planet and tgt_planet:
+                    distance = ((src_planet.x - tgt_planet.x) ** 2 + (src_planet.y - tgt_planet.y) ** 2) ** 0.5
+                    eta = distance / max(fleet_speed(int(sent_ships)), 1e-6)
+            bucket = _incoming_bucket_idx(eta)
+            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 100.0
+            obs_work.source_mask[src_slot] = obs_work.planet_feats[src_slot, PF_IDX_SHIPS] > 0.01
+            available_pairs[src_slot, tgt_slot] = False
+            if not bool(obs_work.source_mask[src_slot]):
+                available_pairs[src_slot, :] = False
+            infos.append({
+                "src_slot": src_slot,
+                "tgt_slot": tgt_slot,
+                "ship_value": ship_value,
+                "is_noop": False,
+                "value": float(out.value[0].item()),
+            })
+        return env_actions, infos
+
     for src_slot in [int(i) for i, ok in enumerate(obs.source_mask) if ok]:
         obs_decision = replace(
             obs_work,
@@ -136,10 +230,10 @@ def _act_all_sources(net, env_obs, player: int, *,
             )
 
         tgt_slot = int(action["tgt"][0])
-        ship_bin = int(action["ship_bin"][0])
+        ship_value = float(action["ship_value"][0])
         is_noop = bool(action["is_noop"][0])
         move = decode_action(
-            obs_decision, src_slot, tgt_slot, ship_bin,
+            obs_decision, src_slot, tgt_slot, ship_value,
             planets=parsed, angular_velocity=omega, no_op=is_noop,
         )
         if move is not None:
@@ -157,12 +251,12 @@ def _act_all_sources(net, env_obs, player: int, *,
                 distance = ((src_planet.x - tgt_planet.x) ** 2 + (src_planet.y - tgt_planet.y) ** 2) ** 0.5
             eta = distance / max(fleet_speed(int(sent_ships)), 1e-6)
             bucket = _incoming_bucket_idx(eta)
-            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 500.0
+            obs_work.planet_feats[tgt_slot, PF_IDX_INCOMING_SELF_B0 + bucket] += sent_ships / 100.0
         obs_work.source_mask[src_slot] = False
         infos.append({
             "src_slot": src_slot,
             "tgt_slot": tgt_slot,
-            "ship_bin": ship_bin,
+            "ship_value": ship_value,
             "is_noop": is_noop,
             "value": float(out.value[0].item()),
         })
@@ -186,6 +280,28 @@ def _planet_counts_by_owner(env_obs: dict, num_agents: int) -> dict:
     return counts
 
 
+def _act_dispatch(net, env_obs, player: int, *, deterministic: bool,
+                  device: torch.device, opponent_indices: set,
+                  scripted_agent: Optional[CaptureEfficiencyAgent],
+                  current_turn: int, max_turns: int) -> tuple:
+    """Pick an action for `player`. Scripted slots get scripted actions;
+    everyone else uses the loaded policy/Q-net.
+
+    Returns the same tuple shape as `_act_all_sources` so callers can
+    treat both paths uniformly: `(actions, info_extra)`.
+    """
+    if player in opponent_indices and scripted_agent is not None:
+        actions = scripted_agent.act(
+            env_obs, player=player,
+            current_turn=int(current_turn), max_turns=int(max_turns),
+        )
+        return actions, {"scripted": True, "n_launches": len(actions)}
+    return _act_all_sources(
+        net, env_obs, player,
+        deterministic=deterministic, device=device,
+    )
+
+
 def play_self_play_game(
     policy: OrbitWarsPolicy,
     *,
@@ -197,6 +313,8 @@ def play_self_play_game(
     seed: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
+    opponent_indices: Optional[set[int]] = None,
+    scripted_cfg: Optional[ScriptedConfig] = None,
 ) -> dict:
     """Play one self-play game. Returns summary dict.
 
@@ -205,6 +323,10 @@ def play_self_play_game(
     """
     device = device or torch.device("cpu")
     policy.eval().to(device)
+    opponent_indices = set(opponent_indices) if opponent_indices else set()
+    scripted_agent: Optional[CaptureEfficiencyAgent] = (
+        CaptureEfficiencyAgent(scripted_cfg) if opponent_indices else None
+    )
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
@@ -219,9 +341,12 @@ def play_self_play_game(
 
     for t in range(max_steps):
         acted = [
-            _act_all_sources(
+            _act_dispatch(
                 policy, state[p]["observation"], p,
                 deterministic=deterministic, device=device,
+                opponent_indices=opponent_indices,
+                scripted_agent=scripted_agent,
+                current_turn=t, max_turns=max_steps,
             )
             for p in range(num_agents)
         ]
@@ -272,6 +397,8 @@ def record_game_html(
     seed: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
+    opponent_indices: Optional[set[int]] = None,
+    scripted_cfg: Optional[ScriptedConfig] = None,
 ) -> dict:
     """Play one game, write kaggle_environments' native interactive HTML
     replay to `out_path`, and return a summary dict.
@@ -281,6 +408,10 @@ def record_game_html(
     """
     device = device or torch.device("cpu")
     net.eval().to(device)
+    opponent_indices = set(opponent_indices) if opponent_indices else set()
+    scripted_agent: Optional[CaptureEfficiencyAgent] = (
+        CaptureEfficiencyAgent(scripted_cfg) if opponent_indices else None
+    )
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
@@ -290,9 +421,12 @@ def record_game_html(
 
     for t in range(max_steps):
         acted = [
-            _act_all_sources(
+            _act_dispatch(
                 net, state[p]["observation"], p,
                 deterministic=deterministic, device=device,
+                opponent_indices=opponent_indices,
+                scripted_agent=scripted_agent,
+                current_turn=t, max_turns=max_steps,
             )
             for p in range(num_agents)
         ]
@@ -341,11 +475,23 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--games", type=int, default=1,
                    help="Number of games to play/record (with --html, each "
                         "becomes a separate file PATH_NNN.html).")
+    p.add_argument("--opponent", choices=["self_play", "scripted"],
+                   default="self_play",
+                   help="self_play (default): all slots use the loaded "
+                        "policy. scripted: slot 0 = policy, all other "
+                        "slots = CaptureEfficiencyAgent (matches "
+                        "training-vs-scripted setup).")
     p.add_argument("--device", default="cpu")
     args = p.parse_args(argv)
 
     net, kind, _ = load_any_checkpoint(args.ckpt, device=torch.device(args.device))
     print(f"Loaded {kind.upper()} checkpoint: {sum(p.numel() for p in net.parameters()):,} params")
+
+    opponent_indices: set[int] = set()
+    if args.opponent == "scripted":
+        opponent_indices = set(range(1, args.num_agents))
+        print(f"Opponent slots (scripted): {sorted(opponent_indices)} | "
+              f"Policy slots: [0]")
 
     if args.html:
         base = Path(args.html)
@@ -359,6 +505,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 net, out, max_steps=args.max_steps,
                 deterministic=args.deterministic, num_agents=args.num_agents, seed=seed,
                 device=torch.device(args.device),
+                opponent_indices=opponent_indices,
             )
         return
 
@@ -371,6 +518,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         num_agents=args.num_agents,
         seed=args.seed,
         device=torch.device(args.device),
+        opponent_indices=opponent_indices,
     )
 
 

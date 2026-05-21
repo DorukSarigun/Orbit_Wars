@@ -71,6 +71,14 @@ class RewardConfig:
     # reward go to zero; 0.1 keeps a baseline so terminal captures still
     # register a small signal.
     time_decay_floor: float = 0.0
+    # Power applied to the *normalized* remaining-time fraction
+    # ((max_turns - turn) / max_turns) before the (max_turns) scale is
+    # restored. curvature=1.0 matches the legacy linear decay; values
+    # > 1.0 amplify the EARLY/LATE reward ratio, biasing the policy
+    # toward early captures (and symmetrically penalizing early losses).
+    # Affects both `current`/`aggressive` step-shaping and
+    # `production_simple` capture/loss/defense-window credit.
+    capture_time_curvature: float = 1.0
 
     # ---- Auxiliary fast-feedback signals ----
     ship_diff_weight: float = 0.0005    # per ship advantage delta (normalized by 100)
@@ -79,13 +87,56 @@ class RewardConfig:
     fleet_capture_weight: float = 0.05
     fleet_kill_weight: float = 0.001
     fleet_waste_weight: float = 0.0015
+    fleet_overcommit_weight: float = 0.0
     enemy_capture_radius_weight: float = 0.02
     planet_loss_weight: float = 0.05
     planet_loss_credit_horizon: int = 30
+    # Defense-Window credit assignment for planet loss (Tasarım 2). Used
+    # only by the production_simple reward system. The penalty is split:
+    #   depart_share to launches FROM the lost planet (took ships away)
+    #   hold_share   to passive holds (NO-OP / kept ships at planet)
+    # If only one side has records in window, it absorbs the full share.
+    planet_defense_horizon: int = 30
+    planet_defense_depart_share: float = 0.7
+    planet_defense_hold_share: float = 0.3
+    # Sorun 1 (DEPRECATED): post-capture reinforcement reward. The legacy
+    # mechanism unconditionally rewarded ships_sent toward a freshly
+    # captured planet, even when the planet was sitting idle with no
+    # threat. PPO learned to pile ships onto safe planets ("blue team
+    # passing fleets back and forth" exploit). Default weight is now 0
+    # so the reward never fires; use `defense_kills_weight` (below) for
+    # a threat-aware replacement.
+    production_reinforcement_weight: float = 0.0
+    production_reinforcement_decay_window: int = 30
+    production_upstream_credit_weight: float = 0.2
+    production_upstream_credit_window: int = 50
+    # Defense kills reward (threat-aware replacement for the legacy
+    # reinforcement bonus). Tags my planets that have at least one enemy
+    # fleet en route as 'under attack', then distributes the enemy ships
+    # killed during the resulting combat to my launches that targeted the
+    # planet AND arrived before/during the combat. Reward magnitude per
+    # defender = enemy_killed * (ships_sent / total_eligible_ships)
+    # * defense_kills_weight * reward_scale.
+    defense_kills_weight: float = 0.001
+    # Sorun 2: capture-then-lose clawback. When a captured planet is
+    # lost within `clawback_window` turns of capture, a fraction of the
+    # original capture reward is returned (negative reward) to the
+    # original capturing transitions. Magnitude is decayed linearly with
+    # the gap between capture and loss.
+    production_capture_clawback_window: int = 30
+    production_capture_clawback_fraction: float = 0.5
+    # Continuous Beta ship head: the policy can request more ships than the
+    # source planet has. The env clamps to `available`, but we still
+    # penalize the over-allocation so the agent learns to track its own
+    # garrison. Penalty per turn = -ship_overflow_weight * overflow_ships
+    # * reward_scale (i.e. per-ship overshoot, same scale as defense_deficit).
+    ship_overflow_weight: float = 1.0
     defense_hold_weight: float = 0.001
     defense_hold_horizon: int = 15
     defense_arrival_window: float = 1.5
     delayed_reward_discount: float = 1.0
+    production_reward_beta: float = 0.0
+    production_reward_reference: float = 3.0
     invalid_action_penalty: float = 0.01
     reward_scale: float = 1.0
     draw_terminal_reward: float = 0.0
@@ -97,6 +148,15 @@ class RewardConfig:
     eligibility_trace_horizon: int = 0
     eligibility_trace_decay: float = 0.0
     noop_trace_weight: float = 0.0
+    # If True, the eligibility trace assigns MORE credit to OLDER actions in
+    # the trace window and LESS to the most recent ones. This is the right
+    # default for delayed-effect domains like Orbit Wars where a fleet
+    # launched ~30 turns ago is what's currently producing the
+    # production-diff signal, while a launch made this turn has not yet
+    # arrived. Weight at lookback k (0 = current, L-1 = oldest in window):
+    #   forward  : decay^k          -> recent gets max
+    #   reverse  : decay^(L-1-k)    -> oldest gets max
+    eligibility_trace_reverse: bool = False
 
     # ---- Legacy / backward-compatible ----
     # Un-weighted planet count differential (superseded by capture-value).
@@ -107,12 +167,84 @@ class RewardConfig:
     shape_on_terminal: bool = False
 
 
-REWARD_SYSTEMS: tuple[str, ...] = ("current", "aggressive", "production_simple")
+REWARD_SYSTEMS: tuple[str, ...] = (
+    "current", "aggressive", "production_simple", "production_diff", "production_only",
+)
 
 
 def build_reward_config(reward_system: str = "current", **overrides) -> RewardConfig:
     if reward_system == "current":
         cfg = RewardConfig(reward_system="current")
+    elif reward_system == "production_diff":
+        # Minimal "production differential + eligibility trace" system.
+        # Per-step reward = (sum_my_production - sum_opp_production / num_opp)
+        #                   * reward_scale
+        # That single scalar is then distributed back to launch transitions
+        # over the last `eligibility_trace_horizon` turns with exponential
+        # decay (`eligibility_trace_decay`). NO-OP credit is scaled by
+        # `noop_trace_weight`. ALL legacy tracker channels (capture, defense
+        # kills, planet defense, fleet combat, airborne, overflow,
+        # defense_deficit, ...) are disabled here so the reward landscape
+        # is exactly: dense production diff + terminal +/-1.
+        cfg = RewardConfig(
+            reward_system="production_diff",
+            # All shaping channels off.
+            capture_value_weight=0.0,
+            denial_value_weight=0.0,
+            ship_diff_weight=0.0,
+            ship_loss_weight=0.0,
+            fleet_airborne_weight=0.0,
+            fleet_capture_weight=0.0,
+            fleet_kill_weight=0.0,
+            fleet_waste_weight=0.0,
+            fleet_overcommit_weight=0.0,
+            enemy_capture_radius_weight=0.0,
+            planet_loss_weight=0.0,
+            defense_hold_weight=0.0,
+            ship_overflow_weight=0.0,
+            defense_kills_weight=0.0,
+            production_reinforcement_weight=0.0,
+            invalid_action_penalty=0.0,
+            planet_diff_weight=0.0,
+            # Eligibility trace defaults. Reverse=True so older launches
+            # (whose fleets are arriving NOW and producing the current
+            # production-diff signal) receive the bulk of the credit.
+            eligibility_trace_horizon=30,
+            eligibility_trace_decay=0.9,
+            eligibility_trace_reverse=True,
+            noop_trace_weight=1.0,
+            delayed_reward_discount=1.0,
+            reward_scale=0.001,
+            draw_terminal_reward=0.0,
+        )
+    elif reward_system == "production_only":
+        cfg = RewardConfig(
+            reward_system="production_only",
+            capture_value_weight=0.0,
+            denial_value_weight=0.0,
+            ship_diff_weight=0.0,
+            ship_loss_weight=0.0,
+            fleet_airborne_weight=0.0,
+            fleet_capture_weight=0.0,
+            fleet_kill_weight=1.0,
+            fleet_waste_weight=0.0,
+            fleet_overcommit_weight=0.0,
+            enemy_capture_radius_weight=0.0,
+            planet_loss_weight=0.0,
+            defense_hold_weight=0.0,
+            ship_overflow_weight=0.0,
+            defense_kills_weight=0.0,
+            production_reinforcement_weight=0.0,
+            invalid_action_penalty=0.0,
+            planet_diff_weight=0.0,
+            eligibility_trace_horizon=30,
+            eligibility_trace_decay=0.9,
+            eligibility_trace_reverse=True,
+            noop_trace_weight=1.0,
+            delayed_reward_discount=1.0,
+            reward_scale=0.001,
+            draw_terminal_reward=0.0,
+        )
     elif reward_system == "aggressive":
         cfg = RewardConfig(
             reward_system="aggressive",
@@ -135,13 +267,17 @@ def build_reward_config(reward_system: str = "current", **overrides) -> RewardCo
             ship_loss_weight=0.0,
             # NOTE: airborne is risk-aware in rollout and intentionally
             # uses an unnormalized base weight in production_simple.
-            fleet_airborne_weight=1.0,
+            fleet_airborne_weight=2.0,
             fleet_capture_weight=0.0,
             fleet_kill_weight=1.0,
             fleet_waste_weight=1.0,
+            fleet_overcommit_weight=0.0,
             enemy_capture_radius_weight=0.0,
             planet_loss_weight=1.0,
             defense_hold_weight=0.0,
+            defense_kills_weight=0.05,
+            production_upstream_credit_weight=0.2,
+            production_upstream_credit_window=50,
             delayed_reward_discount=1.0,
             reward_scale=0.001,
             draw_terminal_reward=-1.0,
@@ -169,6 +305,25 @@ def _planet_value(p, kind: str) -> float:
     if kind == "production":
         return float(p.production)
     raise ValueError(f"Unknown capture_value_kind: {kind!r} (use 'production' or 'radius')")
+
+
+def curved_time_factor(max_turns: int, turn: int, *,
+                       curvature: float = 1.0,
+                       floor_norm: float = 0.0) -> float:
+    """Time-decay factor with optional super-linear curvature.
+
+    Returns ``max_turns * max(floor_norm, ((max_turns - turn) / max_turns) ** curvature)``.
+
+    With ``curvature=1.0`` this matches the legacy linear ``max_turns - turn``
+    (modulo the ``floor_norm`` clamp). Values > 1.0 keep the t=0 peak at
+    ``max_turns`` but accelerate the dropoff toward t=max_turns, so the
+    EARLY-vs-LATE reward ratio grows without inflating the per-capture
+    scale (PPO value head stays well-behaved).
+    """
+    T = max(1, int(max_turns))
+    remaining_norm = max(0.0, (T - int(turn)) / T)
+    decayed = remaining_norm ** max(0.0, float(curvature))
+    return max(float(floor_norm), decayed) * float(T)
 
 
 def _capture_value_components(prev_env_obs, curr_env_obs, player: int, *,
@@ -258,9 +413,14 @@ def compute_step_reward(
     cfg = cfg or RewardConfig()
 
     # ---- Time-decay factor (1.0 at start, -> floor at end of game) ----
+    # Curvature > 1.0 amplifies the early/late reward ratio (capture
+    # *and* loss are weighted by the same factor, so symmetry is
+    # preserved automatically inside _capture_value_components).
     turn = _current_turn(curr_env_obs)
-    raw_factor = max(0.0, (cfg.max_turns - turn) / max(1, cfg.max_turns))
-    time_factor = max(cfg.time_decay_floor, raw_factor)
+    T = max(1, int(cfg.max_turns))
+    raw_factor = max(0.0, (T - turn) / T)
+    curved = raw_factor ** max(0.0, float(cfg.capture_time_curvature))
+    time_factor = max(cfg.time_decay_floor, curved)
 
     # ---- Primary capture-value shaping (production-weighted, time-decayed) ----
     # gain   = +production captured by me (mine grows)

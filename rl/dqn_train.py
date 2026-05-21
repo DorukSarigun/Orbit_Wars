@@ -106,8 +106,16 @@ def _act_q(
     ship_bin = int(actions["ship_bin"][0])
     is_noop = bool(actions["is_noop"][0])
 
+    # PPO switched its launch head to a continuous Beta distribution and
+    # decode_action now expects ship_value in [0, 1]. DQN keeps its
+    # discrete bin head (Q-learning needs enumerable actions); we map
+    # bin_idx in [0, n_bins-1] to the upper edge of that bucket so each
+    # bin still corresponds to a distinct request fraction of the cap.
+    n_bins = max(1, int(online.n_ship_bins))
+    ship_value = float(min(n_bins, ship_bin + 1)) / float(n_bins)
+
     parsed = parse_planets(env_obs)
-    move = decode_action(obs, src_slot, tgt_slot, ship_bin,
+    move = decode_action(obs, src_slot, tgt_slot, ship_value,
                          planets=parsed, angular_velocity=omega, no_op=is_noop)
     env_action = [move] if move is not None else []
     return obs, src_slot, tgt_slot, ship_bin, is_noop, env_action

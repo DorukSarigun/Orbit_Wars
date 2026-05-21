@@ -15,6 +15,7 @@ from rl.fleet_tracker import (
     FleetOutcome,
     FleetTracker,
     compute_fleet_reward,
+    compute_production_only_fleet_kill_reward,
     compute_production_simple_fleet_combat_reward,
 )
 from rl.planet_loss_tracker import (
@@ -22,18 +23,31 @@ from rl.planet_loss_tracker import (
     PlanetLossTracker,
     compute_planet_loss_launch_penalty,
 )
+from rl.planet_defense_tracker import PlanetDefenseTracker
 from rl.production_reward_tracker import (
     ProductionRewardTracker,
     ProductionCaptureOutcome,
+    ProductionUpstreamCaptureOutcome,
+    ProductionNeutralGiftOutcome,
+    ProductionReinforcementOutcome,
+    ProductionCaptureClawbackOutcome,
     compute_production_capture_reward,
+    compute_production_upstream_capture_reward,
+    compute_production_neutral_gift_penalty,
+    compute_production_reinforcement_reward,
+    compute_production_capture_clawback,
+    production_reward_value,
 )
 from rl.rollout import (
     _airborne_risk_multiplier,
     _compute_airborne_cost,
     _compute_source_defense_deficit_penalty,
+    _compute_source_defense_shortfall,
+    _production_trace_reward,
 )
 from rl.replay import ReplayBuffer, DQNTransition
 from rl.rewards import REWARD_SYSTEMS, RewardConfig, build_reward_config, compute_step_reward, normalize_terminal_rewards
+from rl.train import TrainConfig, _episode_num_agents, _parse_num_agent_choices
 from rl.metrics import (
     WeightSnapshot, grad_norms_by_module, weight_norms_by_module,
 )
@@ -82,7 +96,7 @@ class TestEvaluateActions:
             out = net(**batch)
             action = net.act(out, deterministic=False)
 
-        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_bin"])
+        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_value"])
         assert torch.allclose(ev["log_prob"], action["log_prob"], atol=1e-5)
 
     def test_entropy_is_nonnegative(self):
@@ -92,7 +106,7 @@ class TestEvaluateActions:
         batch = pack_observations([obs])
         out = net(**batch)
         action = net.act(out)
-        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_bin"])
+        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_value"])
         assert (ev["entropy"] >= 0).all()
 
     def test_gradient_flows(self):
@@ -103,7 +117,7 @@ class TestEvaluateActions:
         batch = pack_observations([obs])
         out = net(**batch)
         action = net.act(out)
-        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_bin"])
+        ev = net.evaluate_actions(out, action["src"], action["tgt"], action["ship_value"])
         loss = -ev["log_prob"].sum()
         loss.backward()
         any_grad = any(p.grad is not None and p.grad.abs().sum() > 0
@@ -120,8 +134,8 @@ class TestEvaluateActions:
         # Force a NO-OP action.
         src = torch.tensor([net.p_max], dtype=torch.long)
         tgt = torch.tensor([0], dtype=torch.long)
-        ship = torch.tensor([0], dtype=torch.long)
-        ev = net.evaluate_actions(out, src, tgt, ship)
+        ship_value = torch.tensor([0.5], dtype=torch.float32)
+        ev = net.evaluate_actions(out, src, tgt, ship_value)
         # log_prob should equal log_softmax(src_logits)[NOOP].
         from torch.distributions import Categorical
         expected = Categorical(logits=out.src_logits).log_prob(src)
@@ -139,7 +153,7 @@ def _dummy_transition(reward: float = 0.0, done: bool = False, p_max: int = 4,
         global_feats=obs.global_feats, edge_bias=obs.edge_bias,
         planet_mask=obs.planet_mask, fleet_mask=obs.fleet_mask,
         source_mask=obs.source_mask,
-        src=0, tgt=1, ship_bin=2, is_noop=False,
+        src=0, tgt=1, ship_value=0.5, is_noop=False,
         log_prob=-1.5, value=0.1,
         reward=reward, done=done,
     )
@@ -314,13 +328,13 @@ class TestDefenseTracker:
 
 
 class TestFleetReward:
-    def test_airborne_cost_scales_with_ships_and_eta(self):
+    def test_airborne_cost_uses_distance_dependent_eta(self):
         assert _compute_airborne_cost(
-            ships_sent=20,
-            est_distance=40.0,
-            weight=0.00002,
+            ships_sent=10,
+            est_distance=20.0,
+            weight=1.0,
             speed=1.0,
-        ) == pytest.approx(-0.016, abs=1e-6)
+        ) == pytest.approx(-200.0, abs=1e-6)
 
     def test_capture_reward_is_positive(self):
         outcome = FleetOutcome(
@@ -379,7 +393,7 @@ class TestFleetReward:
 
 
 class TestProductionSimpleFleetCombatReward:
-    def test_failed_attack_is_empire_relative(self):
+    def test_failed_attack_penalizes_wasted_ships(self):
         # Same 20-ship loss; different empires get very different penalties.
         big_empire = FleetOutcome(
             captured_planet=False,
@@ -399,10 +413,10 @@ class TestProductionSimpleFleetCombatReward:
             own_waste=20.0,
             my_total_ships_at_launch=50,
         )
-        assert compute_production_simple_fleet_combat_reward(big_empire) == pytest.approx(0.0, abs=1e-6)
-        assert compute_production_simple_fleet_combat_reward(small_empire) == pytest.approx(0.0, abs=1e-6)
+        assert compute_production_simple_fleet_combat_reward(big_empire) == pytest.approx(-0.02, abs=1e-6)
+        assert compute_production_simple_fleet_combat_reward(small_empire) == pytest.approx(-0.02, abs=1e-6)
 
-    def test_enemy_capture_combat_signal_uses_same_denominator(self):
+    def test_enemy_capture_combat_signal_rewards_kills(self):
         outcome = FleetOutcome(
             captured_planet=True,
             killed_enemy_ships=False,
@@ -413,7 +427,56 @@ class TestProductionSimpleFleetCombatReward:
             enemy_ships_killed=20.0,
             my_total_ships_at_launch=100,
         )
-        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(0.0002, abs=1e-6)
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(0.02, abs=1e-6)
+
+    def test_enemy_kill_is_positive_when_empire_is_stronger(self):
+        outcome = FleetOutcome(
+            captured_planet=False,
+            killed_enemy_ships=True,
+            destroyed_enroute=False,
+            self_reinforce=False,
+            enemy_ships_killed=20.0,
+            my_total_ships_at_launch=200,
+            enemy_total_ships_at_launch=100,
+        )
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(0.04, abs=1e-6)
+
+    def test_enemy_kill_is_positive_but_reduced_when_empire_is_weaker(self):
+        outcome = FleetOutcome(
+            captured_planet=False,
+            killed_enemy_ships=True,
+            destroyed_enroute=False,
+            self_reinforce=False,
+            enemy_ships_killed=20.0,
+            my_total_ships_at_launch=100,
+            enemy_total_ships_at_launch=200,
+        )
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(0.01, abs=1e-6)
+
+    def test_enemy_kill_uses_base_value_when_empires_are_equal(self):
+        outcome = FleetOutcome(
+            captured_planet=False,
+            killed_enemy_ships=True,
+            destroyed_enroute=False,
+            self_reinforce=False,
+            enemy_ships_killed=20.0,
+            my_total_ships_at_launch=100,
+            enemy_total_ships_at_launch=100,
+        )
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(0.02, abs=1e-6)
+
+    def test_failed_enemy_attack_nets_kills_against_waste(self):
+        outcome = FleetOutcome(
+            captured_planet=False,
+            killed_enemy_ships=True,
+            destroyed_enroute=False,
+            self_reinforce=False,
+            enemy_ships_killed=20.0,
+            own_waste=50.0,
+            my_total_ships_at_launch=100,
+            enemy_total_ships_at_launch=100,
+        )
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(-0.03, abs=1e-6)
 
     def test_self_reinforce_returns_zero(self):
         outcome = FleetOutcome(
@@ -426,8 +489,7 @@ class TestProductionSimpleFleetCombatReward:
         )
         assert compute_production_simple_fleet_combat_reward(outcome) == 0.0
 
-    def test_zero_empire_falls_back_to_default_denominator(self):
-        # If empire ships were never recorded, fall back to the legacy /100.
+    def test_destroyed_enroute_penalizes_wasted_ships(self):
         outcome = FleetOutcome(
             captured_planet=False,
             killed_enemy_ships=False,
@@ -436,7 +498,7 @@ class TestProductionSimpleFleetCombatReward:
             own_waste=20.0,
             my_total_ships_at_launch=0,
         )
-        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(-0.0002, abs=1e-6)
+        assert compute_production_simple_fleet_combat_reward(outcome) == pytest.approx(-0.02, abs=1e-6)
 
 
 class TestFleetTrackerMultiFleetAttribution:
@@ -531,7 +593,50 @@ class TestFleetTrackerMultiFleetAttribution:
         resolved = list(tracker.pop_resolved(0))
         for _, outcome in resolved:
             r = compute_production_simple_fleet_combat_reward(outcome)
-            assert r == pytest.approx((outcome.enemy_ships_killed / 500.0) * 0.001, abs=1e-6)
+            assert r == pytest.approx(outcome.enemy_ships_killed * 0.001, abs=1e-6)
+
+    def test_accidental_comet_capture_reports_actual_target(self):
+        tracker = FleetTracker()
+        tracker.register_launch(
+            buffer_idx=1, launch_turn=0, player=0,
+            src_planet_id=0, tgt_planet_id=2, ships_sent=10, angle=0.0,
+            est_distance=90.0, launch_tgt_owner=-1, launch_tgt_ships=20,
+            my_total_ships_at_launch=100,
+        )
+        active = {
+            "planets": [
+                [0, 0, 0.0, 50.0, 2.0, 100, 3],
+                [2, -1, 90.0, 50.0, 2.0, 20, 1],
+                [3, -1, 30.0, 50.0, 2.0, 5, 2],
+            ],
+            "fleets": [[99, 0, 10.0, 50.0, 0.0, 0, 10]],
+            "initial_planets": [
+                [0, 0, 0.0, 50.0, 2.0, 100, 3],
+                [2, -1, 90.0, 50.0, 2.0, 20, 1],
+                [3, -1, 30.0, 50.0, 2.0, 5, 2],
+            ],
+            "comet_planet_ids": [3],
+            "comets": [],
+        }
+        arrived = {
+            **active,
+            "planets": [
+                [0, 0, 0.0, 50.0, 2.0, 100, 3],
+                [2, -1, 90.0, 50.0, 2.0, 20, 1],
+                [3, 0, 30.0, 50.0, 2.0, 5, 2],
+            ],
+            "fleets": [],
+        }
+        tracker.observe_turn(turn=1, env_obs=active, player=0)
+        tracker.observe_turn(turn=2, env_obs=arrived, player=0)
+        resolved = list(tracker.pop_resolved(0))
+        assert len(resolved) == 1
+        _, outcome = resolved[0]
+        assert outcome.captured_planet
+        assert outcome.intended_tgt_planet_id == 2
+        assert outcome.actual_tgt_planet_id == 3
+        assert outcome.actual_tgt_owner == -1
+        assert outcome.actual_tgt_ships == 5
 
     def test_multi_fleet_failed_attack_splits_damage(self):
         """Two fleets fail against heavily defended enemy. Each fleet dies,
@@ -783,33 +888,308 @@ class TestPlanetLossTracker:
         assert list(tracker.pop_resolved(0)) == []
 
 
+class TestPlanetDefenseTracker:
+    """Defense Window credit assignment for planet loss (Tasarım 2)."""
+
+    def _flip_p0_to_enemy(self):
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        curr["planets"][0][1] = 1   # P0 ownership flips 0 -> 1
+        curr["planets"][0][5] = 25  # leftover ships (irrelevant for tracker)
+        return prev, curr
+
+    def test_depart_only_absorbs_full_penalty_split_by_ships(self):
+        """When only DEPART actions are recorded, they share the full
+        (depart_share + hold_share) = 1.0 penalty proportional to ships."""
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(
+            horizon=30, depart_share=0.7, hold_share=0.3,
+            max_turns=500, num_opponents=1,
+        )
+        # Two launches FROM planet 0 with ratio 1:3
+        tracker.register_depart(buffer_idx=10, player=0,
+                                src_planet_id=0, turn=4, ships_sent=10)
+        tracker.register_depart(buffer_idx=11, player=0,
+                                src_planet_id=0, turn=4, ships_sent=30)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        resolved = list(tracker.pop_resolved(0))
+        # loss_value = production(3) * remaining(495) * opp_mult(3/2) * 0.001 * 1.0
+        loss_value = 3.0 * 495 * 1.5 * 0.001 * 1.0
+        # Full share since no holds present.
+        full_share = 0.7 + 0.3
+        expected = {
+            10: -loss_value * full_share * (10 / 40),
+            11: -loss_value * full_share * (30 / 40),
+        }
+        assert {idx: r for idx, r in resolved} == pytest.approx(expected, abs=1e-6)
+
+    def test_hold_only_absorbs_full_penalty(self):
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(
+            horizon=30, depart_share=0.7, hold_share=0.3,
+            max_turns=500, num_opponents=1,
+        )
+        tracker.register_hold(buffer_idx=20, player=0,
+                              planet_id=0, turn=4, ships_held=100)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        resolved = list(tracker.pop_resolved(0))
+        loss_value = 3.0 * 495 * 1.5 * 0.001 * 1.0
+        # Full share absorbed by single hold.
+        assert resolved == [(20, pytest.approx(-loss_value, abs=1e-6))]
+
+    def test_depart_and_hold_split_per_configured_shares(self):
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(
+            horizon=30, depart_share=0.7, hold_share=0.3,
+            max_turns=500, num_opponents=1,
+        )
+        tracker.register_depart(buffer_idx=10, player=0,
+                                src_planet_id=0, turn=4, ships_sent=40)
+        tracker.register_hold(buffer_idx=20, player=0,
+                              planet_id=0, turn=4, ships_held=60)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        resolved = dict(tracker.pop_resolved(0))
+        loss_value = 3.0 * 495 * 1.5 * 0.001 * 1.0
+        assert resolved[10] == pytest.approx(-loss_value * 0.7, abs=1e-6)
+        assert resolved[20] == pytest.approx(-loss_value * 0.3, abs=1e-6)
+
+    def test_no_records_yields_no_penalty(self):
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(horizon=30)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        assert list(tracker.pop_resolved(0)) == []
+
+    def test_actions_outside_horizon_are_expired(self):
+        prev, curr = self._flip_p0_to_enemy()
+        tracker = PlanetDefenseTracker(horizon=10, max_turns=500, num_opponents=1)
+        # Action way before window
+        tracker.register_depart(buffer_idx=10, player=0,
+                                src_planet_id=0, turn=0, ships_sent=50)
+        # Action inside window
+        tracker.register_depart(buffer_idx=11, player=0,
+                                src_planet_id=0, turn=98, ships_sent=20)
+        tracker.observe_turn(100, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        resolved = list(tracker.pop_resolved(0))
+        # Only buffer_idx=11 should appear
+        assert [idx for idx, _ in resolved] == [11]
+
+    def test_planet_still_owned_emits_no_penalty(self):
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        # Planet 0 still owned by player 0 in curr -> no loss
+        tracker = PlanetDefenseTracker(horizon=30, max_turns=500, num_opponents=1)
+        tracker.register_depart(buffer_idx=10, player=0,
+                                src_planet_id=0, turn=4, ships_sent=20)
+        tracker.observe_turn(5, prev, curr, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        assert list(tracker.pop_resolved(0)) == []
+        # Records should still be pending (not popped) for future loss
+        # detection if it occurs later in window.
+        tracker.observe_turn(10, _toy_env_obs(player=0),
+                             {**_toy_env_obs(player=0),
+                              "planets": [
+                                  [0, 1, 70.0, 70.0, 3.0, 25, 3],
+                                  [1, 1, 30.0, 30.0, 2.0, 80, 2],
+                                  [2, -1, 50.0, 90.0, 2.0, 20, 1],
+                              ]}, 0,
+                             reward_scale=0.001, loss_weight=1.0)
+        # Now planet 0 lost, depart record from turn 4 (within horizon=30) gets penalty
+        resolved = list(tracker.pop_resolved(0))
+        assert [idx for idx, _ in resolved] == [10]
+
+
 class TestProductionRewardTracker:
-    def test_production_capture_reward_uses_remaining_steps_and_ship_share(self):
+    def test_production_capture_reward_uses_remaining_steps_ship_share_and_investment(self):
         outcome = ProductionCaptureOutcome(
             ships_sent=20,
             total_ships_sent=50,
+            total_ship_investment=50.0,
             planet_production=3.0,
             capture_turn=100,
             max_turns=500,
             captured_from_enemy=False,
             num_opponents=1,
         )
-        # Scaled: production * remaining * ship_share * 0.001
-        # = 3 * 400 * (20/50) * 0.001 = 0.48
-        assert compute_production_capture_reward(outcome) == pytest.approx(0.48, abs=1e-6)
+        # Scaled: (production * remaining - investment) * ship_share * 0.001
+        # = (3 * 400 - 50) * (20/50) * 0.001 = 0.46
+        assert compute_production_capture_reward(outcome) == pytest.approx(0.46, abs=1e-6)
 
-    def test_enemy_capture_multiplier_depends_on_opponent_count(self):
+    def test_capture_reward_subtracts_ship_investment_not_empire_fraction(self):
+        outcome = ProductionCaptureOutcome(
+            ships_sent=90,
+            total_ships_sent=90,
+            total_ship_investment=90.0,
+            planet_production=3.0,
+            capture_turn=100,
+            max_turns=500,
+            captured_from_enemy=False,
+            num_opponents=1,
+            my_total_ships_at_launch=100,
+        )
+        assert compute_production_capture_reward(outcome) == pytest.approx(1.11, abs=1e-6)
+
+    def test_capture_reward_penalizes_overcommit_when_enabled(self):
+        outcome = ProductionCaptureOutcome(
+            ships_sent=90,
+            total_ships_sent=90,
+            total_ship_investment=30.0,
+            planet_production=3.0,
+            capture_turn=100,
+            max_turns=500,
+            captured_from_enemy=False,
+            num_opponents=1,
+            overcommit_ships=60.0,
+        )
+        assert compute_production_capture_reward(
+            outcome,
+            ship_overcommit_weight=1.0,
+        ) == pytest.approx(1.11, abs=1e-6)
+        assert compute_production_capture_reward(outcome) == pytest.approx(1.17, abs=1e-6)
+
+    def test_production_reward_beta_preserves_reference_and_boosts_high_production(self):
+        assert production_reward_value(
+            3.0,
+            production_reward_beta=0.5,
+            production_reward_reference=3.0,
+        ) == pytest.approx(3.0, abs=1e-6)
+        assert production_reward_value(
+            5.0,
+            production_reward_beta=0.5,
+            production_reward_reference=3.0,
+        ) == pytest.approx(5.0 * ((5.0 / 3.0) ** 0.5), abs=1e-6)
+        assert production_reward_value(
+            1.0,
+            production_reward_beta=0.5,
+            production_reward_reference=3.0,
+        ) < 1.0
+
+    def test_production_capture_reward_supports_superlinear_production_value(self):
         outcome = ProductionCaptureOutcome(
             ships_sent=50,
             total_ships_sent=50,
+            total_ship_investment=50.0,
+            planet_production=5.0,
+            capture_turn=100,
+            max_turns=500,
+            captured_from_enemy=False,
+            num_opponents=1,
+        )
+        effective_production = 5.0 * ((5.0 / 3.0) ** 0.5)
+        expected = (effective_production * 400 - 50.0) * 0.001
+        assert compute_production_capture_reward(
+            outcome,
+            production_reward_beta=0.5,
+            production_reward_reference=3.0,
+        ) == pytest.approx(expected, abs=1e-6)
+
+    def test_production_upstream_capture_reward_uses_support_contribution(self):
+        capture = ProductionCaptureOutcome(
+            ships_sent=40,
+            total_ships_sent=80,
+            total_ship_investment=20.0,
+            planet_production=3.0,
+            capture_turn=100,
+            max_turns=500,
+            captured_from_enemy=False,
+            num_opponents=1,
+        )
+        outcome = ProductionUpstreamCaptureOutcome(
+            capture_outcome=capture,
+            support_ships_sent=10,
+            direct_ships_sent=40,
+            upstream_credit_weight=0.2,
+        )
+        direct_reward = compute_production_capture_reward(capture)
+        assert compute_production_upstream_capture_reward(outcome) == pytest.approx(
+            direct_reward * 0.2 * 0.25,
+            abs=1e-6,
+        )
+
+    def test_neutral_gift_penalty_uses_damage_fraction(self):
+        outcome = ProductionNeutralGiftOutcome(
+            damage_done=90.0,
+            launch_target_ships=100,
+            planet_production=3.0,
+            capture_turn=100,
+            max_turns=500,
+        )
+        assert compute_production_neutral_gift_penalty(outcome) == pytest.approx(-1.08, abs=1e-6)
+
+    def test_tracker_assigns_neutral_gift_penalty_when_enemy_captures_softened_planet(self):
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        prev["planets"][2][1] = -1
+        prev["planets"][2][5] = 100
+        prev["planets"][2][6] = 3
+        curr["planets"][2][1] = 1
+        curr["planets"][2][5] = 5
+        curr["planets"][2][6] = 3
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        tracker.register_capture_launch(
+            buffer_idx=7,
+            launch_turn=10,
+            player=0,
+            target_planet_id=2,
+            ships_sent=90,
+            est_arrival_turn=80,
+            launch_target_owner=-1,
+            launch_target_ships=100,
+        )
+        tracker.observe_turn(100, prev, curr, 0)
+        resolved = list(tracker.pop_neutral_gift_resolved(0))
+        assert [idx for idx, _ in resolved] == [7]
+        penalties = [compute_production_neutral_gift_penalty(outcome) for _, outcome in resolved]
+        assert penalties == pytest.approx([-1.08], abs=1e-6)
+
+    def test_neutral_gift_penalty_can_resolve_after_softening_window(self):
+        prev = _toy_env_obs(player=0)
+        mid = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        prev["planets"][2][1] = -1
+        prev["planets"][2][5] = 100
+        prev["planets"][2][6] = 3
+        mid["planets"][2][1] = -1
+        mid["planets"][2][5] = 10
+        mid["planets"][2][6] = 3
+        curr["planets"][2][1] = 1
+        curr["planets"][2][5] = 5
+        curr["planets"][2][6] = 3
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2, softening_window=10)
+        tracker.register_capture_launch(
+            buffer_idx=7,
+            launch_turn=10,
+            player=0,
+            target_planet_id=2,
+            ships_sent=90,
+            est_arrival_turn=80,
+            launch_target_owner=-1,
+            launch_target_ships=100,
+        )
+        tracker.observe_turn(100, prev, mid, 0)
+        assert list(tracker.pop_neutral_gift_resolved(0)) == []
+        tracker.observe_turn(140, mid, curr, 0)
+        resolved = list(tracker.pop_neutral_gift_resolved(0))
+        assert [idx for idx, _ in resolved] == [7]
+        penalties = [compute_production_neutral_gift_penalty(outcome) for _, outcome in resolved]
+        assert penalties == pytest.approx([-0.972], abs=1e-6)
+
+    def test_enemy_capture_multiplier_depends_on_total_player_count(self):
+        outcome = ProductionCaptureOutcome(
+            ships_sent=50,
+            total_ships_sent=50,
+            total_ship_investment=50.0,
             planet_production=3.0,
             capture_turn=100,
             max_turns=500,
             captured_from_enemy=True,
             num_opponents=2,
         )
-        # Scaled: 3 * 400 * 1.5 (enemy mult) * 1.0 * 0.001 = 1.8
-        assert compute_production_capture_reward(outcome) == pytest.approx(1.8, abs=1e-6)
+        assert compute_production_capture_reward(outcome) == pytest.approx(1.55, abs=1e-6)
 
     def test_tracker_splits_capture_reward_only_across_arrived_launches(self):
         prev = _toy_env_obs(player=0)
@@ -849,9 +1229,10 @@ class TestProductionRewardTracker:
         tracker.observe_turn(100, prev, curr, 0)
         resolved = list(tracker.pop_capture_resolved(0))
         assert [idx for idx, _ in resolved] == [1, 2]
+        assert [outcome.overcommit_ships for _, outcome in resolved] == pytest.approx([30.0, 30.0], abs=1e-6)
         rewards = [compute_production_capture_reward(outcome) for _, outcome in resolved]
-        # Scaled: 3 * 400 * ship_share * 0.001 -> 1.2 * [0.4, 0.6]
-        assert rewards == pytest.approx([0.48, 0.72], abs=1e-6)
+        # Scaled: (3 * 400 - 20) * ship_share * 0.001 -> 1.18 * [0.4, 0.6]
+        assert rewards == pytest.approx([0.472, 0.708], abs=1e-6)
 
     def test_neutral_capture_base_reward_still_splits_by_ship_share(self):
         prev = _toy_env_obs(player=0)
@@ -883,8 +1264,131 @@ class TestProductionRewardTracker:
         resolved = list(tracker.pop_capture_resolved(0))
         assert [idx for idx, _ in resolved] == [1, 2]
         rewards = [compute_production_capture_reward(outcome) for _, outcome in resolved]
-        total_reward = 3.0 * (500 - 100) * 0.001
+        total_reward = (3.0 * (500 - 100) - 20.0) * 0.001
         assert rewards == pytest.approx([total_reward * 0.5, total_reward * 0.5], abs=1e-6)
+
+    def test_retargeted_comet_capture_gets_production_credit(self):
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        comet = [3, -1, 60.0, 60.0, 2.0, 10, 2]
+        prev["planets"].append(comet.copy())
+        prev["initial_planets"].append(comet.copy())
+        curr["planets"].append([3, 0, 60.0, 60.0, 2.0, 5, 2])
+        curr["initial_planets"].append(comet.copy())
+        prev["comet_planet_ids"] = [3]
+        curr["comet_planet_ids"] = [3]
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        tracker.register_capture_launch(
+            buffer_idx=7,
+            launch_turn=10,
+            player=0,
+            target_planet_id=2,
+            ships_sent=25,
+            est_arrival_turn=100,
+            launch_target_owner=-1,
+            launch_target_ships=20,
+        )
+        assert tracker.retarget_capture_launch(
+            buffer_idx=7,
+            player=0,
+            target_planet_id=3,
+            launch_target_owner=-1,
+            launch_target_ships=10,
+        )
+        tracker.observe_turn(100, prev, curr, 0)
+        resolved = list(tracker.pop_capture_resolved(0))
+        assert [idx for idx, _ in resolved] == [7]
+        reward = compute_production_capture_reward(resolved[0][1])
+        assert reward == pytest.approx((2.0 * 400 - 10.0) * 0.001, abs=1e-6)
+
+    def test_tracker_assigns_one_hop_upstream_credit_to_source_support_launches(self):
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        prev["planets"][2][1] = -1
+        prev["planets"][2][6] = 3
+        curr["planets"][2][1] = 0
+        curr["planets"][2][6] = 3
+        tracker = ProductionRewardTracker(
+            max_turns=500,
+            num_agents=2,
+            upstream_credit_window=50,
+            upstream_credit_weight=0.2,
+        )
+        tracker.register_source_support_launch(
+            buffer_idx=10,
+            launch_turn=20,
+            player=0,
+            src_planet_id=1,
+            target_planet_id=0,
+            ships_sent=10,
+            est_arrival_turn=40,
+            launch_target_owner=0,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=20,
+            launch_turn=60,
+            player=0,
+            src_planet_id=0,
+            target_planet_id=2,
+            ships_sent=40,
+            est_arrival_turn=100,
+            launch_target_owner=-1,
+        )
+        tracker.observe_turn(100, prev, curr, 0)
+        direct = list(tracker.pop_capture_resolved(0))
+        upstream = list(tracker.pop_upstream_capture_resolved(0))
+        assert [idx for idx, _ in direct] == [20]
+        assert [idx for idx, _ in upstream] == [10]
+        direct_reward = compute_production_capture_reward(direct[0][1])
+        assert compute_production_upstream_capture_reward(upstream[0][1]) == pytest.approx(
+            direct_reward * 0.2 * (10 / 40),
+            abs=1e-6,
+        )
+
+    def test_upstream_credit_requires_support_arrival_before_direct_launch_and_window(self):
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        prev["planets"][2][1] = -1
+        curr["planets"][2][1] = 0
+        tracker = ProductionRewardTracker(
+            max_turns=500,
+            num_agents=2,
+            upstream_credit_window=50,
+            upstream_credit_weight=0.2,
+        )
+        tracker.register_source_support_launch(
+            buffer_idx=10,
+            launch_turn=1,
+            player=0,
+            src_planet_id=1,
+            target_planet_id=0,
+            ships_sent=10,
+            est_arrival_turn=9,
+            launch_target_owner=0,
+        )
+        tracker.register_source_support_launch(
+            buffer_idx=11,
+            launch_turn=55,
+            player=0,
+            src_planet_id=1,
+            target_planet_id=0,
+            ships_sent=10,
+            est_arrival_turn=70,
+            launch_target_owner=0,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=20,
+            launch_turn=60,
+            player=0,
+            src_planet_id=0,
+            target_planet_id=2,
+            ships_sent=40,
+            est_arrival_turn=100,
+            launch_target_owner=-1,
+        )
+        tracker.observe_turn(100, prev, curr, 0)
+        assert [idx for idx, _ in tracker.pop_capture_resolved(0)] == [20]
+        assert list(tracker.pop_upstream_capture_resolved(0)) == []
 
     def test_delayed_discount_makes_recent_equal_capture_launch_more_valuable(self):
         buf = RolloutBuffer()
@@ -928,7 +1432,7 @@ class TestProductionRewardTracker:
         tracker.observe_turn(100, prev, curr, 0)
         resolved = list(tracker.pop_capture_resolved(0))
         rewards = [compute_production_capture_reward(outcome) for _, outcome in resolved]
-        total_reward = 3.0 * (500 - 100) * 2.0 * 0.001
+        total_reward = (3.0 * (500 - 100) * 1.5 - 20.0) * 0.001
         assert rewards == pytest.approx([total_reward * 0.5, total_reward * 0.5], abs=1e-6)
 
     def test_failed_arrived_launch_outside_window_does_not_get_later_credit(self):
@@ -967,8 +1471,8 @@ class TestProductionRewardTracker:
         resolved = list(tracker.pop_capture_resolved(0))
         assert [idx for idx, _ in resolved] == [2]
         rewards = [compute_production_capture_reward(outcome) for _, outcome in resolved]
-        # Scaled: production(=1 default) * 400 * 1.0 * 0.001 = 0.4
-        assert rewards == pytest.approx([0.4], abs=1e-6)
+        # Scaled: (production(=1 default) * 400 - 20) * 1.0 * 0.001 = 0.38
+        assert rewards == pytest.approx([0.38], abs=1e-6)
 
     def test_softening_fleet_within_window_shares_capture_credit(self):
         """Fleet 1 arrives at turn 50 and softens the target (no capture).
@@ -1014,8 +1518,8 @@ class TestProductionRewardTracker:
         # Fleet 1 share = 20/50 = 0.4, Fleet 2 share = 30/50 = 0.6.
         assert [idx for idx, _ in resolved] == [1, 2]
         rewards = [compute_production_capture_reward(outcome) for _, outcome in resolved]
-        # production(=2) * 430 * 1.0 * 0.001 = 0.86
-        total = 2.0 * (500 - 70) * 0.001
+        # (production(=2) * 430 - 20) * 1.0 * 0.001 = 0.84
+        total = (2.0 * (500 - 70) - 20.0) * 0.001
         assert rewards == pytest.approx([total * 0.4, total * 0.6], abs=1e-6)
 
     def test_softening_fleet_outside_window_gets_no_credit(self):
@@ -1106,6 +1610,399 @@ class TestProductionRewardTracker:
         assert penalty == pytest.approx(-5.0, abs=1e-6)
 
 
+class TestSourceDefenseShortfall:
+    """Per-fleet ETA simulation: garrison evolves with production, each
+    incoming enemy fleet attacks the CURRENT garrison (not the final
+    total). Distant threats are auto-absorbed if production catches up
+    in time; only overwhelming arrivals contribute to the shortfall."""
+
+    def test_no_enemy_arrivals_returns_zero(self):
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=0,
+            production=2.0,
+            enemy_arrivals=[],
+        ) == pytest.approx(0.0, abs=1e-9)
+
+    def test_distant_threat_covered_by_production_contributes_zero(self):
+        # 3 ships remaining, production 2/turn, enemy 30 ships at ETA 80.
+        # By t=80 garrison = 3 + 2*80 = 163 >> 30. Zero shortfall.
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(80.0, 30.0)],
+        ) == pytest.approx(0.0, abs=1e-9)
+
+    def test_imminent_threat_exceeding_garrison_reports_exact_shortfall(self):
+        # 3 ships remaining, production 2/turn, enemy 30 ships at ETA 5.
+        # At t=5: garrison = 3 + 2*5 = 13. Deficit = 30 - 13 = 17.
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(5.0, 30.0)],
+        ) == pytest.approx(17.0, abs=1e-6)
+
+    def test_user_example_two_sequential_attacks(self):
+        # User's concrete example:
+        #   ships_remaining=3, production=2
+        #   Attack 1: 20 ships @ ETA 10
+        #     garrison = 3 + 2*10 = 23, deficit = max(0, 20-23) = 0
+        #     garrison after = 23 - 20 = 3
+        #   Attack 2: 100 ships @ ETA 35 (25 turns later)
+        #     garrison = 3 + 2*25 = 53, deficit = max(0, 100-53) = 47
+        #     garrison after = 0
+        # Total shortfall = 47.
+        shortfall = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(10.0, 20.0), (35.0, 100.0)],
+        )
+        assert shortfall == pytest.approx(47.0, abs=1e-6)
+
+    def test_arrivals_sorted_internally_independent_of_input_order(self):
+        unsorted_first = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(35.0, 100.0), (10.0, 20.0)],
+        )
+        sorted_first = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=3,
+            production=2.0,
+            enemy_arrivals=[(10.0, 20.0), (35.0, 100.0)],
+        )
+        assert unsorted_first == pytest.approx(sorted_first, abs=1e-9)
+
+    def test_self_reinforcement_increases_garrison_before_attack(self):
+        # Enemy 50 ships @ ETA 20. Without help: garrison = 5 + 2*20 = 45,
+        # shortfall = 50-45 = 5.
+        # With self reinforcement 30 ships @ ETA 15: garrison at t=15 is
+        # 5 + 2*15 = 35 -> +30 reinforcement = 65. At t=20 garrison is
+        # 65 + 2*5 = 75 > 50 -> zero shortfall.
+        without_help = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=5,
+            production=2.0,
+            enemy_arrivals=[(20.0, 50.0)],
+        )
+        with_help = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=5,
+            production=2.0,
+            enemy_arrivals=[(20.0, 50.0)],
+            self_arrivals=[(15.0, 30.0)],
+        )
+        assert without_help == pytest.approx(5.0, abs=1e-6)
+        assert with_help == pytest.approx(0.0, abs=1e-9)
+
+    def test_zero_production_planet_only_uses_initial_garrison(self):
+        # Comet-like: no production. 10 ships remaining, enemy 15 @ ETA 50.
+        # Garrison never grows -> shortfall = 15 - 10 = 5.
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=10,
+            production=0.0,
+            enemy_arrivals=[(50.0, 15.0)],
+        ) == pytest.approx(5.0, abs=1e-6)
+
+    def test_multiple_small_enemies_chain_deplete_garrison(self):
+        # 10 ships remaining, production 1/turn, three small attacks at
+        # ETAs 5, 10, 15 (each 8 ships).
+        #   t=5 : garrison = 10 + 5 = 15, combat: 8 vs 15 -> 7 left, no deficit
+        #   t=10: garrison = 7 + 5  = 12, combat: 8 vs 12 -> 4 left, no deficit
+        #   t=15: garrison = 4 + 5  = 9,  combat: 8 vs 9  -> 1 left, no deficit
+        # Total shortfall = 0 (every attack is absorbed).
+        assert _compute_source_defense_shortfall(
+            ships_remaining_after_launch=10,
+            production=1.0,
+            enemy_arrivals=[(5.0, 8.0), (10.0, 8.0), (15.0, 8.0)],
+        ) == pytest.approx(0.0, abs=1e-9)
+
+
+class TestPostCaptureReinforcement:
+    """Sorun 1: a fleet launched at a non-mine target that is captured
+    by an earlier-arriving friendly fleet should still receive an
+    outcome-tied reward when it eventually arrives at the now-mine
+    planet."""
+
+    def _capture_neutral_p2_at_t10(self):
+        """Helper: prev has P2 neutral, curr has P2 owned by player 0."""
+        prev = _toy_env_obs(player=0)
+        curr = _toy_env_obs(player=0)
+        prev["planets"][2][1] = -1   # P2 neutral
+        prev["planets"][2][6] = 3    # P2 production
+        curr["planets"][2][1] = 0    # P2 mine after capture
+        curr["planets"][2][6] = 3
+        return prev, curr
+
+    def test_in_flight_launch_moves_to_reinforce_pending_at_capture(self):
+        """F1 arrives at T10 and captures. F2 still in flight (arrives
+        T15). After observe_turn(10), F2 must be queued in
+        _reinforce_pending, NOT silently dropped."""
+        prev, curr = self._capture_neutral_p2_at_t10()
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        # F1: arrives at T10 (capture launch)
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        # F2: still in flight, arrives T15
+        tracker.register_capture_launch(
+            buffer_idx=2, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=10,
+            est_arrival_turn=15, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev, curr, 0)
+        # F1 captured; F2 must still be tracked as a reinforcement.
+        captures = list(tracker.pop_capture_resolved(0))
+        assert [idx for idx, _ in captures] == [1]
+        reinforcements = list(tracker.pop_reinforcement_resolved(0))
+        assert reinforcements == []  # not yet arrived
+        # Internal state: F2 is in _reinforce_pending.
+        assert (0, 2) in tracker._reinforce_pending
+        assert len(tracker._reinforce_pending[(0, 2)]) == 1
+        assert tracker._reinforce_pending[(0, 2)][0].buffer_idx == 2
+
+    def test_arrival_at_still_mine_planet_emits_reinforcement_reward(self):
+        """F2 arrives at T15 to a still-mine P2 -> small + reward."""
+        prev, curr = self._capture_neutral_p2_at_t10()
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=2, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=10,
+            est_arrival_turn=15, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev, curr, 0)
+        list(tracker.pop_capture_resolved(0))  # drain
+        # Now T15: P2 still mine, F2 arrives.
+        prev2 = _toy_env_obs(player=0)
+        prev2["planets"][2][1] = 0
+        prev2["planets"][2][6] = 3
+        curr2 = _toy_env_obs(player=0)
+        curr2["planets"][2][1] = 0
+        curr2["planets"][2][6] = 3
+        tracker.observe_turn(15, prev2, curr2, 0)
+        reinforcements = list(tracker.pop_reinforcement_resolved(0))
+        assert [idx for idx, _ in reinforcements] == [2]
+        outcome = reinforcements[0][1]
+        assert outcome.ships_sent == 10
+        assert outcome.planet_production == pytest.approx(3.0)
+        assert outcome.arrival_turn == 15
+        assert outcome.capture_turn == 10
+        # Reward: 10 * 3 * (1 - 5/30) * 0.1 * 0.001 = ~0.0025
+        reward = compute_production_reinforcement_reward(
+            outcome,
+            reinforcement_weight=0.1,
+            reward_scale=0.001,
+            decay_window=30,
+        )
+        expected = 10.0 * 3.0 * (1.0 - 5.0 / 30.0) * 0.1 * 0.001
+        assert reward == pytest.approx(expected, abs=1e-6)
+        # And it must be positive.
+        assert reward > 0.0
+
+    def test_arrival_at_lost_planet_emits_no_reinforcement_reward(self):
+        """F2 arrives at T15 but P2 was lost to enemy at T13. No bonus."""
+        prev, curr = self._capture_neutral_p2_at_t10()
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=2, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=10,
+            est_arrival_turn=15, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev, curr, 0)
+        list(tracker.pop_capture_resolved(0))
+        # Drain any clawback pending events from the capture so the loss
+        # observed below doesn't mix with this test's assertions.
+        list(tracker.pop_capture_clawback_resolved(0))
+        # T15: P2 owned by enemy now (lost in between).
+        prev2 = _toy_env_obs(player=0)
+        prev2["planets"][2][1] = 1   # enemy
+        prev2["planets"][2][6] = 3
+        curr2 = _toy_env_obs(player=0)
+        curr2["planets"][2][1] = 1
+        curr2["planets"][2][6] = 3
+        tracker.observe_turn(15, prev2, curr2, 0)
+        reinforcements = list(tracker.pop_reinforcement_resolved(0))
+        assert reinforcements == []  # no reinforcement reward when not mine
+
+    def test_reinforcement_decay_floors_at_0_1(self):
+        """Beyond decay_window the reward is 0; at the boundary it floors
+        at 10% of the base magnitude."""
+        outcome = ProductionReinforcementOutcome(
+            ships_sent=10, planet_production=3.0,
+            arrival_turn=40, capture_turn=10,  # gap=30 == window
+            max_turns=500,
+        )
+        # gap exactly == decay_window: time_factor = max(0.1, 1 - 30/30) = 0.1
+        reward = compute_production_reinforcement_reward(
+            outcome,
+            reinforcement_weight=0.1, reward_scale=0.001, decay_window=30,
+        )
+        assert reward == pytest.approx(10 * 3 * 0.1 * 0.1 * 0.001, abs=1e-9)
+
+        # gap > decay_window: 0
+        outcome.arrival_turn = 41
+        reward = compute_production_reinforcement_reward(
+            outcome,
+            reinforcement_weight=0.1, reward_scale=0.001, decay_window=30,
+        )
+        assert reward == pytest.approx(0.0, abs=1e-9)
+
+    def test_self_reinforce_launch_target_is_filtered_at_register(self):
+        """A launch toward a target ALREADY mine at launch time is
+        filtered by `register_capture_launch` (existing behavior). The
+        reinforcement path must NOT receive such launches."""
+        tracker = ProductionRewardTracker(max_turns=500, num_agents=2)
+        tracker.register_capture_launch(
+            buffer_idx=99, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=10,
+            est_arrival_turn=15, launch_target_owner=0,  # mine at launch
+        )
+        assert tracker._capture_pending == {}
+        # Even after observe_turn, no reinforcement record appears.
+        prev, curr = self._capture_neutral_p2_at_t10()
+        tracker.observe_turn(10, prev, curr, 0)
+        assert list(tracker.pop_reinforcement_resolved(0)) == []
+
+
+class TestCaptureClawback:
+    """Sorun 2: a captured planet lost within the clawback window
+    triggers a partial refund of the original capture reward."""
+
+    def _scenario_capture_then_lose(self, *, capture_turn: int = 10,
+                                     loss_turn: int = 13):
+        """Build prev/curr observations for capture at `capture_turn`
+        and a separate prev/curr for loss at `loss_turn`."""
+        # T(capture-1) -> T(capture): neutral -> mine
+        prev_cap = _toy_env_obs(player=0)
+        curr_cap = _toy_env_obs(player=0)
+        prev_cap["planets"][2][1] = -1
+        prev_cap["planets"][2][6] = 3
+        curr_cap["planets"][2][1] = 0
+        curr_cap["planets"][2][6] = 3
+        # T(loss-1) -> T(loss): mine -> enemy
+        prev_loss = _toy_env_obs(player=0)
+        curr_loss = _toy_env_obs(player=0)
+        prev_loss["planets"][2][1] = 0
+        prev_loss["planets"][2][6] = 3
+        curr_loss["planets"][2][1] = 1
+        curr_loss["planets"][2][6] = 3
+        return prev_cap, curr_cap, prev_loss, curr_loss
+
+    def test_capture_then_lose_emits_negative_clawback(self):
+        """Capture at T10, lose at T13 (gap=3, well inside window=30):
+        original capturing transitions get a clawback (negative) reward."""
+        prev_cap, curr_cap, prev_loss, curr_loss = self._scenario_capture_then_lose(
+            capture_turn=10, loss_turn=13,
+        )
+        tracker = ProductionRewardTracker(
+            max_turns=500, num_agents=2,
+            capture_clawback_window=30, capture_clawback_fraction=0.5,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev_cap, curr_cap, 0)
+        captures = list(tracker.pop_capture_resolved(0))
+        assert [idx for idx, _ in captures] == [1]
+        capture_reward = compute_production_capture_reward(
+            captures[0][1], reward_scale=0.001,
+        )
+        assert capture_reward > 0.0
+
+        # T13: planet lost.
+        tracker.observe_turn(13, prev_loss, curr_loss, 0)
+        clawbacks = list(tracker.pop_capture_clawback_resolved(0))
+        assert [idx for idx, _ in clawbacks] == [1]
+        clawback_outcome = clawbacks[0][1]
+        clawback_reward = compute_production_capture_clawback(
+            clawback_outcome, reward_scale=0.001,
+        )
+        # gap = 13 - 10 = 3, time_factor = max(0.1, 1 - 2/30) = 28/30
+        # clawback_reward = -capture_reward * 0.5 * 28/30
+        expected = -capture_reward * 0.5 * (1.0 - 2.0 / 30.0)
+        assert clawback_reward == pytest.approx(expected, abs=1e-9)
+        # And clawback strictly less than capture (net positive).
+        assert capture_reward + clawback_reward > 0.0
+
+    def test_loss_outside_clawback_window_emits_no_clawback(self):
+        """Capture at T10, lose at T100 (gap=90, beyond window=30): no
+        clawback emitted because the recent-capture record has expired."""
+        prev_cap, curr_cap, prev_loss, curr_loss = self._scenario_capture_then_lose(
+            capture_turn=10, loss_turn=100,
+        )
+        tracker = ProductionRewardTracker(
+            max_turns=500, num_agents=2,
+            capture_clawback_window=30, capture_clawback_fraction=0.5,
+        )
+        tracker.register_capture_launch(
+            buffer_idx=1, launch_turn=4, player=0,
+            target_planet_id=2, ships_sent=30,
+            est_arrival_turn=10, launch_target_owner=-1,
+        )
+        tracker.observe_turn(10, prev_cap, curr_cap, 0)
+        list(tracker.pop_capture_resolved(0))
+        # Walk forward via observe_turn (no transitions) to expire the
+        # recent-capture record.
+        unchanged = _toy_env_obs(player=0)
+        unchanged["planets"][2][1] = 0
+        unchanged["planets"][2][6] = 3
+        tracker.observe_turn(45, unchanged, unchanged, 0)  # > 10 + 30
+        assert (0, 2) not in tracker._recent_captures
+        # Now lose at T100 - no clawback record exists.
+        tracker.observe_turn(100, prev_loss, curr_loss, 0)
+        assert list(tracker.pop_capture_clawback_resolved(0)) == []
+
+    def test_loss_without_recent_capture_emits_no_clawback(self):
+        """A planet I owned all along (no recent capture record) loses;
+        no clawback emitted (Defense Window handles this case)."""
+        prev_cap = _toy_env_obs(player=0)
+        prev_cap["planets"][2][1] = 0  # already mine
+        prev_cap["planets"][2][6] = 3
+        curr_cap = _toy_env_obs(player=0)
+        curr_cap["planets"][2][1] = 0
+        curr_cap["planets"][2][6] = 3
+        prev_loss = _toy_env_obs(player=0)
+        prev_loss["planets"][2][1] = 0
+        prev_loss["planets"][2][6] = 3
+        curr_loss = _toy_env_obs(player=0)
+        curr_loss["planets"][2][1] = 1
+        curr_loss["planets"][2][6] = 3
+        tracker = ProductionRewardTracker(
+            max_turns=500, num_agents=2,
+            capture_clawback_window=30, capture_clawback_fraction=0.5,
+        )
+        tracker.observe_turn(10, prev_cap, curr_cap, 0)
+        tracker.observe_turn(13, prev_loss, curr_loss, 0)
+        assert list(tracker.pop_capture_clawback_resolved(0)) == []
+
+    def test_clawback_disabled_when_fraction_or_window_zero(self):
+        """Setting fraction=0 or window=0 disables clawback emission."""
+        outcome = ProductionCaptureOutcome(
+            ships_sent=30, total_ships_sent=30, total_ship_investment=0.0,
+            planet_production=3.0, capture_turn=10, max_turns=500,
+            captured_from_enemy=False, num_opponents=1,
+        )
+        clawback_outcome = ProductionCaptureClawbackOutcome(
+            capture_outcome=outcome, loss_turn=13,
+            clawback_window=0, clawback_fraction=0.5,
+        )
+        # Window=0 -> reward=0. (window is clamped to >=1, gap=3 > 1)
+        reward = compute_production_capture_clawback(
+            clawback_outcome, reward_scale=0.001,
+        )
+        assert reward == pytest.approx(0.0, abs=1e-9)
+
+
 def _dummy_dqn_transition(reward: float = 0.0, done: bool = False) -> DQNTransition:
     cur = _toy_obs(p_max=4, f_max=4)
     nxt = _toy_obs(p_max=4, f_max=4)
@@ -1169,12 +2066,51 @@ class TestRewards:
         assert cfg.denial_value_weight == pytest.approx(0.0)
         assert cfg.fleet_kill_weight == pytest.approx(1.0)
         assert cfg.fleet_waste_weight == pytest.approx(1.0)
+        assert cfg.fleet_overcommit_weight == pytest.approx(0.0)
         # Base airborne weight is unnormalized; rollout applies a risk
         # multiplier when source is under enemy attack.
-        assert cfg.fleet_airborne_weight == pytest.approx(1.0)
+        assert cfg.fleet_airborne_weight == pytest.approx(2.0)
         assert cfg.reward_scale == pytest.approx(0.001)
         assert cfg.draw_terminal_reward == pytest.approx(-1.0)
         assert cfg.delayed_reward_discount == pytest.approx(1.0)
+        assert cfg.defense_kills_weight == pytest.approx(0.05)
+        assert cfg.production_upstream_credit_weight == pytest.approx(0.2)
+        assert cfg.production_upstream_credit_window == 50
+
+    def test_reward_factory_production_only_is_separate_preset(self):
+        cfg = build_reward_config("production_only")
+        assert "production_only" in REWARD_SYSTEMS
+        assert cfg.capture_value_weight == pytest.approx(0.0)
+        assert cfg.denial_value_weight == pytest.approx(0.0)
+        assert cfg.fleet_capture_weight == pytest.approx(0.0)
+        assert cfg.fleet_kill_weight == pytest.approx(1.0)
+        assert cfg.fleet_waste_weight == pytest.approx(0.0)
+        assert cfg.ship_overflow_weight == pytest.approx(0.0)
+        assert cfg.reward_scale == pytest.approx(0.001)
+        assert cfg.eligibility_trace_horizon == 30
+        assert cfg.eligibility_trace_reverse is True
+
+    def test_production_only_trace_reward_ignores_opponent_production(self):
+        obs = _toy_env_obs(player=0)
+        cfg_only = build_reward_config("production_only")
+        cfg_diff = build_reward_config("production_diff")
+        assert _production_trace_reward(obs, 0, 2, cfg_only) == pytest.approx(0.003)
+        assert _production_trace_reward(obs, 0, 2, cfg_diff) == pytest.approx(0.001)
+
+    def test_production_only_enemy_ship_kill_equals_one_production_unit(self):
+        cfg = build_reward_config("production_only")
+        outcome = FleetOutcome(
+            captured_planet=False,
+            killed_enemy_ships=True,
+            destroyed_enroute=False,
+            self_reinforce=False,
+            enemy_ships_killed=1.0,
+        )
+        assert compute_production_only_fleet_kill_reward(
+            outcome,
+            kill_weight=cfg.fleet_kill_weight,
+            reward_scale=cfg.reward_scale,
+        ) == pytest.approx(0.001)
 
     def test_reward_factory_overrides_preset_values(self):
         cfg = build_reward_config(
@@ -1551,7 +2487,7 @@ class TestMetrics:
         # Pull every head into the loss directly by summing all logits + value.
         loss = (out.src_logits.sum()
                 + out.tgt_logits.sum()
-                + out.ship_logits.sum()
+                + out.ship_params.sum()
                 + out.value.pow(2).sum())
         return net, loss
 

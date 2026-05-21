@@ -23,17 +23,15 @@ class PlanetOnlyOrbitWarsPolicy(OrbitWarsPolicy):
         planet_dim: int = PLANET_FEATURE_DIM,
         global_dim: int = GLOBAL_FEATURE_DIM,
         edge_dim: int = EDGE_FEATURE_DIM,
-        d_model: int = 128,
+        d_model: int = 256,
         n_heads: int = 4,
-        n_layers: int = 4,
-        n_ship_bins: int = 5,
+        n_layers: int = 6,
         dropout: float = 0.0,
     ):
         nn.Module.__init__(self)
         self.p_max = p_max
         self.f_max = f_max
         self.planet_dim = planet_dim
-        self.n_ship_bins = n_ship_bins
         self.d_model = d_model
         self.n_heads = n_heads
         self.model_variant = "planet_only"
@@ -53,12 +51,14 @@ class PlanetOnlyOrbitWarsPolicy(OrbitWarsPolicy):
         self.noop_logit = nn.Parameter(torch.zeros(1))
         self.tgt_query = nn.Linear(d_model, d_model)
         self.tgt_key = nn.Linear(d_model, d_model)
-        self.ship_head = nn.Linear(d_model, n_ship_bins)
+        # Ship Beta head: outputs raw (alpha, beta) logits.
+        self.ship_head = nn.Linear(d_model, 2)
         self.value_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model * 2, d_model),
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
+        self.aux_owner_head = nn.Linear(d_model, 3)  # mine / enemy / neutral
 
         type_ids = torch.zeros(p_max + 1, dtype=torch.long)
         type_ids[-1] = 1
@@ -114,6 +114,10 @@ class PlanetOnlyOrbitWarsPolicy(OrbitWarsPolicy):
 
         planet_tok = x[:, : self.p_max]
         global_tok = x[:, -1]
+        planet_pooled = planet_tok.mean(dim=1)
+        value_input = torch.cat([global_tok, planet_pooled], dim=-1)
+        value = self.value_head(value_input).squeeze(-1)
+        aux_owner_logits = self.aux_owner_head(planet_tok)
         src_raw = self.src_head(planet_tok).squeeze(-1)
         very_neg = torch.finfo(src_raw.dtype).min
         src_raw = src_raw.masked_fill(~source_mask, very_neg)
@@ -128,13 +132,13 @@ class PlanetOnlyOrbitWarsPolicy(OrbitWarsPolicy):
         tgt_logits = tgt_logits.masked_fill(eye[None], very_neg)
         tgt_logits = tgt_logits.masked_fill((~planet_mask)[:, None, :], very_neg)
 
-        ship_logits = self.ship_head(planet_tok)
-        value = self.value_head(global_tok).squeeze(-1)
+        ship_params = self.ship_head(planet_tok)        # (B, P, 2)
 
         return PolicyOutput(
             src_logits=src_logits,
             tgt_logits=tgt_logits,
-            ship_logits=ship_logits,
+            ship_params=ship_params,
             value=value,
             tokens=x,
+            aux_owner_logits=aux_owner_logits,
         )
