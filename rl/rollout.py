@@ -36,7 +36,14 @@ from obs_builder import (
 from model import OrbitWarsPolicy, pack_observations, _make_ship_dist
 
 from .buffer import RolloutBuffer, Transition
-from .rewards import RewardConfig, compute_step_reward, normalize_terminal_rewards
+from .rewards import (
+    RewardConfig,
+    RunningMeanStd,
+    compute_graph_metrics_summary,
+    compute_graph_native_reward,
+    compute_step_reward,
+    normalize_terminal_rewards,
+)
 from .fleet_tracker import (
     FleetTracker,
     compute_fleet_reward,
@@ -737,6 +744,14 @@ def collect_episode(
     n_launches = [0 for _ in range(num_agents)]
     cum_reward = [0.0 for _ in range(num_agents)]
     last_value = [0.0 for _ in range(num_agents)]      # for GAE bootstrapping at end-of-rollout
+    # Cache the previous step's graph metric summary (per player). Storing
+    # the lightweight scalar summary instead of the full Observation halves
+    # the metric computation per step (one summary per step instead of two).
+    prev_graph_summaries: list[Optional[dict]] = [None for _ in range(num_agents)]
+    graph_reward_normalizers: list[RunningMeanStd] = [
+        RunningMeanStd(warmup=int(reward_cfg.graph_reward_normalize_warmup))
+        for _ in range(num_agents)
+    ]
     fleet_trackers = [FleetTracker() for _ in range(num_agents)]  # One per player
     production_trackers = [
         ProductionRewardTracker(
@@ -904,6 +919,40 @@ def collect_episode(
                     rewards.append(float(terminal_rewards[p]))
                     continue
                 rewards.append(_production_trace_reward(new_obs[p], p, num_agents, reward_cfg))
+        elif reward_cfg.reward_system == "graph_native":
+            rewards = []
+            for p in range(num_agents):
+                if terminal:
+                    rewards.append(float(terminal_rewards[p]))
+                    continue
+                # Build current-step Observation so metric deltas can be computed.
+                angular_velocity = new_obs[p].get("angular_velocity", 0.0) or 0.0
+                curr_obs = build_observation(
+                    new_obs[p], player=p,
+                    angular_velocity=angular_velocity,
+                    p_max=policy.p_max, f_max=policy.f_max,
+                    max_turns=max_steps,
+                )
+                # Single-pass metric summary (avoids the duplicate
+                # ``observation_to_pyg_data`` call that the legacy
+                # implementation made every step).
+                curr_summary = compute_graph_metrics_summary(
+                    curr_obs, edge_signal=reward_cfg.graph_edge_efficiency_signal,
+                )
+                if prev_graph_summaries[p] is None:
+                    r = 0.0
+                else:
+                    r = compute_graph_native_reward(
+                        prev_graph_summaries[p], curr_summary, p,
+                        cfg=reward_cfg, turn=t,
+                    )
+                # Optional running-std normalization (per-player).
+                if reward_cfg.graph_reward_normalize and r != 0.0:
+                    norm = graph_reward_normalizers[p]
+                    norm.update(r)
+                    r = norm.normalize(r, eps=reward_cfg.graph_reward_normalize_eps)
+                rewards.append(float(r))
+                prev_graph_summaries[p] = curr_summary
         else:
             rewards = [
                 compute_step_reward(
