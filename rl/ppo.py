@@ -85,7 +85,10 @@ def ppo_update(
         epoch_kls: list[float] = []
         stop_ppo = False
         for batch in buffer.iter_minibatches(cfg.batch_size, device=device):
-            out = policy(
+            # PyG policies built with ``enable_flux_features=True`` carry
+            # an extra (B, P_max, 4) tensor through the buffer; legacy
+            # variants ignore the kwarg.
+            forward_kwargs = dict(
                 planet_feats=batch["planet_feats"],
                 fleet_feats=batch["fleet_feats"],
                 global_feats=batch["global_feats"],
@@ -94,6 +97,9 @@ def ppo_update(
                 fleet_mask=batch["fleet_mask"],
                 source_mask=batch["source_mask"],
             )
+            if "flux_features" in batch and getattr(policy, "enable_flux_features", False):
+                forward_kwargs["flux_features"] = batch["flux_features"]
+            out = policy(**forward_kwargs)
             ev = policy.evaluate_source_actions(
                 out,
                 src=batch["src"],

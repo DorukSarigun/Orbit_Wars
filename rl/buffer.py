@@ -12,8 +12,8 @@ side), which doubles the data collected per environment step.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterator, Sequence
+from dataclasses import dataclass, field
+from typing import Iterator, Optional, Sequence
 
 import numpy as np
 import torch
@@ -44,6 +44,10 @@ class Transition:
     reward: float
     done: bool
     turn: int = 0
+    # Optional per-step flux features ``(P_max, 4)`` used by PyG variants
+    # built with ``enable_flux_features=True``.  Stored as ``None`` for
+    # legacy policies so the buffer stays compact.
+    flux_features: Optional[np.ndarray] = None
 
 
 class RolloutBuffer:
@@ -169,6 +173,18 @@ class RolloutBuffer:
             "returns":      torch.tensor([self._returns[i] for i in idx], dtype=torch.float32),
             "advantages":   torch.tensor([adv_norm[i] for i in idx], dtype=torch.float32),
         }
+        # Optional flux features (PyG variants only).  Only stack when every
+        # sampled transition recorded them; mixing flux/no-flux transitions
+        # in a single batch is unsupported (and indicates a rollout bug).
+        if any(t.flux_features is not None for t in sub):
+            flux = [t.flux_features for t in sub]
+            if any(f is None for f in flux):
+                missing = sum(1 for f in flux if f is None)
+                raise ValueError(
+                    f"flux_features present on {len(flux) - missing}/{len(flux)} "
+                    "sampled transitions; either all or none must carry them."
+                )
+            out["flux_features"] = torch.from_numpy(np.stack(flux)).float()
         return out
 
     def clear(self) -> None:

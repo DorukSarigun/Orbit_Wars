@@ -163,12 +163,72 @@ class RewardConfig:
     # Kept at 0 by default; set non-zero to re-enable the old behavior.
     planet_diff_weight: float = 0.0
 
+    # ---- Graph-native shaping (structure delta over graph metrics) ----
+    # Per-channel weights applied to the *delta* of summed node metrics.
+    # NOTE: ``influence_balance`` and ``strategic_potential`` are linear
+    # combinations of the other three (friendly/enemy/production); leaving
+    # them weighted in addition to the primaries triple-counts the same
+    # signal.  Defaults are 0.0 so only independent channels contribute.
+    graph_friendly_influence_weight: float = 0.0
+    graph_enemy_influence_weight: float = 0.0
+    graph_influence_balance_weight: float = 0.0      # redundant: friendly - enemy
+    graph_friendly_support_weight: float = 0.0
+    graph_supportability_weight: float = 0.0
+    graph_vulnerability_weight: float = 0.0
+    graph_production_potential_weight: float = 0.0
+    graph_strategic_potential_weight: float = 0.0    # redundant: production + friendly - enemy
+    # Edge-level shaping. Activates a single weighted channel on the sum
+    # of an edge metric across all real planet pairs (default
+    # ``flow_opportunity`` -- the only directed, non-anti-symmetric edge
+    # metric that captures progress toward high-strategic targets).
+    # Choices: ``flow_opportunity`` | ``movement_resistance`` | ``same_owner``.
+    graph_edge_efficiency_weight: float = 0.0
+    graph_edge_efficiency_signal: str = "flow_opportunity"
+
+    # ---- Flux-augmented node metrics (Phase 1 of credit-assignment plan) ----
+    # When enabled, four additional per-node channels are appended to the
+    # graph metric summary, representing the imminence-weighted ship flow
+    # in (column-sum) and out (row-sum) of each planet for friendly and
+    # enemy fleets.  See ``rl/flux.py`` for the parametric weighting
+    # modes.  Used by ``compute_graph_native_reward`` to give partial
+    # credit for multi-step launches as fleets approach their target,
+    # without waiting for the final capture event.
+    enable_flux_metrics: bool = False
+    flux_mode: str = "exp_decay"      # "raw" | "linear" | "exp_decay"
+    flux_tau: float = 10.0            # decay timescale for exp_decay (turns)
+    flux_eta_norm: float = 50.0       # cutoff for linear mode (turns)
+    flux_ship_norm: float = 50.0      # divisor for output magnitude
+    # Per-channel reward weights, applied to potential-based delta like
+    # the other graph metrics.  Channel order matches
+    # ``rl/flux.compute_node_flux_features``:
+    #   [friendly_in, friendly_out, enemy_in, enemy_out]
+    graph_flux_friendly_in_weight: float = 0.0
+    graph_flux_friendly_out_weight: float = 0.0
+    graph_flux_enemy_in_weight: float = 0.0
+    graph_flux_enemy_out_weight: float = 0.0
+
+    # ---- Potential-based shaping & normalization ----
+    # Discount used in the potential-based shaping formula
+    #   r_t = graph_potential_discount * φ(s_{t+1}) - φ(s_t)
+    # which preserves the optimal policy under any γ <= this value (Ng et
+    # al. 1999).  Should match (or be slightly less than) the PPO ``gamma``
+    # to keep the shaping theoretically valid.
+    graph_potential_discount: float = 0.99
+    # If True, per-step graph_native rewards are divided by a running
+    # standard deviation (per-player) before being added to the buffer.
+    # Reduces variance from heterogeneous metric scales without changing
+    # the sign or relative ordering of step rewards.
+    graph_reward_normalize: bool = False
+    graph_reward_normalize_eps: float = 1e-6
+    graph_reward_normalize_warmup: int = 64
+
     # If True, shaping signals also fire on the terminal step.
     shape_on_terminal: bool = False
 
 
 REWARD_SYSTEMS: tuple[str, ...] = (
     "current", "aggressive", "production_simple", "production_diff", "production_only",
+    "graph_native",
 )
 
 
@@ -244,6 +304,53 @@ def build_reward_config(reward_system: str = "current", **overrides) -> RewardCo
             delayed_reward_discount=1.0,
             reward_scale=0.001,
             draw_terminal_reward=0.0,
+        )
+    elif reward_system == "graph_native":
+        cfg = RewardConfig(
+            reward_system="graph_native",
+            capture_value_weight=0.0,
+            denial_value_weight=0.0,
+            ship_diff_weight=0.0,
+            ship_loss_weight=0.0,
+            fleet_airborne_weight=0.0,
+            fleet_capture_weight=0.0,
+            fleet_kill_weight=0.0,
+            fleet_waste_weight=0.0,
+            fleet_overcommit_weight=0.0,
+            enemy_capture_radius_weight=0.0,
+            planet_loss_weight=0.0,
+            defense_hold_weight=0.0,
+            ship_overflow_weight=0.0,
+            defense_kills_weight=0.0,
+            production_reinforcement_weight=0.0,
+            invalid_action_penalty=0.0,
+            planet_diff_weight=0.0,
+            # Graph-native channel weights.  Independent channels only:
+            # influence_balance and strategic_potential are linear combos
+            # of friendly/enemy/production and would triple-count the
+            # same signal (kept at 0 by default).
+            graph_friendly_influence_weight=1.0,
+            graph_enemy_influence_weight=-1.0,
+            graph_influence_balance_weight=0.0,           # redundant
+            graph_friendly_support_weight=1.0,
+            graph_supportability_weight=1.0,
+            graph_vulnerability_weight=-1.0,
+            graph_production_potential_weight=1.0,
+            graph_strategic_potential_weight=0.0,         # redundant
+            # Edge-level signal: flow_opportunity is positive and
+            # asymmetric (relu(strategic_gradient) / (eta+1)), so it
+            # rewards launches that progress toward high-strategic
+            # targets relative to current control.
+            graph_edge_efficiency_weight=0.5,
+            graph_edge_efficiency_signal="flow_opportunity",
+            # Potential-based shaping (Ng et al. 1999): r = γ φ(s') - φ(s).
+            graph_potential_discount=0.99,
+            # Running-std normalization helps balance heterogeneous
+            # metric scales (ships vs. production vs. 0-1 metrics).
+            graph_reward_normalize=True,
+            reward_scale=0.001,
+            draw_terminal_reward=0.0,
+            step_cost=0.0,
         )
     elif reward_system == "aggressive":
         cfg = RewardConfig(
@@ -463,3 +570,221 @@ def compute_step_reward(
 
     terminal_term = cfg.terminal_scale * float(env_terminal_reward) if terminal else 0.0
     return float(shaped + terminal_term)
+
+
+# Mapping of edge-efficiency signal name -> column index in
+# GRAPH_EDGE_METRIC_DIM (see model_graph_pyg._graph_edge_metric_matrix).
+_EDGE_SIGNAL_INDEX = {
+    "eta_norm": 0,
+    "movement_resistance": 1,
+    "same_owner": 2,
+    "is_self_src": 3,
+    "is_self_tgt": 4,
+    "is_enemy_tgt": 5,
+    "is_neutral_tgt": 6,
+    "strategic_gradient": 7,
+    "flow_opportunity": 8,
+}
+
+
+def compute_graph_metrics_summary(
+    obs,
+    *,
+    edge_signal: str = "flow_opportunity",
+    cfg: Optional[RewardConfig] = None,
+) -> dict:
+    """Lightweight scalar summary of graph metrics for reward shaping.
+
+    Returns ``{"node_sum": list, "edge_sum": float}`` where ``node_sum``
+    has length :data:`model_graph_pyg.GRAPH_NODE_METRIC_DIM` (8) or
+    :data:`GRAPH_NODE_METRIC_DIM_FLUX` (12) depending on
+    ``cfg.enable_flux_metrics``.  Computed without constructing a PyG
+    ``Data`` object: ETA is computed once and shared between node + edge
+    metric matrices.
+
+    Falls back to a zeroed summary if torch / model_graph_pyg is unavailable.
+    """
+    try:
+        import torch
+        from model_graph_pyg import (
+            GRAPH_NODE_METRIC_DIM,
+            GRAPH_NODE_METRIC_DIM_FLUX,
+            _estimated_intercept_eta_matrix,
+            _graph_edge_metric_matrix,
+            _graph_node_metrics,
+        )
+    except Exception:
+        return {"node_sum": [0.0] * 8, "edge_sum": 0.0}
+
+    edge_idx = _EDGE_SIGNAL_INDEX.get(edge_signal, _EDGE_SIGNAL_INDEX["flow_opportunity"])
+    flux_enabled = bool(cfg is not None and getattr(cfg, "enable_flux_metrics", False))
+    fallback_dim = GRAPH_NODE_METRIC_DIM_FLUX if flux_enabled else GRAPH_NODE_METRIC_DIM
+
+    with torch.no_grad():
+        planet_feats = torch.as_tensor(obs.planet_feats, dtype=torch.float32)
+        edge_bias = torch.as_tensor(obs.edge_bias, dtype=torch.float32)
+        planet_mask = torch.as_tensor(obs.planet_mask, dtype=torch.bool)
+        n = int(planet_mask.sum().item())
+        if n <= 0:
+            return {"node_sum": [0.0] * fallback_dim, "edge_sum": 0.0}
+        eta = _estimated_intercept_eta_matrix(planet_feats, edge_bias, n)
+        flux_features = None
+        if flux_enabled:
+            from .flux import compute_node_flux_features
+            flux_np = compute_node_flux_features(
+                obs,
+                p_max=int(planet_feats.shape[0]),
+                mode=getattr(cfg, "flux_mode", "exp_decay"),
+                tau=float(getattr(cfg, "flux_tau", 10.0)),
+                eta_norm=float(getattr(cfg, "flux_eta_norm", 50.0)),
+                ship_norm=float(getattr(cfg, "flux_ship_norm", 50.0)),
+            )
+            flux_features = torch.as_tensor(flux_np[:n], dtype=torch.float32)
+        node_metrics = _graph_node_metrics(
+            planet_feats, edge_bias, n, eta=eta, flux_features=flux_features,
+        )
+        edge_metrics = _graph_edge_metric_matrix(
+            planet_feats, edge_bias, n, eta=eta, node_metrics=node_metrics,
+        )
+        node_sum = node_metrics.sum(dim=0).cpu().tolist()
+        edge_sum = float(edge_metrics[..., edge_idx].sum().item())
+    return {"node_sum": node_sum, "edge_sum": edge_sum}
+
+
+def compute_graph_native_reward(
+    prev_obs_or_summary,
+    curr_obs_or_summary,
+    player: int,
+    *,
+    cfg: Optional[RewardConfig] = None,
+    turn: int = 0,
+) -> float:
+    """Graph-native potential-based reward.
+
+    Either argument may be an ``Observation`` (in which case a metric
+    summary is computed on the fly) or a pre-computed summary dict from
+    :func:`compute_graph_metrics_summary`.  Passing pre-computed summaries
+    avoids a duplicate metric pass when the rollout caches the previous
+    step's summary.
+
+    Implements **potential-based shaping** (Ng, Harada & Russell 1999):
+
+        r_t = γ · φ(s_{t+1}) − φ(s_t)
+
+    where φ is the weighted sum of graph node + edge metric channels and
+    γ is :attr:`RewardConfig.graph_potential_discount` (matching PPO
+    ``gamma`` keeps the optimal policy invariant).
+
+    Falls back to ``0.0`` if torch / model_graph_pyg is unavailable.
+    """
+    cfg = cfg or RewardConfig()
+
+    def _as_summary(x):
+        if isinstance(x, dict):
+            return x
+        return compute_graph_metrics_summary(
+            x, edge_signal=cfg.graph_edge_efficiency_signal, cfg=cfg,
+        )
+
+    prev = _as_summary(prev_obs_or_summary)
+    curr = _as_summary(curr_obs_or_summary)
+
+    prev_node = prev.get("node_sum") or []
+    curr_node = curr.get("node_sum") or []
+    if not prev_node or not curr_node or len(prev_node) != len(curr_node):
+        return 0.0
+
+    # Channel order must mirror ``_graph_node_metrics`` (base 8) followed
+    # by ``compute_node_flux_features`` (4 flux channels).
+    weights = (
+        cfg.graph_friendly_influence_weight,
+        cfg.graph_enemy_influence_weight,
+        cfg.graph_influence_balance_weight,
+        cfg.graph_friendly_support_weight,
+        cfg.graph_supportability_weight,
+        cfg.graph_vulnerability_weight,
+        cfg.graph_production_potential_weight,
+        cfg.graph_strategic_potential_weight,
+        cfg.graph_flux_friendly_in_weight,
+        cfg.graph_flux_friendly_out_weight,
+        cfg.graph_flux_enemy_in_weight,
+        cfg.graph_flux_enemy_out_weight,
+    )
+    if len(weights) != len(curr_node):
+        # Truncate to match summary length (8-channel summary discards the
+        # 4 flux weights automatically when ``enable_flux_metrics`` is off).
+        weights = weights[: len(curr_node)] + (0.0,) * max(0, len(curr_node) - len(weights))
+
+    discount = float(cfg.graph_potential_discount)
+    # Potential-based shaping per channel: r_i = γ * curr_i - prev_i
+    raw_reward = 0.0
+    for w, p_i, c_i in zip(weights, prev_node, curr_node):
+        if w == 0.0:
+            continue
+        raw_reward += float(w) * (discount * float(c_i) - float(p_i))
+
+    # Edge-level signal (single scalar channel).
+    if cfg.graph_edge_efficiency_weight != 0.0:
+        prev_edge = float(prev.get("edge_sum", 0.0))
+        curr_edge = float(curr.get("edge_sum", 0.0))
+        raw_reward += cfg.graph_edge_efficiency_weight * (discount * curr_edge - prev_edge)
+
+    T = max(1, int(cfg.max_turns))
+    time_norm = max(0.0, (T - turn) / T)
+    time_factor = max(
+        cfg.time_decay_floor,
+        time_norm ** max(0.0, float(cfg.capture_time_curvature)),
+    )
+
+    return float(raw_reward * time_factor * cfg.reward_scale)
+
+
+class RunningMeanStd:
+    """Welford-style running estimator of mean and variance for scalars.
+
+    Used by the graph_native reward path to normalize per-step rewards
+    by a running standard deviation (per-player), which keeps the
+    advantage scale stable across the heterogeneous graph metric channels
+    (ships ~ 0..1000 vs. supportability ~ 0..1).
+
+    Notes
+    -----
+    - Only the standard deviation is consumed (the mean is *not*
+      subtracted); subtracting the mean would shift the equilibrium of a
+      potential-based shaping signal away from zero.
+    - During the first ``warmup`` updates the std is treated as ``1.0`` so
+      we don't amplify near-zero noise into huge rewards.
+    """
+
+    __slots__ = ("count", "_mean", "_m2", "warmup")
+
+    def __init__(self, *, warmup: int = 64) -> None:
+        self.count = 0
+        self._mean = 0.0
+        self._m2 = 0.0
+        self.warmup = max(0, int(warmup))
+
+    def update(self, value: float) -> None:
+        v = float(value)
+        self.count += 1
+        delta = v - self._mean
+        self._mean += delta / self.count
+        delta2 = v - self._mean
+        self._m2 += delta * delta2
+
+    @property
+    def variance(self) -> float:
+        if self.count < 2:
+            return 0.0
+        return self._m2 / (self.count - 1)
+
+    @property
+    def std(self) -> float:
+        return self.variance ** 0.5
+
+    def normalize(self, value: float, *, eps: float = 1e-6) -> float:
+        """Return ``value / max(std, eps)`` once warmup is satisfied; else ``value``."""
+        if self.count < self.warmup:
+            return float(value)
+        s = self.std
+        return float(value) / max(s, float(eps))
