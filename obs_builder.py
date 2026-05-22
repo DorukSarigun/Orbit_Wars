@@ -121,6 +121,17 @@ class Observation:
     source_mask: np.ndarray    # (P_max,) bool, planets we may launch from
     planet_ids: np.ndarray     # (P_max,) int32, env planet ids (-1 for padding)
     fleet_ids: np.ndarray      # (F_max,) int32
+    # ---- Fleet routing (used by flux-based metrics & action heads) -----------
+    # Per-fleet pointers into the planet array, plus raw scalars that the
+    # downstream flux helpers need.  All entries are -1 / 0 when no fleet is
+    # present at that slot (or when the predicted target falls outside the
+    # current planet set).  See ``rl/flux.py``.
+    fleet_src_slot: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))   # (F_max,) int32, source planet slot or -1
+    fleet_tgt_slot: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))   # (F_max,) int32, predicted target slot or -1
+    fleet_eta_raw: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))  # (F_max,) float32, raw eta in turns (0.0 if no prediction)
+    fleet_ships_raw: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))  # (F_max,) float32, raw ship count
+    fleet_is_self: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.bool_))     # (F_max,) bool, fleet belongs to ``player``
+    fleet_is_enemy: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.bool_))    # (F_max,) bool, fleet belongs to an enemy (not neutral)
     # Bookkeeping (not a tensor, but useful):
     meta: dict = field(default_factory=dict)
 
@@ -454,11 +465,41 @@ def build_observation(
     fleet_ids = np.full(f_max, -1, dtype=np.int32)
     fleet_pos = np.zeros((f_max, 2), dtype=np.float32)
 
+    # Fleet routing arrays (needed by flux-based metrics & heads). Default
+    # ``-1`` slot means "no valid reference" and downstream code skips it.
+    fleet_src_slot = np.full(f_max, -1, dtype=np.int32)
+    fleet_tgt_slot = np.full(f_max, -1, dtype=np.int32)
+    fleet_eta_raw = np.zeros(f_max, dtype=np.float32)
+    fleet_ships_raw = np.zeros(f_max, dtype=np.float32)
+    fleet_is_self = np.zeros(f_max, dtype=bool)
+    fleet_is_enemy = np.zeros(f_max, dtype=bool)
+
+    # planet_id -> slot index in the *padded* planet array
+    planet_id_to_slot: dict[int, int] = {
+        int(pid): i for i, pid in enumerate(planet_ids) if pid >= 0
+    }
+
     for j, f in enumerate(fleets):
         fleet_feats[j] = _fleet_features(f, player, preds.get(f.id), max_speed)
         fleet_mask[j] = True
         fleet_ids[j] = f.id
         fleet_pos[j] = (f.x, f.y)
+
+        # Source slot (from_planet_id is always valid; if the planet was
+        # destroyed mid-flight it may have left the visible set, hence the
+        # ``-1`` fallback).
+        fleet_src_slot[j] = planet_id_to_slot.get(int(f.from_planet_id), -1)
+        # Target slot from the ETA prediction (may be None if the fleet
+        # is heading off-board / into the sun).
+        pred = preds.get(f.id)
+        if pred is not None:
+            fleet_tgt_slot[j] = planet_id_to_slot.get(int(pred["target_id"]), -1)
+            fleet_eta_raw[j] = float(pred["eta"])
+        fleet_ships_raw[j] = float(f.ships)
+        if f.owner == player:
+            fleet_is_self[j] = True
+        elif f.owner != -1:
+            fleet_is_enemy[j] = True
 
     # ------- Global features -------
     global_feats = _global_features(
@@ -524,6 +565,12 @@ def build_observation(
         source_mask=source_mask,
         planet_ids=planet_ids,
         fleet_ids=fleet_ids,
+        fleet_src_slot=fleet_src_slot,
+        fleet_tgt_slot=fleet_tgt_slot,
+        fleet_eta_raw=fleet_eta_raw,
+        fleet_ships_raw=fleet_ships_raw,
+        fleet_is_self=fleet_is_self,
+        fleet_is_enemy=fleet_is_enemy,
         meta={
             "n_planets": len(planets),
             "n_fleets": len(fleets),

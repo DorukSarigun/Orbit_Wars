@@ -15,8 +15,10 @@ from model import (
 from model_graph_pyg import (
     PYG_EDGE_FEATURE_DIM,
     PYG_PLANET_FEATURE_DIM,
+    PYG_PLANET_FEATURE_DIM_FLUX,
     BilinearEdgeHead,
     PygPlanetGraphEncoder,
+    SinkhornEdgeHead,
     _batched_pair_edge_features,
     packed_observations_to_pyg_batch,
     pyg_nodes_to_padded,
@@ -47,34 +49,68 @@ class PygEdgeNativePolicy(nn.Module):
         d_model: int = 128,
         n_layers: int = 3,
         dropout: float = 0.0,
+        enable_flux_features: bool = False,
+        enable_sinkhorn: bool = False,
+        sinkhorn_iters: int = 5,
+        sinkhorn_tau: float = 1.0,
     ):
+        """Edge-native planet-graph PPO policy.
+
+        Set ``enable_sinkhorn=True`` to replace the plain
+        :class:`BilinearEdgeHead` edge scorer with a
+        :class:`SinkhornEdgeHead` that runs ``sinkhorn_iters`` log-domain
+        row / col normalization passes before returning logits.  Action
+        sampling, log-prob evaluation, and the rest of the PPO
+        machinery are unchanged.
+
+        ``enable_flux_features`` widens the encoder input from 42 to 46
+        columns so the policy can consume the four
+        ``[friendly_in, friendly_out, enemy_in, enemy_out]`` flux
+        channels (Phase 3 of the credit-assignment plan).
+        """
         super().__init__()
         self.p_max = p_max
         self.d_model = d_model
         self.model_variant = "pyg_edge_native"
+        self.enable_sinkhorn = bool(enable_sinkhorn)
+        self.sinkhorn_iters = int(sinkhorn_iters)
+        self.sinkhorn_tau = float(sinkhorn_tau)
         # ``planet_dim`` is exposed as the *raw* feature dim for rollout
         # / build_observation compatibility.  The encoder receives
-        # augmented features (PYG_PLANET_FEATURE_DIM) appended internally
-        # by ``packed_observations_to_pyg_batch``.
+        # augmented features (PYG_PLANET_FEATURE_DIM = 42, or 46 when
+        # ``enable_flux_features`` is on) appended internally by
+        # ``packed_observations_to_pyg_batch``.
         self.planet_dim = PLANET_FEATURE_DIM
-        self.encoder_planet_dim = PYG_PLANET_FEATURE_DIM
+        self.enable_flux_features = bool(enable_flux_features)
+        encoder_planet_dim = (
+            PYG_PLANET_FEATURE_DIM_FLUX if enable_flux_features else PYG_PLANET_FEATURE_DIM
+        )
+        self.encoder_planet_dim = encoder_planet_dim
         self.global_dim = GLOBAL_FEATURE_DIM
         self.edge_dim = EDGE_FEATURE_DIM
         self.f_max = F_MAX_DEFAULT
 
         self.encoder = PygPlanetGraphEncoder(
-            planet_dim=PYG_PLANET_FEATURE_DIM,
+            planet_dim=encoder_planet_dim,
             edge_dim=PYG_EDGE_FEATURE_DIM,
             global_dim=GLOBAL_FEATURE_DIM,
             d_model=d_model,
             n_layers=n_layers,
             dropout=dropout,
+            enable_flux_features=enable_flux_features,
         )
 
         # Edge-native heads (Bilinear: fuses src/tgt/edge/global with O(B*P) heavy
         # projections instead of O(B*P*P) 4*d_model concat MLP).  Edge projection
         # is shared via self.encoder.edge_proj.
-        self.edge_head = BilinearEdgeHead(d_model, output_dim=1)
+        if enable_sinkhorn:
+            # Wraps a BilinearEdgeHead internally plus K log-domain
+            # row / col normalization passes.  Returns (B, P, P, 1).
+            self.edge_head = SinkhornEdgeHead(
+                d_model, num_iterations=sinkhorn_iters, tau=sinkhorn_tau,
+            )
+        else:
+            self.edge_head = BilinearEdgeHead(d_model, output_dim=1)
         self.ship_head = BilinearEdgeHead(d_model, output_dim=2)
         self.noop_head = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -100,15 +136,28 @@ class PygEdgeNativePolicy(nn.Module):
         planet_mask: torch.Tensor,
         fleet_mask: torch.Tensor,
         source_mask: torch.Tensor,
+        flux_features: Optional[torch.Tensor] = None,
     ) -> PolicyOutput:
+        # When the encoder was built with flux features, callers must
+        # supply a ``(B, P_max, 4)`` tensor; otherwise we fail loudly
+        # rather than silently broadcasting zeros (which would mask bugs
+        # in the rollout / buffer plumbing).
+        if self.enable_flux_features and flux_features is None:
+            raise ValueError(
+                "PygEdgeNativePolicy was built with enable_flux_features=True "
+                "but `flux_features` was not passed to forward()."
+            )
         # 1. Pack observations into a PyG Batch.
-        graph_batch = packed_observations_to_pyg_batch({
+        batch_dict: dict[str, torch.Tensor] = {
             "planet_feats": planet_feats,
             "global_feats": global_feats,
             "edge_bias": edge_bias,
             "planet_mask": planet_mask,
             "source_mask": source_mask,
-        })
+        }
+        if self.enable_flux_features:
+            batch_dict["flux_features"] = flux_features  # type: ignore[assignment]
+        graph_batch = packed_observations_to_pyg_batch(batch_dict)
 
         # 2. Encode with GINEConv layers.
         enc = self.encoder(graph_batch)
@@ -121,8 +170,22 @@ class PygEdgeNativePolicy(nn.Module):
         edge_pair = _batched_pair_edge_features(planet_feats, edge_bias, planet_mask)
         edge_tok = self.encoder.edge_proj(edge_pair)  # (B, P, P, d_model)
 
-        # 4. Edge logits / ship params via BilinearEdgeHead (additive fusion).
-        edge_logits = self.edge_head(planet_tok, planet_tok, edge_tok, graph_summary).squeeze(-1)
+        # 4. Edge logits / ship params via Bilinear (or Sinkhorn) edge head.
+        if self.enable_sinkhorn:
+            # Build a valid-edge mask so Sinkhorn doesn't normalise mass
+            # through self-loops or pad / non-source cells.
+            eye_mask = torch.eye(self.p_max, dtype=torch.bool, device=planet_feats.device)
+            edge_valid = (
+                (~eye_mask)[None]
+                & planet_mask[:, None, :]
+                & source_mask[:, :, None]
+            )
+            edge_logits = self.edge_head(
+                planet_tok, planet_tok, edge_tok, graph_summary,
+                edge_mask=edge_valid,
+            ).squeeze(-1)
+        else:
+            edge_logits = self.edge_head(planet_tok, planet_tok, edge_tok, graph_summary).squeeze(-1)
 
         # 5. Noop logit  ->  (B, 1)
         noop_logit = self.noop_head(graph_summary)  # (B, 1)

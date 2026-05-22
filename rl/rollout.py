@@ -68,6 +68,34 @@ MAX_LAUNCHES_PER_PLAYER_TURN = 8
 MAX_PAIR_CANDIDATES = 64
 
 
+def _pack_with_flux(obs_list, *, device, policy, reward_cfg):
+    """Pack a list of observations into a tensor batch, attaching flux
+    features when the policy was built with ``enable_flux_features=True``.
+
+    The flux mode / temperature mirror the reward-side
+    :class:`RewardConfig` so a single flag controls both encoder input
+    and reward shaping when the user wants them coupled.
+    """
+    import numpy as np
+    batch = pack_observations(obs_list, device=device)
+    if not getattr(policy, "enable_flux_features", False):
+        return batch
+    from .flux import compute_node_flux_features
+    p_max = int(obs_list[0].planet_feats.shape[0])
+    flux_np = np.stack([
+        compute_node_flux_features(
+            o, p_max=p_max,
+            mode=getattr(reward_cfg, "flux_mode", "exp_decay"),
+            tau=float(getattr(reward_cfg, "flux_tau", 10.0)),
+            eta_norm=float(getattr(reward_cfg, "flux_eta_norm", 50.0)),
+            ship_norm=float(getattr(reward_cfg, "flux_ship_norm", 50.0)),
+        )
+        for o in obs_list
+    ])
+    batch["flux_features"] = torch.from_numpy(flux_np).to(device)
+    return batch
+
+
 def _incoming_bucket_idx(eta: float) -> int:
     for i, upper in enumerate(INCOMING_ETA_BUCKETS):
         if eta <= upper:
@@ -361,6 +389,7 @@ def _act_for_player(
     current_turn: int = 0,
     max_turns: int = 500,
     scripted_expansion: Optional[ScriptedExpansionConfig] = None,
+    reward_cfg: Optional[RewardConfig] = None,
 ) -> tuple:
     angular_velocity = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=angular_velocity,
@@ -408,7 +437,7 @@ def _act_for_player(
                 planet_feats=obs_work.planet_feats.copy(),
                 source_mask=obs_work.source_mask.copy(),
             )
-            batch = pack_observations([obs_decision], device=device)
+            batch = _pack_with_flux([obs_decision], device=device, policy=policy, reward_cfg=reward_cfg)
             selected = None
             with torch.no_grad():
                 out = policy(**batch)
@@ -584,7 +613,7 @@ def _act_for_player(
                 available_pairs[src_slot, :] = False
             decisions.append((obs_decision, action, out, True, False, fleet_meta))
         if last_out is None:
-            batch = pack_observations([obs], device=device)
+            batch = _pack_with_flux([obs], device=device, policy=policy, reward_cfg=reward_cfg)
             with torch.no_grad():
                 last_out = policy(**batch)
         return decisions, env_action, last_out, launch_count, invalid_count
@@ -595,7 +624,7 @@ def _act_for_player(
             planet_feats=obs_work.planet_feats.copy(),
             source_mask=obs_work.source_mask.copy(),
         )
-        batch = pack_observations([obs_decision], device=device)
+        batch = _pack_with_flux([obs_decision], device=device, policy=policy, reward_cfg=reward_cfg)
         with torch.no_grad():
             out = policy(**batch)
             action = policy.act_source(
@@ -693,7 +722,7 @@ def _act_for_player(
         decisions.append((obs_decision, action, out, move is not None, (move is None and not is_noop), fleet_meta))
 
     if last_out is None:
-        batch = pack_observations([obs], device=device)
+        batch = _pack_with_flux([obs], device=device, policy=policy, reward_cfg=reward_cfg)
         with torch.no_grad():
             last_out = policy(**batch)
 
@@ -836,6 +865,7 @@ def collect_episode(
                     policy, env_obs[p], p, device=device, current_turn=t,
                     max_turns=reward_cfg.max_turns,
                     scripted_expansion=scripted_expansion,
+                    reward_cfg=reward_cfg,
                 )))
         env_actions = []
         invalid_actions = [0 for _ in range(num_agents)]
@@ -937,7 +967,9 @@ def collect_episode(
                 # ``observation_to_pyg_data`` call that the legacy
                 # implementation made every step).
                 curr_summary = compute_graph_metrics_summary(
-                    curr_obs, edge_signal=reward_cfg.graph_edge_efficiency_signal,
+                    curr_obs,
+                    edge_signal=reward_cfg.graph_edge_efficiency_signal,
+                    cfg=reward_cfg,
                 )
                 if prev_graph_summaries[p] is None:
                     r = 0.0
@@ -971,6 +1003,13 @@ def collect_episode(
             # acted[p] = ("ppo", (decisions, em, last_out, launches, invalids))
             last_value[p] = float(acted[p][1][2].value[0].item())
 
+        # If the policy was built with ``enable_flux_features=True`` we need
+        # to pre-compute the four flux channels per stored transition so
+        # the PPO update can reconstruct the same encoder input later.
+        policy_wants_flux = bool(getattr(policy, "enable_flux_features", False))
+        if policy_wants_flux:
+            from .flux import compute_node_flux_features
+
         for p, item in enumerate(acted):
             if p in opponent_indices:
                 continue
@@ -982,6 +1021,19 @@ def collect_episode(
                     -reward_cfg.invalid_action_penalty
                     if invalid else 0.0
                 )
+                flux_arr = None
+                if policy_wants_flux:
+                    # Mode / tau mirror the reward-side ``RewardConfig`` so
+                    # one knob controls both signals when the user wants
+                    # them coupled.  Costs O(P_max^2) numpy per step.
+                    flux_arr = compute_node_flux_features(
+                        obs,
+                        p_max=int(obs.planet_feats.shape[0]),
+                        mode=getattr(reward_cfg, "flux_mode", "exp_decay"),
+                        tau=float(getattr(reward_cfg, "flux_tau", 10.0)),
+                        eta_norm=float(getattr(reward_cfg, "flux_eta_norm", 50.0)),
+                        ship_norm=float(getattr(reward_cfg, "flux_ship_norm", 50.0)),
+                    )
                 idx = buffer.add(Transition(
                     player=p,
                     planet_feats=obs.planet_feats,
@@ -1000,6 +1052,7 @@ def collect_episode(
                     reward=reward,
                     done=terminal,
                     turn=t,
+                    flux_features=flux_arr,
                 ))
                 new_indices.append(idx)
                 # Register fleet launch for delayed reward tracking.

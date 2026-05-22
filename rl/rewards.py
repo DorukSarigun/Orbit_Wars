@@ -185,6 +185,28 @@ class RewardConfig:
     graph_edge_efficiency_weight: float = 0.0
     graph_edge_efficiency_signal: str = "flow_opportunity"
 
+    # ---- Flux-augmented node metrics (Phase 1 of credit-assignment plan) ----
+    # When enabled, four additional per-node channels are appended to the
+    # graph metric summary, representing the imminence-weighted ship flow
+    # in (column-sum) and out (row-sum) of each planet for friendly and
+    # enemy fleets.  See ``rl/flux.py`` for the parametric weighting
+    # modes.  Used by ``compute_graph_native_reward`` to give partial
+    # credit for multi-step launches as fleets approach their target,
+    # without waiting for the final capture event.
+    enable_flux_metrics: bool = False
+    flux_mode: str = "exp_decay"      # "raw" | "linear" | "exp_decay"
+    flux_tau: float = 10.0            # decay timescale for exp_decay (turns)
+    flux_eta_norm: float = 50.0       # cutoff for linear mode (turns)
+    flux_ship_norm: float = 50.0      # divisor for output magnitude
+    # Per-channel reward weights, applied to potential-based delta like
+    # the other graph metrics.  Channel order matches
+    # ``rl/flux.compute_node_flux_features``:
+    #   [friendly_in, friendly_out, enemy_in, enemy_out]
+    graph_flux_friendly_in_weight: float = 0.0
+    graph_flux_friendly_out_weight: float = 0.0
+    graph_flux_enemy_in_weight: float = 0.0
+    graph_flux_enemy_out_weight: float = 0.0
+
     # ---- Potential-based shaping & normalization ----
     # Discount used in the potential-based shaping formula
     #   r_t = graph_potential_discount * φ(s_{t+1}) - φ(s_t)
@@ -565,12 +587,20 @@ _EDGE_SIGNAL_INDEX = {
 }
 
 
-def compute_graph_metrics_summary(obs, *, edge_signal: str = "flow_opportunity") -> dict:
+def compute_graph_metrics_summary(
+    obs,
+    *,
+    edge_signal: str = "flow_opportunity",
+    cfg: Optional[RewardConfig] = None,
+) -> dict:
     """Lightweight scalar summary of graph metrics for reward shaping.
 
-    Returns ``{"node_sum": np.ndarray(GRAPH_NODE_METRIC_DIM,), "edge_sum": float}``.
-    Computed without constructing a PyG ``Data`` object: ETA is computed
-    once and shared between node + edge metric matrices.
+    Returns ``{"node_sum": list, "edge_sum": float}`` where ``node_sum``
+    has length :data:`model_graph_pyg.GRAPH_NODE_METRIC_DIM` (8) or
+    :data:`GRAPH_NODE_METRIC_DIM_FLUX` (12) depending on
+    ``cfg.enable_flux_metrics``.  Computed without constructing a PyG
+    ``Data`` object: ETA is computed once and shared between node + edge
+    metric matrices.
 
     Falls back to a zeroed summary if torch / model_graph_pyg is unavailable.
     """
@@ -578,6 +608,7 @@ def compute_graph_metrics_summary(obs, *, edge_signal: str = "flow_opportunity")
         import torch
         from model_graph_pyg import (
             GRAPH_NODE_METRIC_DIM,
+            GRAPH_NODE_METRIC_DIM_FLUX,
             _estimated_intercept_eta_matrix,
             _graph_edge_metric_matrix,
             _graph_node_metrics,
@@ -586,6 +617,8 @@ def compute_graph_metrics_summary(obs, *, edge_signal: str = "flow_opportunity")
         return {"node_sum": [0.0] * 8, "edge_sum": 0.0}
 
     edge_idx = _EDGE_SIGNAL_INDEX.get(edge_signal, _EDGE_SIGNAL_INDEX["flow_opportunity"])
+    flux_enabled = bool(cfg is not None and getattr(cfg, "enable_flux_metrics", False))
+    fallback_dim = GRAPH_NODE_METRIC_DIM_FLUX if flux_enabled else GRAPH_NODE_METRIC_DIM
 
     with torch.no_grad():
         planet_feats = torch.as_tensor(obs.planet_feats, dtype=torch.float32)
@@ -593,9 +626,23 @@ def compute_graph_metrics_summary(obs, *, edge_signal: str = "flow_opportunity")
         planet_mask = torch.as_tensor(obs.planet_mask, dtype=torch.bool)
         n = int(planet_mask.sum().item())
         if n <= 0:
-            return {"node_sum": [0.0] * GRAPH_NODE_METRIC_DIM, "edge_sum": 0.0}
+            return {"node_sum": [0.0] * fallback_dim, "edge_sum": 0.0}
         eta = _estimated_intercept_eta_matrix(planet_feats, edge_bias, n)
-        node_metrics = _graph_node_metrics(planet_feats, edge_bias, n, eta=eta)
+        flux_features = None
+        if flux_enabled:
+            from .flux import compute_node_flux_features
+            flux_np = compute_node_flux_features(
+                obs,
+                p_max=int(planet_feats.shape[0]),
+                mode=getattr(cfg, "flux_mode", "exp_decay"),
+                tau=float(getattr(cfg, "flux_tau", 10.0)),
+                eta_norm=float(getattr(cfg, "flux_eta_norm", 50.0)),
+                ship_norm=float(getattr(cfg, "flux_ship_norm", 50.0)),
+            )
+            flux_features = torch.as_tensor(flux_np[:n], dtype=torch.float32)
+        node_metrics = _graph_node_metrics(
+            planet_feats, edge_bias, n, eta=eta, flux_features=flux_features,
+        )
         edge_metrics = _graph_edge_metric_matrix(
             planet_feats, edge_bias, n, eta=eta, node_metrics=node_metrics,
         )
@@ -635,7 +682,9 @@ def compute_graph_native_reward(
     def _as_summary(x):
         if isinstance(x, dict):
             return x
-        return compute_graph_metrics_summary(x, edge_signal=cfg.graph_edge_efficiency_signal)
+        return compute_graph_metrics_summary(
+            x, edge_signal=cfg.graph_edge_efficiency_signal, cfg=cfg,
+        )
 
     prev = _as_summary(prev_obs_or_summary)
     curr = _as_summary(curr_obs_or_summary)
@@ -645,6 +694,8 @@ def compute_graph_native_reward(
     if not prev_node or not curr_node or len(prev_node) != len(curr_node):
         return 0.0
 
+    # Channel order must mirror ``_graph_node_metrics`` (base 8) followed
+    # by ``compute_node_flux_features`` (4 flux channels).
     weights = (
         cfg.graph_friendly_influence_weight,
         cfg.graph_enemy_influence_weight,
@@ -654,8 +705,14 @@ def compute_graph_native_reward(
         cfg.graph_vulnerability_weight,
         cfg.graph_production_potential_weight,
         cfg.graph_strategic_potential_weight,
+        cfg.graph_flux_friendly_in_weight,
+        cfg.graph_flux_friendly_out_weight,
+        cfg.graph_flux_enemy_in_weight,
+        cfg.graph_flux_enemy_out_weight,
     )
     if len(weights) != len(curr_node):
+        # Truncate to match summary length (8-channel summary discards the
+        # 4 flux weights automatically when ``enable_flux_metrics`` is off).
         weights = weights[: len(curr_node)] + (0.0,) * max(0, len(curr_node) - len(weights))
 
     discount = float(cfg.graph_potential_discount)

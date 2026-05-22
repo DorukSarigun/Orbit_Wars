@@ -27,6 +27,8 @@ from model import OrbitWarsPolicy
 from model_grouped_planet_edge import EdgeAwareGroupedPlanetOrbitWarsPolicy, PairwiseEdgeGroupedPlanetOrbitWarsPolicy
 from model_grouped_planet import GroupedPlanetOrbitWarsPolicy
 from model_planet_only import PlanetOnlyOrbitWarsPolicy
+# PyG variants are imported lazily inside ``_make_policy`` so the train
+# script stays usable even on installs without ``torch_geometric``.
 
 from .buffer import RolloutBuffer
 from .metrics import (
@@ -76,9 +78,35 @@ class TrainConfig:
     # disabled and PPOConfig.entropy_coef is used as a constant.
     entropy_coef_final: Optional[float] = None
     entropy_anneal_iters: int = 0
+    # PyG-only knobs (flux-augmented credit assignment & multi-launch
+    # coordination).  ``enable_flux_features`` widens the encoder input
+    # by 4 channels and requires the rollout to pre-compute per-step
+    # flux features (``rl/flux.compute_node_flux_features``).
+    # ``enable_sinkhorn`` (only meaningful for ``pyg_edge_native``)
+    # replaces the bilinear edge scorer with a Sinkhorn head doing
+    # ``sinkhorn_iters`` log-domain row/col normalization passes.
+    enable_flux_features: bool = False
+    enable_sinkhorn: bool = False
+    sinkhorn_iters: int = 5
+    sinkhorn_tau: float = 1.0
 
 
 def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
+    """Construct a policy of the requested variant.
+
+    Variant-specific kwargs (``enable_flux_features``, ``enable_sinkhorn``,
+    ``sinkhorn_iters``, ``sinkhorn_tau``) are silently dropped for
+    non-PyG variants so the same CLI defaults work everywhere.  The
+    ``planet_dim`` and ``f_max`` kwargs are also normalized: the PyG
+    variants hardcode them internally, so passing them through would
+    raise a ``TypeError``.
+    """
+    flux_kwargs = {
+        k: kwargs.pop(k) for k in (
+            "enable_flux_features", "enable_sinkhorn",
+            "sinkhorn_iters", "sinkhorn_tau",
+        ) if k in kwargs
+    }
     if variant == "grouped_planet":
         return GroupedPlanetOrbitWarsPolicy(**kwargs)
     if variant == "grouped_planet_edge":
@@ -91,6 +119,30 @@ def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
         return PlanetOnlyOrbitWarsPolicy(**kwargs)
     if variant == "full":
         return OrbitWarsPolicy(**kwargs)
+    if variant in ("pyg_planet_graph", "pyg_edge_native"):
+        # Lazy import: PyG is an optional dependency.
+        from model_graph_pyg import PygPlanetGraphPolicy
+        from model_graph_pyg_edgeonly import PygEdgeNativePolicy
+
+        # PyG variants set planet_dim / f_max internally.
+        kwargs.pop("planet_dim", None)
+        kwargs.pop("f_max", None)
+        # ``n_heads`` is a multi-head-attention knob that PyG GNN
+        # encoders don't expose; drop it so the same TrainConfig works.
+        kwargs.pop("n_heads", None)
+        if variant == "pyg_planet_graph":
+            return PygPlanetGraphPolicy(
+                **kwargs,
+                enable_flux_features=bool(flux_kwargs.get("enable_flux_features", False)),
+            )
+        # pyg_edge_native: also accepts sinkhorn knobs.
+        return PygEdgeNativePolicy(
+            **kwargs,
+            enable_flux_features=bool(flux_kwargs.get("enable_flux_features", False)),
+            enable_sinkhorn=bool(flux_kwargs.get("enable_sinkhorn", False)),
+            sinkhorn_iters=int(flux_kwargs.get("sinkhorn_iters", 5)),
+            sinkhorn_tau=float(flux_kwargs.get("sinkhorn_tau", 1.0)),
+        )
     raise ValueError(f"Unknown model_variant={variant!r}")
 
 
@@ -114,9 +166,44 @@ def _episode_num_agents(train_cfg: TrainConfig, seed: int) -> int:
     return int(random.Random(int(seed)).choice(choices))
 
 
+_GROUPED_VARIANTS = ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair")
+_PYG_VARIANTS = ("pyg_planet_graph", "pyg_edge_native")
+
+
+def _policy_n_layers(policy) -> int:
+    """Best-effort n_layers extractor across variants."""
+    variant = getattr(policy, "model_variant", "full")
+    if variant in _GROUPED_VARIANTS:
+        return len(policy.encoder.blocks)
+    if variant in _PYG_VARIANTS:
+        return getattr(policy.encoder, "n_layers", 0)
+    return len(policy.blocks)
+
+
 def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int,
                train_cfg: TrainConfig, ppo_cfg: PPOConfig, reward_cfg: RewardConfig) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    variant = getattr(policy, "model_variant", "full")
+    arch = {
+        "p_max": policy.p_max,
+        "f_max": policy.f_max,
+        "planet_dim": policy.planet_dim,
+        "d_model": policy.d_model,
+        # PyG GNN encoders don't have a multi-head attention block; store
+        # whatever ``n_heads`` is attached to the policy and fall back to
+        # the TrainConfig value otherwise.
+        "n_heads": getattr(policy, "n_heads", train_cfg.n_heads),
+        "n_layers": _policy_n_layers(policy),
+        "model_variant": variant,
+        "attention_type": getattr(policy, "attention_type", "full"),
+        "n_inducing_points": getattr(policy, "n_inducing_points", 32),
+    }
+    if variant in _PYG_VARIANTS:
+        arch["enable_flux_features"] = bool(getattr(policy, "enable_flux_features", False))
+    if variant == "pyg_edge_native":
+        arch["enable_sinkhorn"] = bool(getattr(policy, "enable_sinkhorn", False))
+        arch["sinkhorn_iters"] = int(getattr(policy, "sinkhorn_iters", 5))
+        arch["sinkhorn_tau"] = float(getattr(policy, "sinkhorn_tau", 1.0))
     torch.save({
         "iteration": iteration,
         "policy_state_dict": policy.state_dict(),
@@ -125,17 +212,7 @@ def _save_ckpt(policy: OrbitWarsPolicy, optimizer, path: Path, *, iteration: int
         "ppo_cfg": asdict(ppo_cfg),
         "reward_cfg": asdict(reward_cfg),
         # Architecture is needed to rebuild the model on load.
-        "arch": {
-            "p_max": policy.p_max,
-            "f_max": policy.f_max,
-            "planet_dim": policy.planet_dim,
-            "d_model": policy.d_model,
-            "n_heads": policy.n_heads,
-            "n_layers": len(policy.encoder.blocks) if getattr(policy, "model_variant", "full") in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair") else len(policy.blocks),
-            "model_variant": getattr(policy, "model_variant", "full"),
-            "attention_type": getattr(policy, "attention_type", "full"),
-            "n_inducing_points": getattr(policy, "n_inducing_points", 32),
-        },
+        "arch": arch,
     }, path)
 
 
@@ -170,14 +247,21 @@ def load_checkpoint(path: str | Path, device: torch.device | None = None) -> tup
     if planet_dim is None:
         state = ckpt["policy_state_dict"]
         planet_dim = int(state["planet_proj.weight"].shape[1])
-    policy = _make_policy(
-        arch.get("model_variant", "full"),
+    variant = arch.get("model_variant", "full")
+    make_kwargs: dict = dict(
         p_max=arch["p_max"], f_max=arch["f_max"], planet_dim=planet_dim,
         d_model=arch["d_model"], n_heads=arch["n_heads"],
         n_layers=arch["n_layers"],
         attention_type=arch.get("attention_type", "full"),
         n_inducing_points=arch.get("n_inducing_points", 32),
     )
+    if variant in _PYG_VARIANTS:
+        make_kwargs["enable_flux_features"] = bool(arch.get("enable_flux_features", False))
+    if variant == "pyg_edge_native":
+        make_kwargs["enable_sinkhorn"] = bool(arch.get("enable_sinkhorn", False))
+        make_kwargs["sinkhorn_iters"] = int(arch.get("sinkhorn_iters", 5))
+        make_kwargs["sinkhorn_tau"] = float(arch.get("sinkhorn_tau", 1.0))
+    policy = _make_policy(variant, **make_kwargs)
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.to(device)
     return policy, ckpt
@@ -209,22 +293,34 @@ def train(
             n_layers=train_cfg.n_layers,
             attention_type=train_cfg.grouped_attention_type,
             n_inducing_points=train_cfg.n_inducing_points,
+            enable_flux_features=train_cfg.enable_flux_features,
+            enable_sinkhorn=train_cfg.enable_sinkhorn,
+            sinkhorn_iters=train_cfg.sinkhorn_iters,
+            sinkhorn_tau=train_cfg.sinkhorn_tau,
         ).to(device)
         start_iter = 0
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=train_cfg.learning_rate)
     n_params = sum(p.numel() for p in policy.parameters())
     variant = getattr(policy, "model_variant", "full")
-    if variant in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"):
+    if variant in _GROUPED_VARIANTS or variant in _PYG_VARIANTS:
         token_count = policy.p_max
     elif variant == "planet_only":
         token_count = policy.p_max + 1
     else:
         token_count = policy.p_max + policy.f_max + 1
-    attention_info = ""
-    if variant in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"):
-        attention_info = f", attention={policy.attention_type}, M={policy.n_inducing_points}"
-    print(f"Policy[{variant}]: {n_params:,} params, T={token_count}{attention_info}, device={device}")
+    extra_info = ""
+    if variant in _GROUPED_VARIANTS:
+        extra_info = f", attention={policy.attention_type}, M={policy.n_inducing_points}"
+    elif variant in _PYG_VARIANTS:
+        bits = []
+        if getattr(policy, "enable_flux_features", False):
+            bits.append("flux")
+        if getattr(policy, "enable_sinkhorn", False):
+            bits.append(f"sinkhorn(K={policy.sinkhorn_iters},tau={policy.sinkhorn_tau})")
+        if bits:
+            extra_info = ", " + ",".join(bits)
+    print(f"Policy[{variant}]: {n_params:,} params, T={token_count}{extra_info}, device={device}")
 
     log_path = Path(train_cfg.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -420,7 +516,50 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--grouped-attention-type", choices=("full", "induced"), default="full")
     p.add_argument("--n-inducing-points", type=int, default=32)
-    p.add_argument("--model-variant", choices=("full", "planet_only", "grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"), default="planet_only")
+    p.add_argument(
+        "--model-variant",
+        choices=(
+            "full", "planet_only",
+            "grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair",
+            "pyg_planet_graph", "pyg_edge_native",
+        ),
+        default="planet_only",
+        help="Policy architecture. ``pyg_*`` variants require torch_geometric.",
+    )
+    p.add_argument(
+        "--enable-flux-features", action="store_true",
+        help="(PyG variants) widen the encoder input by the 4 flux channels "
+             "[friendly_in, friendly_out, enemy_in, enemy_out].  Requires the "
+             "rollout to pre-compute and store flux features per step.",
+    )
+    p.add_argument(
+        "--enable-sinkhorn", action="store_true",
+        help="(pyg_edge_native only) replace the bilinear edge head with a "
+             "Sinkhorn head that runs log-domain row/col normalization passes.",
+    )
+    p.add_argument(
+        "--sinkhorn-iters", type=int, default=5,
+        help="Number of Sinkhorn iterations (K=0 falls back to bilinear).",
+    )
+    p.add_argument(
+        "--sinkhorn-tau", type=float, default=1.0,
+        help="Temperature for the Sinkhorn iterations (lower = sharper plan).",
+    )
+    # Reward-side flux knobs (Phase 1 of the credit-assignment plan).  All
+    # default to None so the preset's defaults survive when the user
+    # doesn't override them.
+    p.add_argument(
+        "--enable-flux-metrics", action="store_true",
+        help="Turn on the 4 flux channels in the graph_native reward summary.",
+    )
+    p.add_argument("--flux-mode", choices=("raw", "linear", "exp_decay"), default=None,
+                   help="Weighting mode used by rl.flux for in-flight fleets.")
+    p.add_argument("--flux-tau", type=float, default=None,
+                   help="Decay timescale (turns) for exp_decay mode.")
+    p.add_argument("--graph-flux-friendly-in-weight", type=float, default=None)
+    p.add_argument("--graph-flux-friendly-out-weight", type=float, default=None)
+    p.add_argument("--graph-flux-enemy-in-weight", type=float, default=None)
+    p.add_argument("--graph-flux-enemy-out-weight", type=float, default=None)
     p.add_argument("--save-game-batches", action="store_true",
                    help="Save one .pt rollout/training batch per self-play game after GAE")
     p.add_argument("--batch-save-dir", default="checkpoints/game_batches")
@@ -564,6 +703,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         opponent=args.opponent,
         entropy_coef_final=args.entropy_coef_final,
         entropy_anneal_iters=args.entropy_anneal_iters,
+        enable_flux_features=args.enable_flux_features,
+        enable_sinkhorn=args.enable_sinkhorn,
+        sinkhorn_iters=args.sinkhorn_iters,
+        sinkhorn_tau=args.sinkhorn_tau,
     )
     ppo_cfg = PPOConfig(
         clip_range=args.clip_range,
@@ -609,6 +752,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         eligibility_trace_decay=args.eligibility_trace_decay,
         noop_trace_weight=args.noop_trace_weight,
         eligibility_trace_reverse=args.eligibility_trace_reverse,
+        # Flux-augmented reward shaping (Phase 1 of credit-assignment).
+        # ``--enable-flux-metrics`` is a store_true flag so we only forward
+        # ``True`` to ``build_reward_config``; absence preserves the preset.
+        enable_flux_metrics=(True if args.enable_flux_metrics else None),
+        flux_mode=args.flux_mode,
+        flux_tau=args.flux_tau,
+        graph_flux_friendly_in_weight=args.graph_flux_friendly_in_weight,
+        graph_flux_friendly_out_weight=args.graph_flux_friendly_out_weight,
+        graph_flux_enemy_in_weight=args.graph_flux_enemy_in_weight,
+        graph_flux_enemy_out_weight=args.graph_flux_enemy_out_weight,
     )
     train(train_cfg, ppo_cfg, reward_cfg, resume_from=args.resume_from)
 
