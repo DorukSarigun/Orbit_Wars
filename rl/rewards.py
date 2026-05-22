@@ -207,6 +207,37 @@ class RewardConfig:
     graph_flux_enemy_in_weight: float = 0.0
     graph_flux_enemy_out_weight: float = 0.0
 
+    # ---- Arrival-credit eligibility trace (Option B: ETA-weighted backward
+    # credit assignment of realized graph-metric impact to the launch step).
+    #
+    # On every successful launch we snapshot the launch-time per-planet
+    # graph-metric vector at the target slot.  When the fleet arrives
+    # (FleetTracker.pop_resolved), we recompute the same per-planet
+    # vector under the current state and credit the *original launch
+    # transition* with the ETA-discounted weighted delta:
+    #
+    #     credit = w(eta) * arrival_credit_weight *
+    #              Σ_c channel_weight[c] · (curr_vec[c] - launch_vec[c])
+    #
+    # where ``channel_weight`` is the same 12-vector used by the
+    # graph_native potential shaping (`graph_*_weight` + `graph_flux_*`).
+    # The credit is added via ``buffer.add_delayed_reward`` so it shares
+    # the same delay-discount machinery as fleet/planet-loss credit.
+    #
+    # Default off; opt-in via ``enable_arrival_credit=True`` so existing
+    # reward systems behave identically.
+    enable_arrival_credit: bool = False
+    arrival_credit_mode: str = "exp_decay"   # "raw" | "linear" | "exp_decay"
+    arrival_credit_tau: float = 10.0         # decay timescale (turns)
+    arrival_credit_eta_norm: float = 50.0    # cutoff for "linear" mode
+    arrival_credit_weight: float = 1.0       # global scale on the credit
+    # If True, the snapshot also captures the *source* planet vector and
+    # the credit is the sum of (target delta) + (-source delta), which
+    # rewards the agent both for what the fleet achieves at tgt and for
+    # the cost it pays at src (e.g. source becoming more vulnerable).
+    # Default False to keep the signal focused on tgt impact.
+    arrival_credit_include_source: bool = False
+
     # ---- Potential-based shaping & normalization ----
     # Discount used in the potential-based shaping formula
     #   r_t = graph_potential_discount * φ(s_{t+1}) - φ(s_t)
@@ -585,6 +616,70 @@ _EDGE_SIGNAL_INDEX = {
     "strategic_gradient": 7,
     "flow_opportunity": 8,
 }
+
+
+def compute_planet_metric_vectors(
+    obs,
+    *,
+    cfg: Optional[RewardConfig] = None,
+):
+    """Per-planet graph metric matrix used by arrival-credit snapshots.
+
+    Returns a ``(num_real_planets, D)`` ``numpy.ndarray`` where ``D`` is
+    8 (base) or 12 (base + flux) depending on ``cfg.enable_flux_metrics``.
+    Padded planet slots are *excluded* — index 0..num_real_planets-1
+    corresponds to the first ``num_real_planets`` planet slots in
+    ``obs.planet_mask`` (which mirrors the convention used elsewhere in
+    the codebase: real planets occupy the leading slots).
+
+    Channel order matches the weight tuple consumed by
+    :func:`compute_graph_native_reward`:
+
+        [friendly_influence, enemy_influence, influence_balance,
+         friendly_support, supportability, vulnerability,
+         production_potential, strategic_potential,
+         flux_friendly_in, flux_friendly_out,
+         flux_enemy_in, flux_enemy_out]
+
+    Returns ``None`` if torch / model_graph_pyg is unavailable or there
+    are no real planets, so callers can no-op gracefully.
+    """
+    try:
+        import numpy as np
+        import torch
+        from model_graph_pyg import (
+            _estimated_intercept_eta_matrix,
+            _graph_node_metrics,
+        )
+    except Exception:
+        return None
+
+    flux_enabled = bool(cfg is not None and getattr(cfg, "enable_flux_metrics", False))
+
+    with torch.no_grad():
+        planet_feats = torch.as_tensor(obs.planet_feats, dtype=torch.float32)
+        edge_bias = torch.as_tensor(obs.edge_bias, dtype=torch.float32)
+        planet_mask = torch.as_tensor(obs.planet_mask, dtype=torch.bool)
+        n = int(planet_mask.sum().item())
+        if n <= 0:
+            return None
+        eta = _estimated_intercept_eta_matrix(planet_feats, edge_bias, n)
+        flux_features = None
+        if flux_enabled:
+            from .flux import compute_node_flux_features
+            flux_np = compute_node_flux_features(
+                obs,
+                p_max=int(planet_feats.shape[0]),
+                mode=getattr(cfg, "flux_mode", "exp_decay"),
+                tau=float(getattr(cfg, "flux_tau", 10.0)),
+                eta_norm=float(getattr(cfg, "flux_eta_norm", 50.0)),
+                ship_norm=float(getattr(cfg, "flux_ship_norm", 50.0)),
+            )
+            flux_features = torch.as_tensor(flux_np[:n], dtype=torch.float32)
+        node_metrics = _graph_node_metrics(
+            planet_feats, edge_bias, n, eta=eta, flux_features=flux_features,
+        )
+        return node_metrics.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 def compute_graph_metrics_summary(

@@ -560,6 +560,40 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--graph-flux-friendly-out-weight", type=float, default=None)
     p.add_argument("--graph-flux-enemy-in-weight", type=float, default=None)
     p.add_argument("--graph-flux-enemy-out-weight", type=float, default=None)
+    # ETA-weighted arrival-credit eligibility trace (Option B of the
+    # credit-assignment plan).  Defaults preserve previous behaviour
+    # (everything off) so existing training configurations are unaffected.
+    p.add_argument(
+        "--enable-arrival-credit", action="store_true",
+        help="Back-credit each launch transition with the ETA-discounted "
+             "realised graph-metric delta at the target slot when the "
+             "fleet arrives.  Uses the same 12-channel weight vector as "
+             "the graph_native potential shaping; safe to enable on top "
+             "of any reward system.",
+    )
+    p.add_argument(
+        "--arrival-credit-mode", choices=("raw", "linear", "exp_decay"), default=None,
+        help="ETA decay mode for the arrival-credit weight w(eta).",
+    )
+    p.add_argument(
+        "--arrival-credit-tau", type=float, default=None,
+        help="Decay timescale (turns) for arrival-credit exp_decay mode.",
+    )
+    p.add_argument(
+        "--arrival-credit-eta-norm", type=float, default=None,
+        help="ETA cutoff (turns) for arrival-credit linear mode.",
+    )
+    p.add_argument(
+        "--arrival-credit-weight", type=float, default=None,
+        help="Global scale on the arrival-credit signal.",
+    )
+    p.add_argument(
+        "--arrival-credit-include-source", action="store_true",
+        help="Also snapshot the source planet's metric vector and net "
+             "the (target delta) - (source delta) into the credit.  "
+             "Encodes the trade-off the launch makes between gaining at "
+             "target and weakening source.",
+    )
     p.add_argument("--save-game-batches", action="store_true",
                    help="Save one .pt rollout/training batch per self-play game after GAE")
     p.add_argument("--batch-save-dir", default="checkpoints/game_batches")
@@ -762,6 +796,17 @@ def main(argv: Optional[list[str]] = None) -> None:
         graph_flux_friendly_out_weight=args.graph_flux_friendly_out_weight,
         graph_flux_enemy_in_weight=args.graph_flux_enemy_in_weight,
         graph_flux_enemy_out_weight=args.graph_flux_enemy_out_weight,
+        # Arrival-credit eligibility trace (Option B).  As with the flux
+        # knobs, only forward ``True`` for the store_true flags so the
+        # preset's defaults survive when the user omits them.
+        enable_arrival_credit=(True if args.enable_arrival_credit else None),
+        arrival_credit_mode=args.arrival_credit_mode,
+        arrival_credit_tau=args.arrival_credit_tau,
+        arrival_credit_eta_norm=args.arrival_credit_eta_norm,
+        arrival_credit_weight=args.arrival_credit_weight,
+        arrival_credit_include_source=(
+            True if args.arrival_credit_include_source else None
+        ),
     )
     train(train_cfg, ppo_cfg, reward_cfg, resume_from=args.resume_from)
 
