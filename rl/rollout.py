@@ -41,9 +41,11 @@ from .rewards import (
     RunningMeanStd,
     compute_graph_metrics_summary,
     compute_graph_native_reward,
+    compute_planet_metric_vectors,
     compute_step_reward,
     normalize_terminal_rewards,
 )
+from .arrival_credit import ArrivalCreditTracker, build_channel_weights
 from .fleet_tracker import (
     FleetTracker,
     compute_fleet_reward,
@@ -782,6 +784,18 @@ def collect_episode(
         for _ in range(num_agents)
     ]
     fleet_trackers = [FleetTracker() for _ in range(num_agents)]  # One per player
+    # Arrival-credit eligibility trace.  Snapshots launch-time per-planet
+    # graph-metric vectors and credits the launch transition with the
+    # ETA-weighted realised delta at fleet arrival.  Default off; opt-in
+    # via ``RewardConfig.enable_arrival_credit``.
+    arrival_credit_active = bool(getattr(reward_cfg, "enable_arrival_credit", False))
+    arrival_credit_trackers = (
+        [ArrivalCreditTracker() for _ in range(num_agents)]
+        if arrival_credit_active else None
+    )
+    arrival_channel_weights = (
+        build_channel_weights(reward_cfg) if arrival_credit_active else None
+    )
     production_trackers = [
         ProductionRewardTracker(
             max_turns=reward_cfg.max_turns,
@@ -890,6 +904,13 @@ def collect_episode(
             if p in opponent_indices:
                 continue
             fleet_trackers[p].observe_turn(t, new_obs[p], p)
+            # Lazy-built once per player per turn iff arrival-credit is on
+            # and the player actually has at least one arrival to resolve.
+            # Cost: one ``build_observation`` + one O(P^2) metric matrix per
+            # affected turn, which is negligible compared to the per-step
+            # rollout cost (forward + env step).
+            _ac_curr_metric_mat = None
+            _ac_curr_planet_ids = None
             for buffer_idx, outcome in fleet_trackers[p].pop_resolved(p):
                 if reward_cfg.reward_system == "production_simple":
                     actual_tgt = int(getattr(outcome, "actual_tgt_planet_id", -1))
@@ -931,6 +952,45 @@ def collect_episode(
                     event_turn=t,
                     discount=reward_cfg.delayed_reward_discount,
                 )
+                # ---- ETA-weighted arrival-credit eligibility trace ----
+                # Independent additive credit channel that fires when a
+                # launch transition's fleet arrives.  Uses the *realized*
+                # per-planet graph-metric delta at the target slot,
+                # weighted by launch ETA.  Lazy-builds the current-state
+                # metric matrix on first arrival of the turn for this
+                # player so we pay the O(P^2) cost at most once per turn.
+                if (
+                    arrival_credit_active
+                    and arrival_credit_trackers is not None
+                    and buffer_idx in arrival_credit_trackers[p]
+                ):
+                    if _ac_curr_metric_mat is None:
+                        _ac_av = float(new_obs[p].get("angular_velocity", 0.0) or 0.0)
+                        _ac_obs_curr = build_observation(
+                            new_obs[p], player=p,
+                            angular_velocity=_ac_av,
+                            p_max=policy.p_max, f_max=policy.f_max,
+                            max_turns=max_steps,
+                        )
+                        _ac_curr_metric_mat = compute_planet_metric_vectors(
+                            _ac_obs_curr, cfg=reward_cfg,
+                        )
+                        _ac_curr_planet_ids = _ac_obs_curr.planet_ids
+                    arrival_credit_signed = arrival_credit_trackers[p].compute_credit(
+                        buffer_idx=buffer_idx,
+                        curr_metric_matrix=_ac_curr_metric_mat,
+                        curr_planet_ids=_ac_curr_planet_ids,
+                        channel_weights=arrival_channel_weights,
+                        cfg=reward_cfg,
+                        actual_target_planet_id=int(getattr(outcome, "actual_tgt_planet_id", -1)),
+                    )
+                    if arrival_credit_signed is not None and arrival_credit_signed != 0.0:
+                        buffer.add_delayed_reward(
+                            buffer_idx,
+                            float(arrival_credit_signed),
+                            event_turn=t,
+                            discount=reward_cfg.delayed_reward_discount,
+                        )
 
         terminal = any(s.status == "DONE" for s in new_state) or env.done or (t == max_steps - 1)
         terminal_rewards = (
@@ -1111,6 +1171,30 @@ def collect_episode(
                         my_total_ships_at_launch=fleet_meta["my_total_ships_at_launch"],
                         enemy_total_ships_at_launch=fleet_meta["enemy_total_ships_at_launch"],
                     )
+                    # ---- Arrival-credit snapshot (Option B) -----------
+                    # Pin the launch-time per-planet metric vector at the
+                    # target (and optionally source) slot.  When the fleet
+                    # arrives we'll compute the delta vs. the current
+                    # state and back-credit *this* transition (``idx``).
+                    if (
+                        arrival_credit_active
+                        and arrival_credit_trackers is not None
+                    ):
+                        launch_metric_mat = compute_planet_metric_vectors(
+                            obs, cfg=reward_cfg,
+                        )
+                        arrival_credit_trackers[p].register(
+                            buffer_idx=idx,
+                            player=p,
+                            target_planet_id=int(fleet_meta["tgt_planet_id"]),
+                            eta_at_launch=float(fleet_meta["eta"]),
+                            launch_metric_matrix=launch_metric_mat,
+                            launch_planet_ids=obs.planet_ids,
+                            source_planet_id=int(fleet_meta["src_planet_id"]),
+                            include_source=bool(
+                                getattr(reward_cfg, "arrival_credit_include_source", False)
+                            ),
+                        )
                     if reward_cfg.reward_system == "production_simple":
                         # Defense Window: this launch took ships AWAY from
                         # src_planet_id; if that planet is later lost, this
