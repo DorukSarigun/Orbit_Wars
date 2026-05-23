@@ -63,11 +63,26 @@ except ImportError:
 
 
 def _require_pyg() -> None:
-    if Data is None or Batch is None or GINEConv is None:
+    """Ensure PyG symbols are importable (retries after a mid-session pip install)."""
+    global Batch, Data, GINEConv, global_max_pool, global_mean_pool
+    if Data is not None and Batch is not None and GINEConv is not None:
+        return
+    try:
+        from torch_geometric.data import Batch as _Batch, Data as _Data
+        from torch_geometric.nn import (
+            GINEConv as _GINEConv,
+            global_max_pool as _global_max_pool,
+            global_mean_pool as _global_mean_pool,
+        )
+    except ImportError as exc:
         raise ImportError(
             "model_graph_pyg requires torch_geometric. Install a torch-compatible "
             "PyTorch Geometric build before using PygPlanetGraphPolicy."
-        )
+        ) from exc
+    Batch, Data = _Batch, _Data
+    GINEConv = _GINEConv
+    global_max_pool = _global_max_pool
+    global_mean_pool = _global_mean_pool
 
 
 def _planet_edge_index(num_nodes: int, *, device: Optional[torch.device] = None) -> torch.Tensor:
