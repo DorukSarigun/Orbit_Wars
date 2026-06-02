@@ -65,7 +65,7 @@ Düzeltildi:
 
 ```python
 self.planet_dim = PLANET_FEATURE_DIM      # 34, build_observation için
-self.encoder_planet_dim = PYG_PLANET_FEATURE_DIM  # 42, encoder internal
+self.encoder_planet_dim = PYG_PLANET_FEATURE_DIM  # 43, encoder internal
 self.f_max = F_MAX_DEFAULT                # 64
 ```
 
@@ -78,11 +78,19 @@ End-to-end smoke test: 30 step × 2 agent → 60 transition, NaN/Inf yok, normal
 
 Önceliğe göre sıralı:
 
-### 🔴 A. Action-Level Credit Assignment (sıradaki ana iş — bkz. §3)
+### ✅ A. Action-Level Credit Assignment — counterfactual arrival credit ile çözüldü
 
-Step-level graph_native ödülü şu an aynı turn'deki tüm transition'lara **eşit**
-dağıtılıyor. NOOP yapan ile A→B launch yapan oyuncu aynı `r`'yi alıyor. Bu en büyük
-eksik. Tasarım §3'te.
+Eski sorun: step-level graph_native ödülü aynı turn'deki tüm transition'lara
+**eşit** dağıtılıyordu; NOOP ile A→B launch aynı `r`'yi alıyordu.
+
+Güncel çözüm: launch transition'ına **counterfactual arrival credit** delayed
+reward olarak yazılıyor (`actual_arrival - no_launch_counterfactual`). Detay
+ve formüller `docs/arrival_credit_design.md` ve aşağıdaki §3 özetinde.
+
+Step-level potential shaping artık arrival credit aktifken otomatik kapatılıyor
+(`enable_arrival_credit=True` ⇒ step `r=0`), yani çift kredi sorunu kalmadı.
+Doğrulayan regression testleri: `tests/test_arrival_credit.py::test_rollout_arrival_credit_disables_step_shaping`
+ve `..._off_keeps_step_shaping`.
 
 ### 🔴 G. Calibration: Terminal vs Shaping
 
@@ -173,163 +181,102 @@ Mevcut yeni testler reward formülünü doğruluyor, ama:
 
 ---
 
-## 3. Sıradaki İş: Per-Node Action-Level Credit (Tasarım Tartışması)
+## 3. Güncel Reward Sistemi: Counterfactual Arrival Credit (Özet)
 
-### 3.1 Çekirdek Fikir
+> **Detaylı tasarım, formüller, CLI bayrakları, double-counting analizi ve
+> AI handoff özeti** için tek kaynak doğruluğu (single source of truth):
+> [`docs/arrival_credit_design.md`](docs/arrival_credit_design.md).
+>
+> Bu bölüm yalnızca o dokümandaki kararların kısa Türkçe özetidir. Bir
+> uyumsuzluk olursa `docs/arrival_credit_design.md` esas alınır.
 
-> "Her aksiyon, hangi node'ların metriklerinde değişikliğe sebep olduysa oradan
-> ödül alır. Launch `x → y` yapıldıysa, x ve y gezegenindeki metrik değişimlerini
-> bu aksiyona yansıt."
+### Çekirdek karar
 
-Formüller:
 ```
-r(launch(x → y)) = w_src_node · Δφ_node[x]
-                 + w_tgt_node · Δφ_node[y]
-                 + w_edge      · Δφ_edge[x, y]
+No-launch direct reward = 0
 
-Δφ_node[i] = γ · curr_node_metrics[i] − prev_node_metrics[i]   (per-planet, weighted)
-Δφ_edge[i,j] = γ · curr_edge_metric[i,j] − prev_edge_metric[i,j]
-```
-
-### 3.2 Avantajlar
-
-1. **Local credit** — global broadcast yok
-2. **NOOP ile launch ayrışır** (NOOP=0, launch'lar ≠ 0)
-3. **FleetTracker ile temiz separation**:
-   - Graph delta = anlık pozisyon kalitesi
-   - FleetTracker = uzun vadeli capture/kill outcome
-4. **Multi-launch in same turn** doğal destekleniyor
-5. **Source over-commit otomatik cezalanır** (x'ten gemi gönderince x'in
-   `vulnerability` artar → negatif source-credit)
-
-### 3.3 İncelikler & Karar Noktaları
-
-#### İncelik 1: Residual Reward (Atfedilmemiş Kısım)
-
-Her turn metrikler **opponent action + production + fleet movement** nedeniyle de
-değişir. Bu kısım nereye gider?
-
-| Seçenek | Davranış | Karar |
-|---------|----------|-------|
-| **A) Drop** | Sadece launch'a atfedilen credit verilir | ✅ Önerilen |
-| B) NOOP'a ver | Residual → NOOP transition'larına | Belirsiz multi-NOOP |
-| C) Tüm transition'lara eşit dağıt | Mevcut step-shaping davranışı | Bilgi kaybı yok ama zayıf attribution |
-
-**Karar gerekçesi**: Critic zaten residual'ı value function olarak öğrenir.
-Shaping aksiyon-spesifik sinyal vermek için var. NOOP=0 sorun olursa B'ye geçeriz.
-
-#### İncelik 2: Multi-Launch → Same Target
-
-İki launch aynı turn'de `y`'yi hedeflerse `Δφ_node[y]` nasıl bölünür?
-
-| Seçenek | Karar |
-|---------|-------|
-| **Eşit böl** (`Δφ[y] / k`) | ✅ Önerilen |
-| Ship-weighted | Daha doğru ama karmaşık |
-| Full credit (overcount) | ❌ Yanlış, double-counts |
-
-> Env kuralı: bir oyuncu turn başına farklı `src` kullanmak zorunda → source-side
-> bölme problemi yok, sadece target-side var.
-
-#### İncelik 3: Non-Local Effects
-
-Launch `x→y` aslında **z**'nin metriklerini de etkiler (kernel `exp(-eta/τ)`). Ama
-τ=10 turn → en büyük etki kesinlikle x ve y'de, non-local etki tipik <%20.
-
-**Karar**: v1'de görmezden gel.
-
-#### İncelik 4: Source vs Target Asimetri
-
-Source (`x`) tarafında `vulnerability` artıyor → launch negatif source credit alır.
-Doğru ama aşırı agresif olursa policy hiç launch yapmaz.
-
-**Karar**: Ayrı weight'ler:
-```python
-graph_src_node_weight: float = 0.5
-graph_tgt_node_weight: float = 1.0
+Launch delayed reward =
+    metrics(actual_arrival_branch)
+  - metrics(no_launch_counterfactual_branch)
 ```
 
-#### İncelik 5: Multi-Player Same Target
+Kötü launch'lar farktan negatif credit alır → ayrı NOOP bonusuna gerek yok.
 
-İki **farklı oyuncu** aynı turn'de `y`'ye launch atarsa:
-- Her oyuncu kendi metrik uzayında (kendi gemiler = friendly)
-- Δφ matrisleri **farklı** (asymmetric ownership)
-- **Bölme sorunu yok**: her oyuncu kendi metric uzayında credit'liyor
+### Aktif katmanlar
 
-### 3.4 Önerilen Final Tasarım (Pseudocode)
+Step shaping ve arrival credit **mutually exclusive** — `enable_arrival_credit=True`
+iken step-level shaping otomatik kapanır (`rl/rollout.py` `graph_native` branch'inde
+`shaping_active = not cfg.enable_arrival_credit` guard'ı). Aynı metric swing
+iki kez kredi olarak gradient'e girmez.
 
-```python
-def credit(action, prev_metrics, curr_metrics, *, cfg, k_targets_y):
-    """Per-action reward."""
-    γ = cfg.graph_potential_discount
+1. **Counterfactual arrival credit** *(yeni default; arrival credit on)* —
+   fleet vardığında launch transition'ına `buffer.add_delayed_reward` ile
+   `<channel_weights, M_actual − M_no_launch>` yazılır. Step reward = 0.
+2. **Graph-native potential shaping** *(legacy; arrival credit off)* —
+   `r_t = γ φ(s_{t+1}) − φ(s_t)` her adıma yazılır.
+3. **Flux metrics** — her iki modda da geçerli; arrival credit modunda
+   counterfactual'ın 13-D metric vektörünün son 4 kanalı olarak yaşar.
 
-    if action.is_noop:
-        return 0.0  # residual atılır (mod A)
+Terminal reward (±1) ve `invalid_action_penalty` her iki modda etkilenmez.
 
-    x, y = action.src, action.tgt
-    delta_node = γ * curr_metrics.node - prev_metrics.node     # (P, 8)
-    per_planet = (delta_node * node_weights).sum(-1)           # (P,)
+### Kritik kurallar (kısa)
 
-    # Multi-launch target sharing
-    r_node = (cfg.graph_src_node_weight * per_planet[x]
-              + cfg.graph_tgt_node_weight * per_planet[y] / max(1, k_targets_y))
+- Counterfactual'da `tgt.ships -= arriving`, `src.ships += arriving`.
+- `tgt.ships < 0` → `tgt.owner = non_self`, `ships = abs(...)`. Negatif ship
+  count metric input'a bırakılmaz; `friendly_*` kaynakları doğal kapanır.
+- `arrival_credit_counterfactual_horizon > 0` ise etkilenen self-owned target/source
+  için horizon içindeki **soonest enemy arrival** resolve edilir
+  (kurtarma değerlerini ölçmek için).
+- Production kanalları için `friendly_production_potential` kullanılır;
+  ham `production_potential` ownership-blind.
 
-    delta_edge = γ * curr_metrics.edge[x, y] - prev_metrics.edge[x, y]
-    r_edge = cfg.graph_edge_efficiency_weight * delta_edge
+### Önerilen başlangıç ayarı
 
-    return (r_node + r_edge) * time_factor * cfg.reward_scale
+```bash
+--reward-system graph_native \
+--enable-flux-metrics \
+--enable-arrival-credit \
+--arrival-credit-counterfactual \
+--arrival-credit-counterfactual-scope full_graph \
+--arrival-credit-counterfactual-horizon 5 \
+--arrival-credit-mode exp_decay \
+--arrival-credit-tau 10.0 \
+--arrival-credit-weight 1.0
 ```
 
-### 3.5 Implementation Plan
+`arrival_credit_weight` artık `1.0` ile başlanabilir — step shaping kapalı
+olduğu için çift kredi yok. PPO `valL` variance fazla olursa `0.5`'e düşür.
 
-| Adım | Açıklama | LOC tahmini |
-|------|----------|-------------|
-| 1 | `compute_graph_metrics_summary` → full matrix döndür (sum yerine) | ~20 |
-| 2 | Yeni `compute_action_credited_rewards(prev, curr, actions, cfg, turn) -> list[float]` | ~80 |
-| 3 | `RewardConfig` yeni alanlar (`graph_src_node_weight`, `graph_tgt_node_weight`, `graph_action_attribution: bool`) | ~10 |
-| 4 | `rollout.py`: her transition için kendi action'ını eşle, attributed reward set et | ~60 |
-| 5 | Multi-launch target counting helper | ~15 |
-| 6 | Backward compat: `cfg.graph_action_attribution = False` ise eski global mod | ~10 |
-| 7 | Unit testler | ~120 |
-| **Toplam** | | **~315 LOC** |
+### Kod karşılığı
 
-### 3.6 Karar Verilmesi Gerekenler (kodlamadan önce)
-
-1. ✅ **Residual handling**: A (drop)
-2. ✅ **Multi-launch target**: eşit böl
-3. ✅ **Source/target asimetri**: ayrı weight (default `0.5` / `1.0`)
-4. ⏳ **Backward compat flag**: `cfg.graph_action_attribution: bool = True` mu?
-5. ✅ **N-step / 1-step**: 1-step (v1)
-
-### 3.7 Riskler
-
-- **Source-side over-penalty**: w_src çok yüksek olursa policy launch yapmaz.
-  Calibration gerek (`w_src=0.5` başlangıç).
-- **Multi-launch attribution**: aynı turn'de >2 launch nadir, ama happy path'i
-  test etmemiz şart.
-- **Launch kuyrukta gecikirse**: Action turn t'de yapıldı ama metrik delta turn
-  t+1'de görünüyor → buffer sıralamasında dikkat.
-- **NOOP=0 dezavantaj**: Pasif savunma rolündeki oyuncu hiç sinyal almaz.
-  Yan etki olabilir; eğer ortaya çıkarsa residual mode B'ye geçmek için flag
-  hazır olmalı.
+| Dosya | Rol |
+|---|---|
+| `rl/rewards.py` | `RewardConfig` graph weights, counterfactual flags |
+| `rl/arrival_credit.py` | `ArrivalCreditTracker`, counterfactual obs, credit hesabı |
+| `rl/rollout.py` | launch snapshot, arrival'da actual/counterfactual metric matrix |
+| `rl/flux.py` | transit fleet flux metrics |
+| `tests/test_arrival_credit.py` | 41 test — unit + integration smoke + shaping-off regression |
 
 ---
 
 ## 4. Sıradaki Adımlar
 
-1. **Karar 4** (backward compat flag) onaylandıktan sonra §3.5 implementation planına başla
-2. Action-level credit eklendikten sonra §2'deki **C (clipping)** ve **G (calibration)**
-   küçük PR'lar halinde gelir
-3. **B (asymmetry)** ve **H (invalid action penalty)** isteğe bağlı tuning olarak ek
-4. **I (test coverage)** action-level credit ile birlikte gelmeli — yeni invariant'lar
-   eklemek için doğal yer
+1. Counterfactual arrival-credit'i training'de `arrival_credit_weight=1.0`
+   ile dene (step shaping kapalı; çift kredi yok).
+2. `credits_emitted` / `credits_total` diagnostic counters'ı training log'a ekle.
+3. Terminal vs delayed credit kalibrasyonu: counterfactual credit'in
+   cumulative magnitude'u terminal sinyali (±1) ezerse `arrival_credit_weight`
+   ya da `reward_scale` indir.
+4. No-launch özel reward ekleme; önce kötü launch penalty sinyalinin yeterli
+   olup olmadığını gözle.
+5. Gerekirse sadece threatened-source defensive hold credit tasarla.
 
 ---
 
 ## 5. Referans Komutlar
 
 ```bash
-# Tüm test suite (264 passed)
+# Tüm test suite (332 passed)
 orbit_wars_venv/bin/python -m pytest tests/ -q
 
 # Sadece graph_native reward testleri (11 passed)

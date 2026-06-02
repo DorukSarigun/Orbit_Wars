@@ -197,6 +197,68 @@ def compute_node_flux_features(
     return out
 
 
+def compute_pair_flux_edge_features(
+    obs,
+    edge_index,
+    distance_matrix,
+    *,
+    n_real: int,
+    mode: FluxMode = DEFAULT_FLUX_MODE,
+    tau: float = DEFAULT_TAU,
+    eta_norm: float = DEFAULT_ETA_NORM,
+    ship_norm: float = DEFAULT_SHIP_NORM,
+    matrices: Optional[FluxMatrices] = None,
+) -> np.ndarray:
+    """Build per-edge flux features aligned with a planet FC graph.
+
+    Each directed edge ``(i → j)`` in ``edge_index`` receives::
+
+        [distance_ij, friendly_flux_ij, enemy_flux_ij]
+
+    where ``friendly_flux_ij`` / ``enemy_flux_ij`` come from
+    :func:`compute_flux_matrices` (ETA-weighted in-flight ship flow from
+    ``obs.fleet_*`` routing fields).  Values are divided by ``ship_norm``
+    for scale parity with node graph metrics.
+
+    Parameters
+    ----------
+    obs : Observation
+        Must expose fleet routing arrays (see :func:`compute_flux_matrices`).
+    edge_index : array-like, shape ``(2, E)``
+        PyG-style edge list; indices refer to planet slots ``0..n_real-1``.
+    distance_matrix : array-like, shape ``(n_real, n_real)``
+        Normalized distance ``D[i, j]`` (typically ``edge_bias[..., 0]``).
+    n_real : int
+        Number of real planets in the graph slice.
+
+    Returns
+    -------
+    np.ndarray, shape ``(E, 3)``, dtype ``float32``
+    """
+    if n_real <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    if matrices is None:
+        matrices = compute_flux_matrices(
+            obs, p_max=n_real, mode=mode, tau=tau, eta_norm=eta_norm
+        )
+
+    src = np.asarray(edge_index[0], dtype=np.int64)
+    dst = np.asarray(edge_index[1], dtype=np.int64)
+    dist = np.asarray(distance_matrix, dtype=np.float32)
+    scale = 1.0 / max(float(ship_norm), 1e-6)
+
+    out = np.stack(
+        [
+            dist[src, dst],
+            matrices.friendly[src, dst] * scale,
+            matrices.enemy[src, dst] * scale,
+        ],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+    return out
+
+
 __all__ = [
     "FluxMode",
     "FluxMatrices",
@@ -207,4 +269,5 @@ __all__ = [
     "DEFAULT_SHIP_NORM",
     "compute_flux_matrices",
     "compute_node_flux_features",
+    "compute_pair_flux_edge_features",
 ]

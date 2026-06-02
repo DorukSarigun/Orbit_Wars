@@ -60,8 +60,18 @@ class RewardConfig:
     # FleetTracker (see rl/fleet_tracker.py). These step-level weights are kept
     # smaller than fleet_capture_weight so they provide state-change feedback
     # without dominating launch-specific delayed credit.
-    capture_value_weight: float = 0.01    # gain side: my production growth
-    denial_value_weight: float = 0.01     # denial side: opp's production loss
+    #
+    # ⚠️ LEGACY (DEPRECATED for graph-native pipeline):
+    # `capture_value_weight` and `denial_value_weight` are **production-delta**
+    # step-shaping channels from the original (pre-graph) reward stack. They
+    # are retained for backwards compatibility with the `current` / `aggressive`
+    # / `production_simple` presets and for ablations. In the modern graph-
+    # based stack they are explicitly zeroed.  Dense signal for ``graph_native``
+    # comes from arrival credit (``enable_arrival_credit``) and terminal reward.
+    # Keep these at 0.0 for any new training runs that consume the graph
+    # encoder; they exist for legacy reproduction only.
+    capture_value_weight: float = 0.01    # gain side: my production growth (LEGACY)
+    denial_value_weight: float = 0.01     # denial side: opp's production loss (LEGACY)
     # 'production' (gameplay-true: ships/turn) or 'radius' (log-proxy)
     capture_value_kind: str = "production"
     # Total game length used to normalize the time-decay factor. Default
@@ -163,74 +173,73 @@ class RewardConfig:
     # Kept at 0 by default; set non-zero to re-enable the old behavior.
     planet_diff_weight: float = 0.0
 
-    # ---- Graph-native shaping (structure delta over graph metrics) ----
-    # Per-channel weights applied to the *delta* of summed node metrics.
-    # NOTE: ``influence_balance`` and ``strategic_potential`` are linear
-    # combinations of the other three (friendly/enemy/production); leaving
-    # them weighted in addition to the primaries triple-counts the same
-    # signal.  Defaults are 0.0 so only independent channels contribute.
-    graph_friendly_influence_weight: float = 0.0
-    graph_enemy_influence_weight: float = 0.0
-    graph_influence_balance_weight: float = 0.0      # redundant: friendly - enemy
-    graph_friendly_support_weight: float = 0.0
-    graph_supportability_weight: float = 0.0
-    graph_vulnerability_weight: float = 0.0
-    graph_production_potential_weight: float = 0.0
-    graph_strategic_potential_weight: float = 0.0    # redundant: production + friendly - enemy
-    # Edge-level shaping. Activates a single weighted channel on the sum
-    # of an edge metric across all real planet pairs (default
-    # ``flow_opportunity`` -- the only directed, non-anti-symmetric edge
-    # metric that captures progress toward high-strategic targets).
-    # Choices: ``flow_opportunity`` | ``movement_resistance`` | ``same_owner``.
-    graph_edge_efficiency_weight: float = 0.0
-    graph_edge_efficiency_signal: str = "flow_opportunity"
+    # ---- Held-production metric (GNN node feature + arrival-credit channel) ----
+    # Per-owned-planet discounted future production:
+    #   prod * (1 + x + x^2 + ... + x^{R-1}),  R = remaining turns,
+    #   x = per-turn hold survival (optionally from vulnerability).
+    held_production_norm: float = 500.0
+    hold_survival_base: float = 0.99
+    hold_survival_from_vulnerability: bool = True
+    hold_survival_min: float = 0.5
+    hold_survival_max: float = 0.99
 
-    # ---- Flux-augmented node metrics (Phase 1 of credit-assignment plan) ----
-    # When enabled, four additional per-node channels are appended to the
-    # graph metric summary, representing the imminence-weighted ship flow
-    # in (column-sum) and out (row-sum) of each planet for friendly and
-    # enemy fleets.  See ``rl/flux.py`` for the parametric weighting
-    # modes.  Used by ``compute_graph_native_reward`` to give partial
-    # credit for multi-step launches as fleets approach their target,
-    # without waiting for the final capture event.
+    # ---- Flux-augmented node metrics (observation + arrival credit) ----
+    # When enabled, four additional per-node channels are appended to
+    # ``compute_planet_metric_vectors`` (friendly/enemy in/out flux).
     enable_flux_metrics: bool = False
     flux_mode: str = "exp_decay"      # "raw" | "linear" | "exp_decay"
     flux_tau: float = 10.0            # decay timescale for exp_decay (turns)
     flux_eta_norm: float = 50.0       # cutoff for linear mode (turns)
     flux_ship_norm: float = 50.0      # divisor for output magnitude
-    # Per-channel reward weights, applied to potential-based delta like
-    # the other graph metrics.  Channel order matches
-    # ``rl/flux.compute_node_flux_features``:
-    #   [friendly_in, friendly_out, enemy_in, enemy_out]
-    graph_flux_friendly_in_weight: float = 0.0
-    graph_flux_friendly_out_weight: float = 0.0
-    graph_flux_enemy_in_weight: float = 0.0
-    graph_flux_enemy_out_weight: float = 0.0
 
-    # ---- Arrival-credit eligibility trace (Option B: ETA-weighted backward
-    # credit assignment of realized graph-metric impact to the launch step).
+    # ---- Arrival-credit channel weights (independent of any step shaping) ----
+    # Per-channel weights for counterfactual credit at fleet arrival.
+    # Order mirrors ``model_graph_pyg._graph_node_metrics`` (base 10 + flux 4).
+    # ``influence_balance`` and ``strategic_potential`` are redundant linear
+    # combos — keep at 0 unless ablating.
+    arrival_credit_friendly_influence_weight: float = 0.0
+    arrival_credit_enemy_influence_weight: float = 0.0
+    arrival_credit_influence_balance_weight: float = 0.0
+    arrival_credit_friendly_support_weight: float = 0.0
+    arrival_credit_supportability_weight: float = 0.0
+    arrival_credit_vulnerability_weight: float = 0.0
+    arrival_credit_production_potential_weight: float = 0.0
+    arrival_credit_friendly_production_potential_weight: float = 0.0
+    arrival_credit_strategic_potential_weight: float = 0.0
+    arrival_credit_held_discounted_production_weight: float = 0.0
+    arrival_credit_flux_friendly_in_weight: float = 0.0
+    arrival_credit_flux_friendly_out_weight: float = 0.0
+    arrival_credit_flux_enemy_in_weight: float = 0.0
+    arrival_credit_flux_enemy_out_weight: float = 0.0
+
+    # ---- Arrival-credit eligibility trace (ETA-weighted backward credit) ----
     #
-    # On every successful launch we snapshot the launch-time per-planet
-    # graph-metric vector at the target slot.  When the fleet arrives
-    # (FleetTracker.pop_resolved), we recompute the same per-planet
-    # vector under the current state and credit the *original launch
-    # transition* with the ETA-discounted weighted delta:
+    # On launch: snapshot per-planet metric vector.  On fleet arrival:
     #
-    #     credit = w(eta) * arrival_credit_weight *
-    #              Σ_c channel_weight[c] · (curr_vec[c] - launch_vec[c])
+    #     credit = w(eta) * arrival_credit_weight * reward_scale *
+    #              Σ_c arrival_credit_*_weight[c] · Δmetric[c]
     #
-    # where ``channel_weight`` is the same 12-vector used by the
-    # graph_native potential shaping (`graph_*_weight` + `graph_flux_*`).
-    # The credit is added via ``buffer.add_delayed_reward`` so it shares
-    # the same delay-discount machinery as fleet/planet-loss credit.
-    #
-    # Default off; opt-in via ``enable_arrival_credit=True`` so existing
-    # reward systems behave identically.
+    # Default off; opt-in via ``enable_arrival_credit=True``.
     enable_arrival_credit: bool = False
     arrival_credit_mode: str = "exp_decay"   # "raw" | "linear" | "exp_decay"
     arrival_credit_tau: float = 10.0         # decay timescale (turns)
     arrival_credit_eta_norm: float = 50.0    # cutoff for "linear" mode
     arrival_credit_weight: float = 1.0       # global scale on the credit
+    # If True, arrival credit compares actual metrics at arrival against
+    # a counterfactual branch where the fleet did not arrive and stayed at
+    # the source.  If removing the arrival makes a self-owned target go
+    # negative, the counterfactual target is marked non-self so friendly
+    # production/influence metrics are disabled naturally.
+    arrival_credit_counterfactual: bool = False
+    # "target" | "target_source" | "full_graph".  Full-graph sums the
+    # weighted metric delta across all planets, so diffusion effects from
+    # target/source ownership changes are captured.
+    arrival_credit_counterfactual_scope: str = "full_graph"
+    arrival_credit_counterfactual_return_to_source: bool = True
+    # Optional short horizon after arrival.  When >0, both actual and
+    # counterfactual branches resolve the soonest enemy arrival at the
+    # affected self-owned planets if its ETA is within this cap.
+    arrival_credit_counterfactual_horizon: float = 0.0
     # If True, the snapshot also captures the *source* planet vector and
     # the credit is the sum of (target delta) + (-source delta), which
     # rewards the agent both for what the fleet achieves at tgt and for
@@ -238,23 +247,13 @@ class RewardConfig:
     # Default False to keep the signal focused on tgt impact.
     arrival_credit_include_source: bool = False
 
-    # ---- Potential-based shaping & normalization ----
-    # Discount used in the potential-based shaping formula
-    #   r_t = graph_potential_discount * φ(s_{t+1}) - φ(s_t)
-    # which preserves the optimal policy under any γ <= this value (Ng et
-    # al. 1999).  Should match (or be slightly less than) the PPO ``gamma``
-    # to keep the shaping theoretically valid.
-    graph_potential_discount: float = 0.99
-    # If True, per-step graph_native rewards are divided by a running
-    # standard deviation (per-player) before being added to the buffer.
-    # Reduces variance from heterogeneous metric scales without changing
-    # the sign or relative ordering of step rewards.
-    graph_reward_normalize: bool = False
-    graph_reward_normalize_eps: float = 1e-6
-    graph_reward_normalize_warmup: int = 64
-
-    # If True, shaping signals also fire on the terminal step.
-    shape_on_terminal: bool = False
+    # In counterfactual ``full_graph`` scope, which planets contribute to
+    # the (curr - cf) sum:
+    #   "self"  -> only planets currently owned by the launching player
+    #              (the natural "what happened to MY empire" reading)
+    #   "all"   -> every real planet (legacy behaviour; double-counts
+    #              enemy-side effects that the player can't directly use)
+    arrival_credit_owner_filter: str = "self"
 
 
 REWARD_SYSTEMS: tuple[str, ...] = (
@@ -356,30 +355,20 @@ def build_reward_config(reward_system: str = "current", **overrides) -> RewardCo
             production_reinforcement_weight=0.0,
             invalid_action_penalty=0.0,
             planet_diff_weight=0.0,
-            # Graph-native channel weights.  Independent channels only:
-            # influence_balance and strategic_potential are linear combos
-            # of friendly/enemy/production and would triple-count the
-            # same signal (kept at 0 by default).
-            graph_friendly_influence_weight=1.0,
-            graph_enemy_influence_weight=-1.0,
-            graph_influence_balance_weight=0.0,           # redundant
-            graph_friendly_support_weight=1.0,
-            graph_supportability_weight=1.0,
-            graph_vulnerability_weight=-1.0,
-            graph_production_potential_weight=1.0,
-            graph_strategic_potential_weight=0.0,         # redundant
-            # Edge-level signal: flow_opportunity is positive and
-            # asymmetric (relu(strategic_gradient) / (eta+1)), so it
-            # rewards launches that progress toward high-strategic
-            # targets relative to current control.
-            graph_edge_efficiency_weight=0.5,
-            graph_edge_efficiency_signal="flow_opportunity",
-            # Potential-based shaping (Ng et al. 1999): r = γ φ(s') - φ(s).
-            graph_potential_discount=0.99,
-            # Running-std normalization helps balance heterogeneous
-            # metric scales (ships vs. production vs. 0-1 metrics).
-            graph_reward_normalize=True,
-            reward_scale=0.001,
+            # Arrival-credit channel defaults (independent channels only).
+            arrival_credit_friendly_influence_weight=1.0,
+            arrival_credit_enemy_influence_weight=-1.0,
+            arrival_credit_influence_balance_weight=0.0,
+            arrival_credit_friendly_support_weight=1.0,
+            arrival_credit_supportability_weight=1.0,
+            arrival_credit_vulnerability_weight=-1.0,
+            arrival_credit_production_potential_weight=1.0,
+            arrival_credit_friendly_production_potential_weight=1.0,
+            arrival_credit_held_discounted_production_weight=1.0,
+            arrival_credit_strategic_potential_weight=0.0,
+            held_production_norm=500.0,
+            hold_survival_from_vulnerability=True,
+            reward_scale=1.0,
             draw_terminal_reward=0.0,
             step_cost=0.0,
         )
@@ -594,50 +583,97 @@ def compute_step_reward(
               - cfg.invalid_action_penalty * max(0, int(invalid_actions))
               + cfg.step_cost)
 
-    # Suppress shaping on terminal step if requested (some prefer clean
-    # terminal-only credit assignment).
-    if terminal and not cfg.shape_on_terminal:
+    # Terminal step: legacy capture/diff shaping is suppressed; terminal
+    # +/-1 is added separately.
+    if terminal:
         shaped = 0.0
 
     terminal_term = cfg.terminal_scale * float(env_terminal_reward) if terminal else 0.0
     return float(shaped + terminal_term)
 
 
-# Mapping of edge-efficiency signal name -> column index in
-# GRAPH_EDGE_METRIC_DIM (see model_graph_pyg._graph_edge_metric_matrix).
-_EDGE_SIGNAL_INDEX = {
-    "eta_norm": 0,
-    "movement_resistance": 1,
-    "same_owner": 2,
-    "is_self_src": 3,
-    "is_self_tgt": 4,
-    "is_enemy_tgt": 5,
-    "is_neutral_tgt": 6,
-    "strategic_gradient": 7,
-    "flow_opportunity": 8,
-}
+def arrival_credit_channel_weights(cfg: Optional[RewardConfig] = None) -> tuple[float, ...]:
+    """Per-node metric weights for arrival credit and scripted graph agents.
+
+    Order mirrors ``model_graph_pyg._graph_node_metrics`` base 10 (no flux).
+    """
+    cfg = cfg or RewardConfig()
+    return (
+        float(cfg.arrival_credit_friendly_influence_weight),
+        float(cfg.arrival_credit_enemy_influence_weight),
+        float(cfg.arrival_credit_influence_balance_weight),
+        float(cfg.arrival_credit_friendly_support_weight),
+        float(cfg.arrival_credit_supportability_weight),
+        float(cfg.arrival_credit_vulnerability_weight),
+        float(cfg.arrival_credit_production_potential_weight),
+        float(cfg.arrival_credit_friendly_production_potential_weight),
+        float(cfg.arrival_credit_strategic_potential_weight),
+        float(cfg.arrival_credit_held_discounted_production_weight),
+    )
+
+
+def _hold_metric_kwargs_from_cfg(
+    cfg: Optional[RewardConfig],
+    *,
+    turn: int = 0,
+    obs=None,
+) -> dict[str, float | int | bool]:
+    """Kwargs forwarded to ``_graph_node_metrics`` for held production."""
+    if obs is not None:
+        try:
+            from model_graph_pyg import _hold_metric_kwargs_from_obs
+
+            meta = getattr(obs, "meta", None) or {}
+            out = _hold_metric_kwargs_from_obs(obs)
+            if cfg is not None:
+                out["held_production_norm"] = float(getattr(cfg, "held_production_norm", 500.0))
+                out["hold_survival_base"] = float(getattr(cfg, "hold_survival_base", 0.99))
+                out["hold_survival_from_vulnerability"] = bool(
+                    getattr(cfg, "hold_survival_from_vulnerability", True)
+                )
+                out["hold_survival_min"] = float(getattr(cfg, "hold_survival_min", 0.5))
+                out["hold_survival_max"] = float(getattr(cfg, "hold_survival_max", 0.99))
+                if "remaining_turns" not in meta:
+                    out["remaining_turns"] = max(
+                        0, int(getattr(cfg, "max_turns", 500)) - int(turn)
+                    )
+            return out
+        except Exception:
+            pass
+    max_turns = int(getattr(cfg, "max_turns", 500)) if cfg is not None else 500
+    return {
+        "remaining_turns": max(0, max_turns - int(turn)),
+        "held_production_norm": float(getattr(cfg, "held_production_norm", 500.0)),
+        "hold_survival_base": float(getattr(cfg, "hold_survival_base", 0.99)),
+        "hold_survival_from_vulnerability": bool(
+            getattr(cfg, "hold_survival_from_vulnerability", True)
+        ),
+        "hold_survival_min": float(getattr(cfg, "hold_survival_min", 0.5)),
+        "hold_survival_max": float(getattr(cfg, "hold_survival_max", 0.99)),
+    }
 
 
 def compute_planet_metric_vectors(
     obs,
     *,
     cfg: Optional[RewardConfig] = None,
+    turn: int = 0,
 ):
     """Per-planet graph metric matrix used by arrival-credit snapshots.
 
     Returns a ``(num_real_planets, D)`` ``numpy.ndarray`` where ``D`` is
-    8 (base) or 12 (base + flux) depending on ``cfg.enable_flux_metrics``.
+    10 (base) or 14 (base + flux) depending on ``cfg.enable_flux_metrics``.
     Padded planet slots are *excluded* — index 0..num_real_planets-1
     corresponds to the first ``num_real_planets`` planet slots in
     ``obs.planet_mask`` (which mirrors the convention used elsewhere in
     the codebase: real planets occupy the leading slots).
 
-    Channel order matches the weight tuple consumed by
-    :func:`compute_graph_native_reward`:
+    Channel order matches :func:`rl.arrival_credit.build_channel_weights`:
 
         [friendly_influence, enemy_influence, influence_balance,
          friendly_support, supportability, vulnerability,
-         production_potential, strategic_potential,
+         production_potential, friendly_production_potential,
+         strategic_potential, held_discounted_production,
          flux_friendly_in, flux_friendly_out,
          flux_enemy_in, flux_enemy_out]
 
@@ -676,210 +712,26 @@ def compute_planet_metric_vectors(
                 ship_norm=float(getattr(cfg, "flux_ship_norm", 50.0)),
             )
             flux_features = torch.as_tensor(flux_np[:n], dtype=torch.float32)
+        hold_kwargs = _hold_metric_kwargs_from_cfg(cfg, turn=turn, obs=obs)
         node_metrics = _graph_node_metrics(
-            planet_feats, edge_bias, n, eta=eta, flux_features=flux_features,
+            planet_feats, edge_bias, n, eta=eta, flux_features=flux_features, **hold_kwargs,
         )
         return node_metrics.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
-def compute_graph_metrics_summary(
+
+def sum_planet_metric_channels(
     obs,
-    *,
-    edge_signal: str = "flow_opportunity",
-    cfg: Optional[RewardConfig] = None,
-) -> dict:
-    """Lightweight scalar summary of graph metrics for reward shaping.
-
-    Returns ``{"node_sum": list, "edge_sum": float}`` where ``node_sum``
-    has length :data:`model_graph_pyg.GRAPH_NODE_METRIC_DIM` (8) or
-    :data:`GRAPH_NODE_METRIC_DIM_FLUX` (12) depending on
-    ``cfg.enable_flux_metrics``.  Computed without constructing a PyG
-    ``Data`` object: ETA is computed once and shared between node + edge
-    metric matrices.
-
-    Falls back to a zeroed summary if torch / model_graph_pyg is unavailable.
-    """
-    try:
-        import torch
-        from model_graph_pyg import (
-            GRAPH_NODE_METRIC_DIM,
-            GRAPH_NODE_METRIC_DIM_FLUX,
-            _estimated_intercept_eta_matrix,
-            _graph_edge_metric_matrix,
-            _graph_node_metrics,
-        )
-    except Exception:
-        return {"node_sum": [0.0] * 8, "edge_sum": 0.0}
-
-    edge_idx = _EDGE_SIGNAL_INDEX.get(edge_signal, _EDGE_SIGNAL_INDEX["flow_opportunity"])
-    flux_enabled = bool(cfg is not None and getattr(cfg, "enable_flux_metrics", False))
-    fallback_dim = GRAPH_NODE_METRIC_DIM_FLUX if flux_enabled else GRAPH_NODE_METRIC_DIM
-
-    with torch.no_grad():
-        planet_feats = torch.as_tensor(obs.planet_feats, dtype=torch.float32)
-        edge_bias = torch.as_tensor(obs.edge_bias, dtype=torch.float32)
-        planet_mask = torch.as_tensor(obs.planet_mask, dtype=torch.bool)
-        n = int(planet_mask.sum().item())
-        if n <= 0:
-            return {"node_sum": [0.0] * fallback_dim, "edge_sum": 0.0}
-        eta = _estimated_intercept_eta_matrix(planet_feats, edge_bias, n)
-        flux_features = None
-        if flux_enabled:
-            from .flux import compute_node_flux_features
-            flux_np = compute_node_flux_features(
-                obs,
-                p_max=int(planet_feats.shape[0]),
-                mode=getattr(cfg, "flux_mode", "exp_decay"),
-                tau=float(getattr(cfg, "flux_tau", 10.0)),
-                eta_norm=float(getattr(cfg, "flux_eta_norm", 50.0)),
-                ship_norm=float(getattr(cfg, "flux_ship_norm", 50.0)),
-            )
-            flux_features = torch.as_tensor(flux_np[:n], dtype=torch.float32)
-        node_metrics = _graph_node_metrics(
-            planet_feats, edge_bias, n, eta=eta, flux_features=flux_features,
-        )
-        edge_metrics = _graph_edge_metric_matrix(
-            planet_feats, edge_bias, n, eta=eta, node_metrics=node_metrics,
-        )
-        node_sum = node_metrics.sum(dim=0).cpu().tolist()
-        edge_sum = float(edge_metrics[..., edge_idx].sum().item())
-    return {"node_sum": node_sum, "edge_sum": edge_sum}
-
-
-def compute_graph_native_reward(
-    prev_obs_or_summary,
-    curr_obs_or_summary,
-    player: int,
     *,
     cfg: Optional[RewardConfig] = None,
     turn: int = 0,
-) -> float:
-    """Graph-native potential-based reward.
+) -> list[float]:
+    """Sum of per-planet metric vectors (diagnostics / tests).
 
-    Either argument may be an ``Observation`` (in which case a metric
-    summary is computed on the fly) or a pre-computed summary dict from
-    :func:`compute_graph_metrics_summary`.  Passing pre-computed summaries
-    avoids a duplicate metric pass when the rollout caches the previous
-    step's summary.
-
-    Implements **potential-based shaping** (Ng, Harada & Russell 1999):
-
-        r_t = γ · φ(s_{t+1}) − φ(s_t)
-
-    where φ is the weighted sum of graph node + edge metric channels and
-    γ is :attr:`RewardConfig.graph_potential_discount` (matching PPO
-    ``gamma`` keeps the optimal policy invariant).
-
-    Falls back to ``0.0`` if torch / model_graph_pyg is unavailable.
+    Returns a list of length 10 or 14 matching ``compute_planet_metric_vectors``.
     """
-    cfg = cfg or RewardConfig()
-
-    def _as_summary(x):
-        if isinstance(x, dict):
-            return x
-        return compute_graph_metrics_summary(
-            x, edge_signal=cfg.graph_edge_efficiency_signal, cfg=cfg,
-        )
-
-    prev = _as_summary(prev_obs_or_summary)
-    curr = _as_summary(curr_obs_or_summary)
-
-    prev_node = prev.get("node_sum") or []
-    curr_node = curr.get("node_sum") or []
-    if not prev_node or not curr_node or len(prev_node) != len(curr_node):
-        return 0.0
-
-    # Channel order must mirror ``_graph_node_metrics`` (base 8) followed
-    # by ``compute_node_flux_features`` (4 flux channels).
-    weights = (
-        cfg.graph_friendly_influence_weight,
-        cfg.graph_enemy_influence_weight,
-        cfg.graph_influence_balance_weight,
-        cfg.graph_friendly_support_weight,
-        cfg.graph_supportability_weight,
-        cfg.graph_vulnerability_weight,
-        cfg.graph_production_potential_weight,
-        cfg.graph_strategic_potential_weight,
-        cfg.graph_flux_friendly_in_weight,
-        cfg.graph_flux_friendly_out_weight,
-        cfg.graph_flux_enemy_in_weight,
-        cfg.graph_flux_enemy_out_weight,
-    )
-    if len(weights) != len(curr_node):
-        # Truncate to match summary length (8-channel summary discards the
-        # 4 flux weights automatically when ``enable_flux_metrics`` is off).
-        weights = weights[: len(curr_node)] + (0.0,) * max(0, len(curr_node) - len(weights))
-
-    discount = float(cfg.graph_potential_discount)
-    # Potential-based shaping per channel: r_i = γ * curr_i - prev_i
-    raw_reward = 0.0
-    for w, p_i, c_i in zip(weights, prev_node, curr_node):
-        if w == 0.0:
-            continue
-        raw_reward += float(w) * (discount * float(c_i) - float(p_i))
-
-    # Edge-level signal (single scalar channel).
-    if cfg.graph_edge_efficiency_weight != 0.0:
-        prev_edge = float(prev.get("edge_sum", 0.0))
-        curr_edge = float(curr.get("edge_sum", 0.0))
-        raw_reward += cfg.graph_edge_efficiency_weight * (discount * curr_edge - prev_edge)
-
-    T = max(1, int(cfg.max_turns))
-    time_norm = max(0.0, (T - turn) / T)
-    time_factor = max(
-        cfg.time_decay_floor,
-        time_norm ** max(0.0, float(cfg.capture_time_curvature)),
-    )
-
-    return float(raw_reward * time_factor * cfg.reward_scale)
-
-
-class RunningMeanStd:
-    """Welford-style running estimator of mean and variance for scalars.
-
-    Used by the graph_native reward path to normalize per-step rewards
-    by a running standard deviation (per-player), which keeps the
-    advantage scale stable across the heterogeneous graph metric channels
-    (ships ~ 0..1000 vs. supportability ~ 0..1).
-
-    Notes
-    -----
-    - Only the standard deviation is consumed (the mean is *not*
-      subtracted); subtracting the mean would shift the equilibrium of a
-      potential-based shaping signal away from zero.
-    - During the first ``warmup`` updates the std is treated as ``1.0`` so
-      we don't amplify near-zero noise into huge rewards.
-    """
-
-    __slots__ = ("count", "_mean", "_m2", "warmup")
-
-    def __init__(self, *, warmup: int = 64) -> None:
-        self.count = 0
-        self._mean = 0.0
-        self._m2 = 0.0
-        self.warmup = max(0, int(warmup))
-
-    def update(self, value: float) -> None:
-        v = float(value)
-        self.count += 1
-        delta = v - self._mean
-        self._mean += delta / self.count
-        delta2 = v - self._mean
-        self._m2 += delta * delta2
-
-    @property
-    def variance(self) -> float:
-        if self.count < 2:
-            return 0.0
-        return self._m2 / (self.count - 1)
-
-    @property
-    def std(self) -> float:
-        return self.variance ** 0.5
-
-    def normalize(self, value: float, *, eps: float = 1e-6) -> float:
-        """Return ``value / max(std, eps)`` once warmup is satisfied; else ``value``."""
-        if self.count < self.warmup:
-            return float(value)
-        s = self.std
-        return float(value) / max(s, float(eps))
+    mat = compute_planet_metric_vectors(obs, cfg=cfg, turn=turn)
+    if mat is None:
+        flux_enabled = bool(cfg is not None and getattr(cfg, "enable_flux_metrics", False))
+        return [0.0] * (14 if flux_enabled else 10)
+    return mat.sum(axis=0).tolist()

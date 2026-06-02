@@ -578,6 +578,9 @@ def build_observation(
             "incoming_other": incoming_other,
             "p_max": p_max,
             "f_max": f_max,
+            "turn": int(turn),
+            "max_turns": int(max_turns),
+            "remaining_turns": max(0, int(max_turns) - int(turn)),
         },
     )
 

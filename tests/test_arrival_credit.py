@@ -3,9 +3,9 @@
 Covers:
     * Helpers: ``rl.arrival_credit.eta_weight`` modes, channel-weight order.
     * Snapshot: ``compute_planet_metric_vectors`` returns ``(n_real, D)``
-      with ``D in {8, 12}`` driven by ``enable_flux_metrics``.
+      with ``D in {10, 14}`` driven by ``enable_flux_metrics``.
     * Tracker: register → compute_credit lifecycle, snapshot consumption,
-      and that **all 12 channels** contribute to the credit when their
+      and that all metric channels contribute to the credit when their
       weights are non-zero.
     * Backward compatibility: ``enable_arrival_credit=False`` produces
       zero behavioural difference.
@@ -16,6 +16,8 @@ from __future__ import annotations
 import math
 import numpy as np
 import pytest
+
+from rl.arrival_credit import NUM_METRIC_CHANNELS
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +38,7 @@ class _StubObs:
 
     def __init__(self, n_real: int = 4, p_max: int = 8):
         from model_graph_pyg import PYG_PLANET_FEATURE_DIM
-        # PYG_PLANET_FEATURE_DIM may be 34; planet_feats has that base width.
+        # The metric path only reads the raw obs_builder feature indices.
         self.planet_feats = np.zeros((p_max, PYG_PLANET_FEATURE_DIM), dtype=np.float32)
         # 6 base + 9 edge metric channels = 15 in obs.edge_bias.  The
         # metric pipeline only reads the leading channels; zeros are fine.
@@ -97,31 +99,32 @@ def test_eta_weight_unknown_mode_raises():
 
 
 # ---------------------------------------------------------------------------
-# build_channel_weights mirrors RewardConfig 12-vector ordering
+# build_channel_weights mirrors RewardConfig 13-vector ordering
 # ---------------------------------------------------------------------------
 
 
 def test_channel_weights_order_matches_reward_config():
-    """The 12-vector built by ``build_channel_weights`` must match the
-    field ordering consumed by ``compute_graph_native_reward``: any
-    drift between the two would silently change credit assignment.
+    """The 14-vector built by ``build_channel_weights`` must match
+    ``RewardConfig.arrival_credit_*_weight`` field ordering.
     """
     from rl.arrival_credit import build_channel_weights, NUM_METRIC_CHANNELS
     from rl.rewards import RewardConfig
 
     cfg = RewardConfig(
-        graph_friendly_influence_weight=1.0,
-        graph_enemy_influence_weight=2.0,
-        graph_influence_balance_weight=3.0,
-        graph_friendly_support_weight=4.0,
-        graph_supportability_weight=5.0,
-        graph_vulnerability_weight=6.0,
-        graph_production_potential_weight=7.0,
-        graph_strategic_potential_weight=8.0,
-        graph_flux_friendly_in_weight=9.0,
-        graph_flux_friendly_out_weight=10.0,
-        graph_flux_enemy_in_weight=11.0,
-        graph_flux_enemy_out_weight=12.0,
+        arrival_credit_friendly_influence_weight=1.0,
+        arrival_credit_enemy_influence_weight=2.0,
+        arrival_credit_influence_balance_weight=3.0,
+        arrival_credit_friendly_support_weight=4.0,
+        arrival_credit_supportability_weight=5.0,
+        arrival_credit_vulnerability_weight=6.0,
+        arrival_credit_production_potential_weight=7.0,
+        arrival_credit_friendly_production_potential_weight=8.0,
+        arrival_credit_strategic_potential_weight=9.0,
+        arrival_credit_held_discounted_production_weight=10.0,
+        arrival_credit_flux_friendly_in_weight=11.0,
+        arrival_credit_flux_friendly_out_weight=12.0,
+        arrival_credit_flux_enemy_in_weight=13.0,
+        arrival_credit_flux_enemy_out_weight=14.0,
     )
     w = build_channel_weights(cfg)
     assert w.shape == (NUM_METRIC_CHANNELS,)
@@ -143,7 +146,7 @@ def test_planet_metric_vectors_base_shape():
     cfg = RewardConfig(enable_flux_metrics=False)
     mat = compute_planet_metric_vectors(obs, cfg=cfg)
     assert mat is not None
-    assert mat.shape == (3, 8)
+    assert mat.shape == (3, 10)
     assert mat.dtype == np.float32
 
 
@@ -155,7 +158,7 @@ def test_planet_metric_vectors_flux_shape():
     cfg = RewardConfig(enable_flux_metrics=True)
     mat = compute_planet_metric_vectors(obs, cfg=cfg)
     assert mat is not None
-    assert mat.shape == (3, 12)
+    assert mat.shape == (3, 14)
 
 
 def test_planet_metric_vectors_no_real_planets_returns_none():
@@ -195,19 +198,21 @@ class _CfgStub:
         eta_norm: float = 50.0,
         weight: float = 1.0,
         reward_scale: float = 1.0,
+        counterfactual_scope: str = "full_graph",
     ):
         self.arrival_credit_mode = mode
         self.arrival_credit_tau = tau
         self.arrival_credit_eta_norm = eta_norm
         self.arrival_credit_weight = weight
         self.reward_scale = reward_scale
+        self.arrival_credit_counterfactual_scope = counterfactual_scope
 
 
 def test_tracker_register_then_consume():
     from rl.arrival_credit import ArrivalCreditTracker
     tr = ArrivalCreditTracker()
     ids = _zero_planet_ids(3)
-    launch_mat = np.zeros((3, 12), dtype=np.float32)
+    launch_mat = np.zeros((3, NUM_METRIC_CHANNELS), dtype=np.float32)
     ok = tr.register(
         buffer_idx=7,
         player=0,
@@ -219,7 +224,7 @@ def test_tracker_register_then_consume():
     assert ok is True
     assert 7 in tr
     assert len(tr) == 1
-    curr_mat = np.zeros((3, 12), dtype=np.float32)
+    curr_mat = np.zeros((3, NUM_METRIC_CHANNELS), dtype=np.float32)
     credit = tr.compute_credit(
         buffer_idx=7,
         curr_metric_matrix=curr_mat,
@@ -238,7 +243,7 @@ def test_tracker_register_missing_target_skipped():
     from rl.arrival_credit import ArrivalCreditTracker
     tr = ArrivalCreditTracker()
     ids = _zero_planet_ids(3)
-    launch_mat = np.zeros((3, 12), dtype=np.float32)
+    launch_mat = np.zeros((3, NUM_METRIC_CHANNELS), dtype=np.float32)
     ok = tr.register(
         buffer_idx=1,
         player=0,
@@ -270,7 +275,7 @@ def test_tracker_compute_credit_no_snapshot_returns_none():
     from rl.arrival_credit import ArrivalCreditTracker
     tr = ArrivalCreditTracker()
     ids = _zero_planet_ids(3)
-    curr = np.zeros((3, 12), dtype=np.float32)
+    curr = np.zeros((3, NUM_METRIC_CHANNELS), dtype=np.float32)
     out = tr.compute_credit(
         buffer_idx=42,
         curr_metric_matrix=curr,
@@ -290,7 +295,7 @@ def test_tracker_discard():
         player=0,
         target_planet_id=101,
         eta_at_launch=1.0,
-        launch_metric_matrix=np.zeros((2, 12), dtype=np.float32),
+        launch_metric_matrix=np.zeros((2, NUM_METRIC_CHANNELS), dtype=np.float32),
         launch_planet_ids=ids,
     )
     assert tr.discard(3) is True
@@ -299,7 +304,7 @@ def test_tracker_discard():
 
 
 # ---------------------------------------------------------------------------
-# CORE INVARIANT: all 12 channels contribute to the arrival credit.
+# CORE INVARIANT: all channels contribute to the arrival credit.
 # This is the user's hard requirement: "tüm metriklere etki ettiğine emin
 # olalım" — every channel with a non-zero weight must show up in the
 # computed credit when its target-vector entry changes between launch
@@ -307,9 +312,9 @@ def test_tracker_discard():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("channel", range(12))
-def test_all_twelve_channels_contribute(channel: int):
-    """For each channel c in [0, 12), force a unit delta only on that
+@pytest.mark.parametrize("channel", range(NUM_METRIC_CHANNELS))
+def test_all_metric_channels_contribute(channel: int):
+    """For each channel, force a unit delta only on that
     channel and assert the resulting credit equals the channel's weight.
 
     This guards against silent regressions where a future refactor
@@ -483,6 +488,179 @@ def test_arrival_credit_reward_scale_applied():
     assert credit == pytest.approx(1.0 * 2.0 * 0.5)
 
 
+def _set_owner_for_test(feats: np.ndarray, slot: int, kind: str) -> None:
+    from obs_builder import (
+        PF_IDX_OWNER_ENEMY_0,
+        PF_IDX_OWNER_NEUTRAL,
+        PF_IDX_OWNER_SELF,
+    )
+    feats[slot, PF_IDX_OWNER_SELF:PF_IDX_OWNER_NEUTRAL + 1] = 0.0
+    if kind == "self":
+        feats[slot, PF_IDX_OWNER_SELF] = 1.0
+    elif kind == "neutral":
+        feats[slot, PF_IDX_OWNER_NEUTRAL] = 1.0
+    else:
+        feats[slot, PF_IDX_OWNER_ENEMY_0] = 1.0
+
+
+def _set_ships_for_test(feats: np.ndarray, slot: int, ships: float) -> None:
+    from obs_builder import PF_IDX_LOG_SHIPS, PF_IDX_SHIPS
+    feats[slot, PF_IDX_SHIPS] = float(ships) / 100.0
+    feats[slot, PF_IDX_LOG_SHIPS] = math.log(float(ships) + 1.0) / math.log(1000.0)
+
+
+def test_counterfactual_negative_target_flips_to_non_self():
+    """If removing the arriving fleet makes target ships negative, the
+    counterfactual target must stop being self-owned.  This is the
+    ownership switch that disables friendly production potential.
+    """
+    from obs_builder import PF_IDX_OWNER_ENEMY_0, PF_IDX_OWNER_SELF, PF_IDX_SHIPS
+    from rl.arrival_credit import ArrivalCreditTracker
+
+    obs = _StubObs(n_real=2, p_max=4)
+    _set_owner_for_test(obs.planet_feats, 0, "self")
+    _set_ships_for_test(obs.planet_feats, 0, 10.0)
+    tr = ArrivalCreditTracker()
+    tr.register(
+        buffer_idx=9,
+        player=0,
+        target_planet_id=100,
+        eta_at_launch=0.0,
+        launch_metric_matrix=np.zeros((2, NUM_METRIC_CHANNELS), dtype=np.float32),
+        launch_planet_ids=obs.planet_ids,
+        ships_sent=30,
+    )
+
+    pair = tr.build_counterfactual_observations(
+        buffer_idx=9,
+        curr_obs=obs,
+        curr_planet_ids=obs.planet_ids,
+        actual_target_planet_id=100,
+        previous_target_owner=1,
+        return_to_source=False,
+    )
+    assert pair is not None
+    _, cf_obs = pair
+    assert cf_obs.planet_feats[0, PF_IDX_OWNER_SELF] == pytest.approx(0.0)
+    assert cf_obs.planet_feats[0, PF_IDX_OWNER_ENEMY_0] == pytest.approx(1.0)
+    assert cf_obs.planet_feats[0, PF_IDX_SHIPS] == pytest.approx(20.0 / 100.0)
+
+
+def test_counterfactual_returned_source_ships_can_prevent_loss():
+    from obs_builder import PF_IDX_OWNER_ENEMY_0, PF_IDX_OWNER_SELF, PF_IDX_SHIPS
+    from rl.arrival_credit import ArrivalCreditTracker
+
+    obs = _StubObs(n_real=2, p_max=4)
+    _set_owner_for_test(obs.planet_feats, 0, "self")
+    _set_ships_for_test(obs.planet_feats, 0, 50.0)
+    _set_owner_for_test(obs.planet_feats, 1, "enemy")
+    _set_ships_for_test(obs.planet_feats, 1, 10.0)
+    tr = ArrivalCreditTracker()
+    tr.register(
+        buffer_idx=10,
+        player=0,
+        target_planet_id=100,
+        eta_at_launch=0.0,
+        launch_metric_matrix=np.zeros((2, NUM_METRIC_CHANNELS), dtype=np.float32),
+        launch_planet_ids=obs.planet_ids,
+        ships_sent=30,
+        source_planet_id=101,
+    )
+
+    pair = tr.build_counterfactual_observations(
+        buffer_idx=10,
+        curr_obs=obs,
+        curr_planet_ids=obs.planet_ids,
+        actual_target_planet_id=100,
+        previous_target_owner=0,
+        return_to_source=True,
+    )
+    assert pair is not None
+    _, cf_obs = pair
+    assert cf_obs.planet_feats[1, PF_IDX_OWNER_SELF] == pytest.approx(1.0)
+    assert cf_obs.planet_feats[1, PF_IDX_OWNER_ENEMY_0] == pytest.approx(0.0)
+    assert cf_obs.planet_feats[1, PF_IDX_SHIPS] == pytest.approx(20.0 / 100.0)
+
+
+def test_counterfactual_horizon_resolves_soonest_enemy_arrival():
+    from obs_builder import (
+        PF_IDX_INCOMING_ENEMY_MIN_ETA,
+        PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS,
+        PF_IDX_INCOMING_ENEMY_TOTAL,
+        PF_IDX_OWNER_ENEMY_0,
+        PF_IDX_OWNER_SELF,
+        PF_IDX_SHIPS,
+    )
+    from rl.arrival_credit import ArrivalCreditTracker
+
+    obs = _StubObs(n_real=1, p_max=4)
+    _set_owner_for_test(obs.planet_feats, 0, "self")
+    _set_ships_for_test(obs.planet_feats, 0, 30.0)
+    obs.planet_feats[0, PF_IDX_INCOMING_ENEMY_MIN_ETA] = 2.0 / 50.0
+    obs.planet_feats[0, PF_IDX_INCOMING_ENEMY_SOONEST_SHIPS] = 25.0 / 100.0
+    obs.planet_feats[0, PF_IDX_INCOMING_ENEMY_TOTAL] = 25.0 / 100.0
+    tr = ArrivalCreditTracker()
+    tr.register(
+        buffer_idx=11,
+        player=0,
+        target_planet_id=100,
+        eta_at_launch=0.0,
+        launch_metric_matrix=np.zeros((1, NUM_METRIC_CHANNELS), dtype=np.float32),
+        launch_planet_ids=obs.planet_ids,
+        ships_sent=20,
+    )
+
+    pair = tr.build_counterfactual_observations(
+        buffer_idx=11,
+        curr_obs=obs,
+        curr_planet_ids=obs.planet_ids,
+        actual_target_planet_id=100,
+        previous_target_owner=0,
+        return_to_source=False,
+        horizon=5.0,
+    )
+    assert pair is not None
+    actual_obs, cf_obs = pair
+    assert actual_obs.planet_feats[0, PF_IDX_OWNER_SELF] == pytest.approx(1.0)
+    assert actual_obs.planet_feats[0, PF_IDX_SHIPS] == pytest.approx(5.0 / 100.0)
+    assert cf_obs.planet_feats[0, PF_IDX_OWNER_SELF] == pytest.approx(0.0)
+    assert cf_obs.planet_feats[0, PF_IDX_OWNER_ENEMY_0] == pytest.approx(1.0)
+    assert cf_obs.planet_feats[0, PF_IDX_SHIPS] == pytest.approx(15.0 / 100.0)
+
+
+def test_counterfactual_credit_full_graph_uses_actual_minus_counterfactual():
+    from rl.arrival_credit import ArrivalCreditTracker, NUM_METRIC_CHANNELS
+
+    tr = ArrivalCreditTracker()
+    ids = _zero_planet_ids(2)
+    launch_mat = np.zeros((2, NUM_METRIC_CHANNELS), dtype=np.float32)
+    tr.register(
+        buffer_idx=12,
+        player=0,
+        target_planet_id=100,
+        eta_at_launch=0.0,
+        launch_metric_matrix=launch_mat,
+        launch_planet_ids=ids,
+    )
+    curr = np.zeros((2, NUM_METRIC_CHANNELS), dtype=np.float32)
+    cf = np.zeros_like(curr)
+    curr[0, 0] = 5.0
+    cf[0, 0] = 2.0
+    cf[1, 0] = 10.0
+    w = np.zeros(NUM_METRIC_CHANNELS, dtype=np.float32)
+    w[0] = 1.0
+    credit = tr.compute_credit(
+        buffer_idx=12,
+        curr_metric_matrix=curr,
+        curr_planet_ids=ids,
+        channel_weights=w,
+        cfg=_CfgStub(mode="raw"),
+        counterfactual_metric_matrix=cf,
+        counterfactual_planet_ids=ids,
+    )
+    assert credit == pytest.approx(-7.0)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end rollout integration: collect a short episode under
 # graph_native + arrival_credit and verify the tracker is actually
@@ -591,6 +769,66 @@ def test_rollout_tracker_register_is_called_on_launch():
     assert "target_planet_id" in sample
     assert "eta_at_launch" in sample
     assert "launch_metric_matrix" in sample
+
+
+def test_rollout_graph_native_non_terminal_step_reward_zero():
+    """``graph_native`` has no step-level shaping; non-terminal buffer
+    rewards come only from arrival credit (delayed) and invalid penalties.
+    """
+    import torch
+    from rl.buffer import RolloutBuffer
+    from rl.rollout import collect_episode
+    from rl.rewards import build_reward_config
+
+    policy = _make_pyg_policy_cpu()
+    reward_cfg = build_reward_config(
+        "graph_native",
+        enable_arrival_credit=False,
+    )
+    buf = RolloutBuffer()
+    collect_episode(
+        policy, buf,
+        max_steps=12, num_agents=2,
+        reward_cfg=reward_cfg, device=torch.device("cpu"),
+        seed=123,
+    )
+    non_terminal = [tr for tr in buf.data if not tr.done]
+    assert non_terminal, "expected transitions before terminal"
+    assert all(abs(tr.reward) < 1e-12 for tr in non_terminal)
+
+
+def test_rollout_terminal_reward_reaches_buffer():
+    """Terminal +/-1 must reach the buffer when the game has a winner."""
+    import torch
+    from rl.buffer import RolloutBuffer
+    from rl.rollout import collect_episode
+    from rl.rewards import build_reward_config
+
+    policy = _make_pyg_policy_cpu()
+    reward_cfg = build_reward_config(
+        "graph_native",
+        enable_arrival_credit=False,
+        terminal_scale=1.0,
+    )
+    for seed in range(8):
+        buf = RolloutBuffer()
+        stats = collect_episode(
+            policy, buf,
+            max_steps=120, num_agents=2,
+            reward_cfg=reward_cfg, device=torch.device("cpu"),
+            seed=seed,
+        )
+        if stats.winner not in (0, 1):
+            continue
+        p0_rews = [tr.reward for tr in buf.data if tr.player == 0]
+        assert p0_rews, "expected P0 transitions"
+        expected = 1.0 if stats.winner == 0 else -1.0
+        assert stats.reward_p0 == pytest.approx(expected, abs=1e-6)
+        assert sum(p0_rews) == pytest.approx(expected, abs=1e-6), (
+            f"seed={seed} winner={stats.winner} buffer_sum={sum(p0_rews):.4f}"
+        )
+        return
+    pytest.skip("no decisive game in seeds 0..7 within 120 steps")
 
 
 def test_rollout_combo_flux_and_arrival_credit_runs():

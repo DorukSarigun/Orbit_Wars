@@ -48,6 +48,12 @@ class Transition:
     # built with ``enable_flux_features=True``.  Stored as ``None`` for
     # legacy policies so the buffer stays compact.
     flux_features: Optional[np.ndarray] = None
+    # Optional per-step edge flux features ``(P_max, P_max, 2)`` carrying
+    # the directed [friendly_flux_ij, enemy_flux_ij] channels.  Paired
+    # with ``flux_features`` -- when the policy was built with
+    # ``enable_flux_features=True`` both fields are populated together
+    # so the PPO update can rebuild the same encoder input.
+    edge_flux_features: Optional[np.ndarray] = None
 
 
 class RolloutBuffer:
@@ -185,6 +191,15 @@ class RolloutBuffer:
                     "sampled transitions; either all or none must carry them."
                 )
             out["flux_features"] = torch.from_numpy(np.stack(flux)).float()
+        if any(t.edge_flux_features is not None for t in sub):
+            edge_flux = [t.edge_flux_features for t in sub]
+            if any(f is None for f in edge_flux):
+                missing = sum(1 for f in edge_flux if f is None)
+                raise ValueError(
+                    f"edge_flux_features present on {len(edge_flux) - missing}/{len(edge_flux)} "
+                    "sampled transitions; either all or none must carry them."
+                )
+            out["edge_flux_features"] = torch.from_numpy(np.stack(edge_flux)).float()
         return out
 
     def clear(self) -> None:

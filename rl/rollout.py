@@ -19,6 +19,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from typing import Optional
 
+import numpy as np
 import torch
 from kaggle_environments import make
 
@@ -28,6 +29,7 @@ from obs_builder import (
     build_observation,
     decode_action_with_launch,
     INCOMING_ETA_BUCKETS,
+    PF_IDX_OWNER_SELF,
     PF_IDX_SHIPS,
     PF_IDX_INCOMING_SELF_B0,
     PF_IDX_INCOMING_ENEMY_B0,
@@ -36,11 +38,9 @@ from obs_builder import (
 from model import OrbitWarsPolicy, pack_observations, _make_ship_dist
 
 from .buffer import RolloutBuffer, Transition
+from .game_logger import GameLogger
 from .rewards import (
     RewardConfig,
-    RunningMeanStd,
-    compute_graph_metrics_summary,
-    compute_graph_native_reward,
     compute_planet_metric_vectors,
     compute_step_reward,
     normalize_terminal_rewards,
@@ -65,6 +65,8 @@ from .production_reward_tracker import (
     compute_production_capture_clawback,
 )
 from scripted_strategy import CaptureEfficiencyAgent, ScriptedConfig
+from scripted_graph_scorer import ScriptedGraphScores, build_scripted_graph_scores
+from scripted_graph_agent import GraphMaximizingAgent, GraphMaximizingConfig
 
 MAX_LAUNCHES_PER_PLAYER_TURN = 8
 MAX_PAIR_CANDIDATES = 64
@@ -76,25 +78,34 @@ def _pack_with_flux(obs_list, *, device, policy, reward_cfg):
 
     The flux mode / temperature mirror the reward-side
     :class:`RewardConfig` so a single flag controls both encoder input
-    and reward shaping when the user wants them coupled.
+    and reward shaping when the user wants them coupled.  Both the
+    node-level (B, P_max, 4) and edge-level (B, P_max, P_max, 2)
+    tensors are attached so the GINE convs can route fleet-in-flight
+    information through edges as well as nodes.
     """
     import numpy as np
     batch = pack_observations(obs_list, device=device)
     if not getattr(policy, "enable_flux_features", False):
         return batch
-    from .flux import compute_node_flux_features
+    from .flux import compute_flux_matrices, compute_node_flux_features
     p_max = int(obs_list[0].planet_feats.shape[0])
-    flux_np = np.stack([
-        compute_node_flux_features(
-            o, p_max=p_max,
-            mode=getattr(reward_cfg, "flux_mode", "exp_decay"),
-            tau=float(getattr(reward_cfg, "flux_tau", 10.0)),
-            eta_norm=float(getattr(reward_cfg, "flux_eta_norm", 50.0)),
-            ship_norm=float(getattr(reward_cfg, "flux_ship_norm", 50.0)),
+    mode = getattr(reward_cfg, "flux_mode", "exp_decay")
+    tau = float(getattr(reward_cfg, "flux_tau", 10.0))
+    eta_norm = float(getattr(reward_cfg, "flux_eta_norm", 50.0))
+    ship_norm = float(getattr(reward_cfg, "flux_ship_norm", 50.0))
+    inv_ship_norm = 1.0 / max(ship_norm, 1e-6)
+    node_flux_np = np.empty((len(obs_list), p_max, 4), dtype=np.float32)
+    edge_flux_np = np.zeros((len(obs_list), p_max, p_max, 2), dtype=np.float32)
+    for i, o in enumerate(obs_list):
+        mats = compute_flux_matrices(o, p_max=p_max, mode=mode, tau=tau, eta_norm=eta_norm)
+        node_flux_np[i] = compute_node_flux_features(
+            o, p_max=p_max, mode=mode, tau=tau,
+            eta_norm=eta_norm, ship_norm=ship_norm, matrices=mats,
         )
-        for o in obs_list
-    ])
-    batch["flux_features"] = torch.from_numpy(flux_np).to(device)
+        edge_flux_np[i, :, :, 0] = mats.friendly * inv_ship_norm
+        edge_flux_np[i, :, :, 1] = mats.enemy * inv_ship_norm
+    batch["flux_features"] = torch.from_numpy(node_flux_np).to(device)
+    batch["edge_flux_features"] = torch.from_numpy(edge_flux_np).to(device)
     return batch
 
 
@@ -320,55 +331,202 @@ class ScriptedExpansionConfig:
     nearest_k: int = 5
 
 
+def _neutral_friendly_in_flight(
+    target_planet_id: int,
+    *,
+    fleets: list[Fleet],
+    fleet_preds: dict[int, Optional[dict]],
+    player: int,
+) -> int:
+    total = 0
+    for fleet in fleets:
+        pred = fleet_preds.get(int(fleet.id))
+        if pred is None or int(pred["target_id"]) != int(target_planet_id):
+            continue
+        if int(fleet.owner) == int(player):
+            total += int(fleet.ships)
+    return total
+
+
+def _pick_scripted_neutral_expansion_pair(
+    obs,
+    planets: list[Planet],
+    fleets: list[Fleet],
+    fleet_preds: dict[int, Optional[dict]],
+    player: int,
+    *,
+    graph_scores: Optional[ScriptedGraphScores],
+    nearest_k: int = 5,
+    current_turn: int = 0,
+    max_turns: int = 500,
+    src_slot: Optional[int] = None,
+) -> Optional[tuple[int, int, float]]:
+    """Return ``(src_slot, tgt_slot, ship_value)`` for one expansion launch.
+
+    Phase A graph ranking (when metrics are available):
+      - target: strategic_potential + production_potential
+      - source: supportability - vulnerability (tie-break / soft bonus)
+      - pair:   flow_opportunity(src, tgt)
+
+    Hard constraints from the legacy heuristic are preserved: neutral-only
+    in-flight skip, defense shortfall veto, ship caps.
+    """
+    slot_by_planet_id = {
+        int(pid): slot
+        for slot, pid in enumerate(obs.planet_ids)
+        if int(pid) >= 0
+    }
+    planet_by_id = {int(p.id): p for p in planets}
+    source_slots = (
+        [int(src_slot)]
+        if src_slot is not None
+        else [
+            int(slot)
+            for slot, ok in enumerate(obs.source_mask)
+            if bool(ok)
+            and int(obs.planet_ids[slot]) in planet_by_id
+            and planet_by_id[int(obs.planet_ids[slot])].owner == player
+            and planet_by_id[int(obs.planet_ids[slot])].ships > 1
+        ]
+    )
+    if not source_slots:
+        return None
+
+    neutral_targets = [
+        p for p in planets
+        if p.owner == -1 and not p.is_comet and p.id in slot_by_planet_id
+    ]
+    if not neutral_targets:
+        return None
+
+    if src_slot is not None:
+        src = planet_by_id.get(int(obs.planet_ids[src_slot]))
+        if src is None:
+            return None
+        target_pool = sorted(
+            [p for p in neutral_targets if p.id != src.id],
+            key=lambda p: (math.hypot(src.x - p.x, src.y - p.y), p.id),
+        )[:max(1, int(nearest_k))]
+    else:
+        def _min_src_distance(tgt: Planet) -> float:
+            best = float("inf")
+            for slot in source_slots:
+                src = planet_by_id[int(obs.planet_ids[slot])]
+                best = min(best, math.hypot(src.x - tgt.x, src.y - tgt.y))
+            return best
+
+        target_pool = sorted(
+            neutral_targets,
+            key=lambda p: (_min_src_distance(p), p.id),
+        )[:max(1, int(nearest_k))]
+
+    scored: list[tuple] = []
+    for tgt in target_pool:
+        tgt_slot = slot_by_planet_id[int(tgt.id)]
+        needed_ships = int(tgt.ships) + 1
+        if needed_ships > SHIP_REQUEST_CAP:
+            continue
+        if _neutral_friendly_in_flight(
+            int(tgt.id), fleets=fleets, fleet_preds=fleet_preds, player=player,
+        ) >= needed_ships:
+            continue
+
+        for slot in source_slots:
+            src = planet_by_id.get(int(obs.planet_ids[slot]))
+            if src is None or src.owner != player or src.ships <= 1:
+                continue
+            if int(tgt.id) == int(src.id):
+                continue
+            if needed_ships > int(src.ships):
+                continue
+
+            enemy_arrivals, self_arrivals = _enemy_self_arrivals_at_planet(
+                planet_id=int(src.id),
+                player=player,
+                fleets=fleets,
+                fleet_preds=fleet_preds,
+            )
+            remaining_after_launch = max(0, int(src.ships) - needed_ships)
+            if _compute_source_defense_shortfall(
+                ships_remaining_after_launch=remaining_after_launch,
+                production=float(src.production),
+                enemy_arrivals=enemy_arrivals,
+                self_arrivals=self_arrivals,
+            ) > 0.0:
+                continue
+
+            distance = math.hypot(src.x - tgt.x, src.y - tgt.y)
+            eta = distance / max(fleet_speed(needed_ships), 1e-6)
+            remaining_turns = max(0.0, float(max_turns) - float(current_turn) - eta)
+
+            if graph_scores is not None:
+                score = (
+                    graph_scores.target_score(tgt_slot)
+                    + graph_scores.pair_score(slot, tgt_slot)
+                    + 0.1 * graph_scores.source_score(slot)
+                )
+            else:
+                score = (
+                    float(tgt.production) * remaining_turns
+                    - float(needed_ships)
+                    - 0.25 * eta
+                )
+                if enemy_arrivals:
+                    score -= 5.0
+
+            ship_value = float(needed_ships) / float(SHIP_REQUEST_CAP)
+            scored.append((
+                score,
+                graph_scores.source_score(slot) if graph_scores is not None else 0.0,
+                not bool(enemy_arrivals),
+                remaining_after_launch,
+                -distance,
+                int(tgt.production),
+                slot,
+                tgt_slot,
+                ship_value,
+            ))
+
+    if not scored:
+        return None
+    best = max(scored)
+    _, _, _, _, _, _, src_out, tgt_out, ship_value = best
+    return int(src_out), int(tgt_out), float(ship_value)
+
+
 def _scripted_neutral_expansion_action(
     policy: OrbitWarsPolicy,
     out,
     obs,
     src_slot: int,
     planets: list,
+    fleets: list[Fleet],
+    fleet_preds: dict[int, Optional[dict]],
     player: int,
     *,
     device: torch.device,
     nearest_k: int = 5,
+    current_turn: int = 0,
+    max_turns: int = 500,
+    graph_scores: Optional[ScriptedGraphScores] = None,
 ) -> Optional[dict]:
-    src_id = int(obs.planet_ids[src_slot])
-    src = next((p for p in planets if p.id == src_id), None)
-    if src is None or src.owner != player or src.ships <= 1:
+    picked = _pick_scripted_neutral_expansion_pair(
+        obs,
+        planets,
+        fleets,
+        fleet_preds,
+        player,
+        graph_scores=graph_scores,
+        nearest_k=nearest_k,
+        current_turn=current_turn,
+        max_turns=max_turns,
+        src_slot=int(src_slot),
+    )
+    if picked is None:
         return None
-    slot_by_planet_id = {
-        int(pid): slot
-        for slot, pid in enumerate(obs.planet_ids)
-        if int(pid) >= 0
-    }
-    candidates = [
-        p for p in planets
-        if p.owner == -1 and not p.is_comet and p.id != src_id and p.id in slot_by_planet_id
-    ]
-    if not candidates:
-        return None
-    nearest = sorted(
-        candidates,
-        key=lambda p: (math.hypot(src.x - p.x, src.y - p.y), p.id),
-    )[:max(1, int(nearest_k))]
-    scored = []
-    for tgt in nearest:
-        # Scripted heuristic: must send strictly more than tgt.ships to
-        # capture, must not exceed src.ships (otherwise no valid launch),
-        # and must fit within SHIP_REQUEST_CAP (the continuous head's
-        # absolute scale).
-        needed_ships = int(tgt.ships) + 1
-        if needed_ships > int(src.ships) or needed_ships > SHIP_REQUEST_CAP:
-            continue
-        distance = math.hypot(src.x - tgt.x, src.y - tgt.y)
-        score = float(tgt.production) / max(1.0, float(tgt.ships))
-        # Convert needed ship count to the [0, 1] fraction the Beta head emits.
-        ship_value = float(needed_ships) / float(SHIP_REQUEST_CAP)
-        scored.append((score, -distance, int(tgt.production), -int(tgt.ships), tgt.id, ship_value))
-    if not scored:
-        return None
-    _, _, _, _, target_id, ship_value = max(scored)
+    src_slot, tgt_slot, ship_value = picked
     src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
-    tgt_tensor = torch.tensor([slot_by_planet_id[int(target_id)]], device=device, dtype=torch.long)
+    tgt_tensor = torch.tensor([tgt_slot], device=device, dtype=torch.long)
     ship_tensor = torch.tensor([ship_value], device=device, dtype=torch.float32)
     noop_tensor = torch.tensor([False], device=device, dtype=torch.bool)
     with torch.no_grad():
@@ -380,6 +538,96 @@ def _scripted_neutral_expansion_action(
         "is_noop": noop_tensor,
         "log_prob": ev["log_prob"],
     }
+
+
+def _scripted_neutral_expansion_best_action(
+    policy: OrbitWarsPolicy,
+    out,
+    obs,
+    planets: list,
+    fleets: list[Fleet],
+    fleet_preds: dict[int, Optional[dict]],
+    player: int,
+    *,
+    device: torch.device,
+    nearest_k: int = 5,
+    current_turn: int = 0,
+    max_turns: int = 500,
+    graph_scores: Optional[ScriptedGraphScores] = None,
+) -> Optional[dict]:
+    """Graph-ranked expansion launch across all owned sources."""
+    picked = _pick_scripted_neutral_expansion_pair(
+        obs,
+        planets,
+        fleets,
+        fleet_preds,
+        player,
+        graph_scores=graph_scores,
+        nearest_k=nearest_k,
+        current_turn=current_turn,
+        max_turns=max_turns,
+        src_slot=None,
+    )
+    if picked is None:
+        return None
+    src_slot, tgt_slot, ship_value = picked
+    src_tensor = torch.tensor([src_slot], device=device, dtype=torch.long)
+    tgt_tensor = torch.tensor([tgt_slot], device=device, dtype=torch.long)
+    ship_tensor = torch.tensor([ship_value], device=device, dtype=torch.float32)
+    noop_tensor = torch.tensor([False], device=device, dtype=torch.bool)
+    with torch.no_grad():
+        ev = policy.evaluate_source_actions(out, src_tensor, tgt_tensor, ship_tensor, noop_tensor)
+    return {
+        "src": src_tensor,
+        "tgt": tgt_tensor,
+        "ship_value": ship_tensor,
+        "is_noop": noop_tensor,
+        "log_prob": ev["log_prob"],
+    }
+
+
+def _scripted_expansion_source_slots(
+    obs,
+    planets: list[Planet],
+    fleets: list[Fleet],
+    fleet_preds: dict[int, Optional[dict]],
+    player: int,
+    *,
+    graph_scores: Optional[ScriptedGraphScores] = None,
+) -> list[int]:
+    """Prefer safe, graph-supportive expansion sources."""
+    planet_by_id = {int(p.id): p for p in planets}
+    scored: list[tuple] = []
+    for slot, ok in enumerate(obs.source_mask):
+        if not bool(ok):
+            continue
+        pid = int(obs.planet_ids[slot])
+        src = planet_by_id.get(pid)
+        if src is None or src.owner != player:
+            continue
+        enemy_arrivals, self_arrivals = _enemy_self_arrivals_at_planet(
+            planet_id=pid, player=player, fleets=fleets, fleet_preds=fleet_preds,
+        )
+        shortfall_without_launch = _compute_source_defense_shortfall(
+            ships_remaining_after_launch=int(src.ships),
+            production=float(src.production),
+            enemy_arrivals=enemy_arrivals,
+            self_arrivals=self_arrivals,
+        )
+        graph_source = (
+            graph_scores.source_score(slot) if graph_scores is not None else 0.0
+        )
+        scored.append((
+            shortfall_without_launch <= 0.0,
+            graph_source,
+            not bool(enemy_arrivals),
+            int(src.ships),
+            int(src.production),
+            -slot,
+            int(slot),
+        ))
+    scored.sort(reverse=True)
+    return [slot for *_, slot in scored]
 
 
 def _act_for_player(
@@ -397,7 +645,7 @@ def _act_for_player(
     obs = build_observation(env_obs, player=player, angular_velocity=angular_velocity,
                             p_max=policy.p_max, f_max=policy.f_max,
                             planet_feature_dim=policy.planet_dim,
-                            max_turns=max_turns)
+                            max_turns=max_turns, turn=current_turn)
     parsed = parse_planets(env_obs)
     parsed_fleets = parse_fleets(env_obs)
     # Cache per-fleet ETA / target predictions once per decision step.
@@ -426,7 +674,17 @@ def _act_for_player(
         planet_feats=obs.planet_feats.copy(),
         source_mask=obs.source_mask.copy(),
     )
-    source_slots = [int(i) for i, ok in enumerate(obs.source_mask) if ok]
+    if scripted_expansion is not None and current_turn < scripted_expansion.turns:
+        _expansion_graph = build_scripted_graph_scores(
+            obs, reward_cfg=reward_cfg, turn=int(current_turn),
+        )
+        source_slots = _scripted_expansion_source_slots(
+            obs, parsed, parsed_fleets, fleet_preds, player,
+            graph_scores=_expansion_graph,
+        )
+    else:
+        _expansion_graph = None
+        source_slots = [int(i) for i, ok in enumerate(obs.source_mask) if ok]
     last_out = None
 
     if getattr(policy, "model_variant", "") in ("grouped_planet", "grouped_planet_edge", "grouped_planet_edge_pair"):
@@ -444,20 +702,23 @@ def _act_for_player(
             with torch.no_grad():
                 out = policy(**batch)
                 if scripted_expansion is not None and current_turn < scripted_expansion.turns:
-                    scripted_action = None
-                    for src_slot in [int(i) for i, ok in enumerate(obs_decision.source_mask) if ok]:
-                        scripted_action = _scripted_neutral_expansion_action(
-                            policy,
-                            out,
-                            obs_decision,
-                            src_slot,
-                            parsed,
-                            player,
-                            device=device,
-                            nearest_k=scripted_expansion.nearest_k,
-                        )
-                        if scripted_action is not None:
-                            break
+                    _turn_graph = build_scripted_graph_scores(
+                        obs_decision, reward_cfg=reward_cfg, turn=int(current_turn),
+                    )
+                    scripted_action = _scripted_neutral_expansion_best_action(
+                        policy,
+                        out,
+                        obs_decision,
+                        parsed,
+                        parsed_fleets,
+                        fleet_preds,
+                        player,
+                        device=device,
+                        nearest_k=scripted_expansion.nearest_k,
+                        current_turn=current_turn,
+                        max_turns=max_turns,
+                        graph_scores=_turn_graph,
+                    )
                     if scripted_action is not None:
                         action = scripted_action
                         src_slot = int(action["src"][0])
@@ -635,15 +896,23 @@ def _act_for_player(
                 deterministic=False,
             )
             if scripted_expansion is not None and current_turn < scripted_expansion.turns:
+                _turn_graph = build_scripted_graph_scores(
+                    obs_decision, reward_cfg=reward_cfg, turn=int(current_turn),
+                )
                 scripted_action = _scripted_neutral_expansion_action(
                     policy,
                     out,
                     obs_decision,
                     src_slot,
                     parsed,
+                    parsed_fleets,
+                    fleet_preds,
                     player,
                     device=device,
                     nearest_k=scripted_expansion.nearest_k,
+                    current_turn=current_turn,
+                    max_turns=max_turns,
+                    graph_scores=_turn_graph,
                 )
                 if scripted_action is not None:
                     action = scripted_action
@@ -744,6 +1013,9 @@ def collect_episode(
     scripted_expansion: Optional[ScriptedExpansionConfig] = None,
     opponent_indices: Optional[set[int]] = None,
     scripted_opponent_cfg: Optional[ScriptedConfig] = None,
+    scripted_opponent: str = "capture",
+    scripted_graph_cfg: Optional[GraphMaximizingConfig] = None,
+    game_logger: Optional[GameLogger] = None,
 ) -> EpisodeStats:
     """Play one game and append PPO-side transitions into ``buffer``.
 
@@ -761,9 +1033,19 @@ def collect_episode(
     device = device or torch.device("cpu")
     reward_cfg = reward_cfg or RewardConfig()
     opponent_indices = set(opponent_indices) if opponent_indices else set()
-    scripted_agent: Optional[CaptureEfficiencyAgent] = (
-        CaptureEfficiencyAgent(scripted_opponent_cfg) if opponent_indices else None
-    )
+    scripted_agent = None
+    if opponent_indices:
+        if scripted_opponent == "graph":
+            if scripted_graph_cfg is None:
+                from rl.rewards import arrival_credit_channel_weights
+                scripted_graph_cfg = GraphMaximizingConfig(
+                    channel_weights=arrival_credit_channel_weights(reward_cfg),
+                )
+            scripted_agent = GraphMaximizingAgent(
+                scripted_graph_cfg, reward_cfg=reward_cfg,
+            )
+        else:
+            scripted_agent = CaptureEfficiencyAgent(scripted_opponent_cfg)
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
@@ -775,14 +1057,6 @@ def collect_episode(
     n_launches = [0 for _ in range(num_agents)]
     cum_reward = [0.0 for _ in range(num_agents)]
     last_value = [0.0 for _ in range(num_agents)]      # for GAE bootstrapping at end-of-rollout
-    # Cache the previous step's graph metric summary (per player). Storing
-    # the lightweight scalar summary instead of the full Observation halves
-    # the metric computation per step (one summary per step instead of two).
-    prev_graph_summaries: list[Optional[dict]] = [None for _ in range(num_agents)]
-    graph_reward_normalizers: list[RunningMeanStd] = [
-        RunningMeanStd(warmup=int(reward_cfg.graph_reward_normalize_warmup))
-        for _ in range(num_agents)
-    ]
     fleet_trackers = [FleetTracker() for _ in range(num_agents)]  # One per player
     # Arrival-credit eligibility trace.  Snapshots launch-time per-planet
     # graph-metric vectors and credits the launch transition with the
@@ -864,6 +1138,31 @@ def collect_episode(
                 continue
             defense_trackers[p].prime(env_obs[p], p)
 
+        # Open a new turn record in the JSON debug log (no-op if no logger
+        # was supplied).  ``parse_planets`` / ``parse_fleets`` operate on
+        # the env observation, mirroring the same view the reward / state
+        # bookkeeping below uses, so the log faithfully captures what the
+        # agent acted on.
+        if game_logger is not None:
+            try:
+                _gl_planets = parse_planets(env_obs[0])
+                _gl_fleets = parse_fleets(env_obs[0])
+                _gl_global = {
+                    "step": int(env_obs[0].get("step", t) or t),
+                    "angular_velocity": float(env_obs[0].get("angular_velocity", 0.0) or 0.0),
+                }
+                game_logger.start_turn(
+                    turn=t,
+                    planets=_gl_planets,
+                    fleets=_gl_fleets,
+                    global_state=_gl_global,
+                )
+            except Exception:
+                # The logger must never break the rollout; if state
+                # parsing fails (malformed env obs?) we simply skip
+                # this turn record.
+                pass
+
         # PPO players run the policy; opponent slots run the scripted bot
         # and do NOT contribute transitions or trackers.
         acted: list = []
@@ -874,6 +1173,38 @@ def collect_episode(
                     current_turn=t, max_turns=reward_cfg.max_turns,
                 )
                 acted.append(("scripted", scripted_actions, len(scripted_actions)))
+                # Mirror the scripted bot's launches into the JSONL debug
+                # log so the trace shows BOTH players acting.  Scripted
+                # actions are env-level (src, tgt, ships, eta), not policy
+                # decisions, so we only record the geometry; no log_prob
+                # or value field is emitted.
+                if game_logger is not None:
+                    try:
+                        if not scripted_actions:
+                            game_logger.log_action(
+                                player=p,
+                                decision={"agent": "scripted", "is_noop": True},
+                            )
+                        else:
+                            for _gl_a in scripted_actions:
+                                # ``scripted_actions`` is a list of
+                                # ``[src, tgt, ships, ...]`` env-action
+                                # rows.  Be defensive about the schema.
+                                _gl_row = list(_gl_a) if isinstance(_gl_a, (list, tuple)) else []
+                                _gl_dec: dict = {
+                                    "agent": "scripted",
+                                    "launched": True,
+                                    "is_noop": False,
+                                }
+                                if len(_gl_row) >= 1:
+                                    _gl_dec["src"] = int(_gl_row[0])
+                                if len(_gl_row) >= 2:
+                                    _gl_dec["tgt"] = int(_gl_row[1])
+                                if len(_gl_row) >= 3:
+                                    _gl_dec["ships_sent"] = int(_gl_row[2])
+                                game_logger.log_action(player=p, decision=_gl_dec)
+                    except Exception:
+                        pass
             else:
                 acted.append(("ppo", _act_for_player(
                     policy, env_obs[p], p, device=device, current_turn=t,
@@ -971,18 +1302,88 @@ def collect_episode(
                             angular_velocity=_ac_av,
                             p_max=policy.p_max, f_max=policy.f_max,
                             max_turns=max_steps,
+                            turn=t,
                         )
                         _ac_curr_metric_mat = compute_planet_metric_vectors(
-                            _ac_obs_curr, cfg=reward_cfg,
+                            _ac_obs_curr, cfg=reward_cfg, turn=t,
                         )
                         _ac_curr_planet_ids = _ac_obs_curr.planet_ids
+                    _ac_metric_for_credit = _ac_curr_metric_mat
+                    _ac_planet_ids_for_credit = _ac_curr_planet_ids
+                    _ac_counterfactual_metric_mat = None
+                    _ac_counterfactual_planet_ids = None
+                    if bool(getattr(reward_cfg, "arrival_credit_counterfactual", False)):
+                        cf_pair = arrival_credit_trackers[p].build_counterfactual_observations(
+                            buffer_idx=buffer_idx,
+                            curr_obs=_ac_obs_curr,
+                            curr_planet_ids=_ac_curr_planet_ids,
+                            actual_target_planet_id=int(getattr(outcome, "actual_tgt_planet_id", -1)),
+                            previous_target_owner=int(getattr(outcome, "actual_tgt_owner", -2)),
+                            return_to_source=bool(
+                                getattr(
+                                    reward_cfg,
+                                    "arrival_credit_counterfactual_return_to_source",
+                                    True,
+                                )
+                            ),
+                            horizon=float(
+                                getattr(
+                                    reward_cfg,
+                                    "arrival_credit_counterfactual_horizon",
+                                    0.0,
+                                )
+                            ),
+                        )
+                        if cf_pair is not None:
+                            _ac_actual_obs, _ac_counterfactual_obs = cf_pair
+                            if float(getattr(reward_cfg, "arrival_credit_counterfactual_horizon", 0.0)) > 0.0:
+                                _ac_metric_for_credit = compute_planet_metric_vectors(
+                                    _ac_actual_obs, cfg=reward_cfg, turn=t,
+                                )
+                                _ac_planet_ids_for_credit = _ac_actual_obs.planet_ids
+                            _ac_counterfactual_metric_mat = compute_planet_metric_vectors(
+                                _ac_counterfactual_obs, cfg=reward_cfg, turn=t,
+                            )
+                            _ac_counterfactual_planet_ids = _ac_counterfactual_obs.planet_ids
+                    # Ownership mask: in player ``p``'s view, planets owned
+                    # by self set PF_IDX_OWNER_SELF=1. We use the obs that
+                    # matches ``_ac_metric_for_credit`` (the actual obs --
+                    # post-horizon-resolution when horizon > 0, otherwise
+                    # the raw current obs). Restricting the full_graph
+                    # counterfactual sum to self-owned slots gives the
+                    # natural "MY empire metrics, with vs without the
+                    # launch" reward signal.
+                    # Build mask from the immediate post-step obs of player p
+                    # (which is the "current actual" state). Ownership in
+                    # this view: PF_IDX_OWNER_SELF == 1 iff planet belongs
+                    # to player p. We intentionally do NOT use the
+                    # horizon-extended _ac_actual_obs here because:
+                    #   1. The mask is a slot-aligned bool array matching
+                    #      _ac_metric_for_credit row order; both come
+                    #      from p's perspective with the same slot order.
+                    #   2. Horizon resolution rarely flips ownership at
+                    #      the metric-resolution moment.
+                    _ac_owner_self_mask = None
+                    try:
+                        _pm = np.asarray(_ac_obs_curr.planet_mask, dtype=bool)
+                        _n_real = int(_pm.sum())
+                        if _n_real > 0:
+                            _pf = np.asarray(_ac_obs_curr.planet_feats, dtype=np.float32)
+                            _ac_owner_self_mask = (
+                                _pf[:_n_real, PF_IDX_OWNER_SELF] > 0.5
+                            )
+                    except Exception:
+                        _ac_owner_self_mask = None
                     arrival_credit_signed = arrival_credit_trackers[p].compute_credit(
                         buffer_idx=buffer_idx,
-                        curr_metric_matrix=_ac_curr_metric_mat,
-                        curr_planet_ids=_ac_curr_planet_ids,
+                        curr_metric_matrix=_ac_metric_for_credit,
+                        curr_planet_ids=_ac_planet_ids_for_credit,
                         channel_weights=arrival_channel_weights,
                         cfg=reward_cfg,
                         actual_target_planet_id=int(getattr(outcome, "actual_tgt_planet_id", -1)),
+                        counterfactual_metric_matrix=_ac_counterfactual_metric_mat,
+                        counterfactual_planet_ids=_ac_counterfactual_planet_ids,
+                        owner_self_mask=_ac_owner_self_mask,
                     )
                     if arrival_credit_signed is not None and arrival_credit_signed != 0.0:
                         buffer.add_delayed_reward(
@@ -1010,41 +1411,13 @@ def collect_episode(
                     continue
                 rewards.append(_production_trace_reward(new_obs[p], p, num_agents, reward_cfg))
         elif reward_cfg.reward_system == "graph_native":
+            # Dense signal comes from arrival credit + terminal only.
             rewards = []
             for p in range(num_agents):
                 if terminal:
                     rewards.append(float(terminal_rewards[p]))
-                    continue
-                # Build current-step Observation so metric deltas can be computed.
-                angular_velocity = new_obs[p].get("angular_velocity", 0.0) or 0.0
-                curr_obs = build_observation(
-                    new_obs[p], player=p,
-                    angular_velocity=angular_velocity,
-                    p_max=policy.p_max, f_max=policy.f_max,
-                    max_turns=max_steps,
-                )
-                # Single-pass metric summary (avoids the duplicate
-                # ``observation_to_pyg_data`` call that the legacy
-                # implementation made every step).
-                curr_summary = compute_graph_metrics_summary(
-                    curr_obs,
-                    edge_signal=reward_cfg.graph_edge_efficiency_signal,
-                    cfg=reward_cfg,
-                )
-                if prev_graph_summaries[p] is None:
-                    r = 0.0
                 else:
-                    r = compute_graph_native_reward(
-                        prev_graph_summaries[p], curr_summary, p,
-                        cfg=reward_cfg, turn=t,
-                    )
-                # Optional running-std normalization (per-player).
-                if reward_cfg.graph_reward_normalize and r != 0.0:
-                    norm = graph_reward_normalizers[p]
-                    norm.update(r)
-                    r = norm.normalize(r, eps=reward_cfg.graph_reward_normalize_eps)
-                rewards.append(float(r))
-                prev_graph_summaries[p] = curr_summary
+                    rewards.append(0.0)
         else:
             rewards = [
                 compute_step_reward(
@@ -1064,11 +1437,12 @@ def collect_episode(
             last_value[p] = float(acted[p][1][2].value[0].item())
 
         # If the policy was built with ``enable_flux_features=True`` we need
-        # to pre-compute the four flux channels per stored transition so
-        # the PPO update can reconstruct the same encoder input later.
+        # to pre-compute the node + edge flux channels per stored
+        # transition so the PPO update can reconstruct the same encoder
+        # input later.
         policy_wants_flux = bool(getattr(policy, "enable_flux_features", False))
         if policy_wants_flux:
-            from .flux import compute_node_flux_features
+            from .flux import compute_flux_matrices, compute_node_flux_features
 
         for p, item in enumerate(acted):
             if p in opponent_indices:
@@ -1082,18 +1456,29 @@ def collect_episode(
                     if invalid else 0.0
                 )
                 flux_arr = None
+                edge_flux_arr = None
                 if policy_wants_flux:
                     # Mode / tau mirror the reward-side ``RewardConfig`` so
                     # one knob controls both signals when the user wants
                     # them coupled.  Costs O(P_max^2) numpy per step.
-                    flux_arr = compute_node_flux_features(
-                        obs,
-                        p_max=int(obs.planet_feats.shape[0]),
-                        mode=getattr(reward_cfg, "flux_mode", "exp_decay"),
-                        tau=float(getattr(reward_cfg, "flux_tau", 10.0)),
-                        eta_norm=float(getattr(reward_cfg, "flux_eta_norm", 50.0)),
-                        ship_norm=float(getattr(reward_cfg, "flux_ship_norm", 50.0)),
+                    p_max_obs = int(obs.planet_feats.shape[0])
+                    mode = getattr(reward_cfg, "flux_mode", "exp_decay")
+                    tau = float(getattr(reward_cfg, "flux_tau", 10.0))
+                    eta_norm_v = float(getattr(reward_cfg, "flux_eta_norm", 50.0))
+                    ship_norm_v = float(getattr(reward_cfg, "flux_ship_norm", 50.0))
+                    inv_sn = 1.0 / max(ship_norm_v, 1e-6)
+                    mats = compute_flux_matrices(
+                        obs, p_max=p_max_obs, mode=mode, tau=tau, eta_norm=eta_norm_v,
                     )
+                    flux_arr = compute_node_flux_features(
+                        obs, p_max=p_max_obs, mode=mode, tau=tau,
+                        eta_norm=eta_norm_v, ship_norm=ship_norm_v, matrices=mats,
+                    )
+                    edge_flux_arr = np.empty(
+                        (p_max_obs, p_max_obs, 2), dtype=np.float32,
+                    )
+                    edge_flux_arr[:, :, 0] = mats.friendly * inv_sn
+                    edge_flux_arr[:, :, 1] = mats.enemy * inv_sn
                 idx = buffer.add(Transition(
                     player=p,
                     planet_feats=obs.planet_feats,
@@ -1113,8 +1498,40 @@ def collect_episode(
                     done=terminal,
                     turn=t,
                     flux_features=flux_arr,
+                    edge_flux_features=edge_flux_arr,
                 ))
                 new_indices.append(idx)
+                # JSON debug log: record this PPO decision's network
+                # outputs (value, log-prob) alongside the chosen action.
+                if game_logger is not None:
+                    try:
+                        _gl_src = int(act["src"][0])
+                        _gl_tgt = int(act["tgt"][0])
+                        _gl_is_noop = bool(act["is_noop"][0])
+                        _gl_decision = {
+                            "buffer_idx": int(idx),
+                            "src_slot": _gl_src,
+                            "tgt_slot": _gl_tgt,
+                            "ship_value": float(act["ship_value"][0]),
+                            "is_noop": _gl_is_noop,
+                            "launched": bool(launched),
+                            "invalid": bool(invalid),
+                            "log_prob": float(act["log_prob"][0].item()),
+                            "value": float(out.value[0].item()),
+                        }
+                        if fleet_meta is not None:
+                            _gl_decision["src_planet_id"] = int(
+                                fleet_meta.get("src_planet_id", -1)
+                            )
+                            _gl_decision["tgt_planet_id"] = int(
+                                fleet_meta.get("tgt_planet_id", -1)
+                            )
+                            _gl_decision["ships_sent"] = int(
+                                fleet_meta.get("ships_sent", 0)
+                            )
+                        game_logger.log_action(player=p, decision=_gl_decision)
+                    except Exception:
+                        pass
                 # Register fleet launch for delayed reward tracking.
                 if launched and fleet_meta is not None:
                     # In production_diff the reward landscape is exactly
@@ -1181,7 +1598,7 @@ def collect_episode(
                         and arrival_credit_trackers is not None
                     ):
                         launch_metric_mat = compute_planet_metric_vectors(
-                            obs, cfg=reward_cfg,
+                            obs, cfg=reward_cfg, turn=int(fleet_meta["launch_turn"]),
                         )
                         arrival_credit_trackers[p].register(
                             buffer_idx=idx,
@@ -1190,6 +1607,7 @@ def collect_episode(
                             eta_at_launch=float(fleet_meta["eta"]),
                             launch_metric_matrix=launch_metric_mat,
                             launch_planet_ids=obs.planet_ids,
+                            ships_sent=int(fleet_meta["ships_sent"]),
                             source_planet_id=int(fleet_meta["src_planet_id"]),
                             include_source=bool(
                                 getattr(reward_cfg, "arrival_credit_include_source", False)
@@ -1338,6 +1756,10 @@ def collect_episode(
                 reward = r / len(new_indices)
                 for idx in new_indices:
                     buffer.add_reward(idx, reward)
+            elif terminal and r != 0.0:
+                prior = [i for i, tr in enumerate(buffer.data) if tr.player == p]
+                if prior:
+                    buffer.add_reward(prior[-1], r)
             defense_trackers[p].observe_turn(t, new_obs[p], p)
             for buffer_idx, outcome in defense_trackers[p].pop_resolved():
                 defense_reward = compute_defense_reward(
@@ -1484,6 +1906,18 @@ def collect_episode(
                         discount=reward_cfg.delayed_reward_discount,
                     )
 
+        # Flush the per-turn record (rewards + invalid counts) to the
+        # JSON debug log and close the turn entry.
+        if game_logger is not None:
+            try:
+                game_logger.log_rewards(
+                    rewards,
+                    invalid_actions=invalid_actions,
+                )
+                game_logger.end_turn()
+            except Exception:
+                pass
+
         state = new_state
         if progress_cb is not None:
             progress_cb(t, state)
@@ -1495,6 +1929,21 @@ def collect_episode(
     best_reward = max(final_r) if final_r else 0
     winners = [p for p, r in enumerate(final_r) if r == best_reward]
     winner = winners[0] if len(winners) == 1 and best_reward > 0 else -1
+
+    if game_logger is not None:
+        try:
+            game_logger.finish(
+                terminal_rewards=final_r,
+                cum_rewards=cum_reward,
+                winner=winner,
+                extra={
+                    "length": int(t + 1),
+                    "n_launches": list(n_launches),
+                    "opponent_indices": sorted(opponent_indices),
+                },
+            )
+        except Exception:
+            pass
 
     return EpisodeStats(
         length=t + 1,

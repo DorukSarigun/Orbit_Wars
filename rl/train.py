@@ -31,12 +31,14 @@ from model_planet_only import PlanetOnlyOrbitWarsPolicy
 # script stays usable even on installs without ``torch_geometric``.
 
 from .buffer import RolloutBuffer
+from .game_logger import GameLogger
 from .metrics import (
     WeightSnapshot, grad_norms_by_module,
     round_metrics, weight_norms_by_module,
 )
 from .ppo import PPOConfig, ppo_update
-from .rewards import REWARD_SYSTEMS, RewardConfig, build_reward_config
+from .rewards import REWARD_SYSTEMS, RewardConfig, build_reward_config, arrival_credit_channel_weights
+from scripted_graph_agent import GraphMaximizingConfig
 from .rollout import ScriptedExpansionConfig, collect_episode
 
 
@@ -70,8 +72,9 @@ class TrainConfig:
     # Opponent dispatch:
     #   "self_play"  -> all slots run the live policy (pure self-play).
     #   "scripted"   -> slot 0 runs the live policy, all other slots run
-    #                   the CaptureEfficiencyAgent.
+    #                   a scripted bot (see ``scripted_opponent``).
     opponent: str = "self_play"
+    scripted_opponent: str = "capture"
     # Entropy schedule (linear anneal from PPOConfig.entropy_coef -> entropy_coef_final
     # over the first `entropy_anneal_iters` iterations; held constant afterwards).
     # If entropy_coef_final is None or entropy_anneal_iters <= 0, the schedule is
@@ -89,6 +92,11 @@ class TrainConfig:
     enable_sinkhorn: bool = False
     sinkhorn_iters: int = 5
     sinkhorn_tau: float = 1.0
+    # If non-empty, every self-play episode writes a JSONL debug log to
+    # ``<game_log_dir>/iter<NNNNN>_game<NNN>_seed<seed>.jsonl`` with full
+    # per-turn state, actions, rewards and policy outputs (see
+    # ``rl/game_logger.py``).  Empty string disables logging (default).
+    game_log_dir: str = ""
 
 
 def _make_policy(variant: str, **kwargs) -> OrbitWarsPolicy:
@@ -337,22 +345,63 @@ def train(
                 set(range(1, episode_num_agents))
                 if train_cfg.opponent == "scripted" else set()
             )
-            stats = collect_episode(
-                policy, buffer,
-                max_steps=train_cfg.max_episode_steps,
-                num_agents=episode_num_agents,
-                reward_cfg=reward_cfg,
-                device=device,
-                seed=seed,
-                scripted_expansion=(
-                    ScriptedExpansionConfig(
-                        turns=train_cfg.scripted_expansion_turns,
-                        nearest_k=train_cfg.scripted_expansion_nearest_k,
-                    )
-                    if train_cfg.scripted_expansion_turns > 0 else None
-                ),
-                opponent_indices=opponent_indices,
-            )
+            # JSON debug logger: when ``--game-log-dir`` is set, write a
+            # ``iter*****_game***_seed**.jsonl`` file per episode capturing
+            # state + actions + rewards + network outputs.
+            game_logger: Optional[GameLogger] = None
+            if train_cfg.game_log_dir:
+                log_dir = Path(train_cfg.game_log_dir)
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_file = (
+                    log_dir / f"iter{it:05d}_game{ep:03d}_seed{seed}.jsonl"
+                )
+                game_logger = GameLogger(
+                    log_file,
+                    meta={
+                        "iteration": int(it),
+                        "episode": int(ep),
+                        "seed": int(seed),
+                        "num_agents": int(episode_num_agents),
+                        "opponent": str(train_cfg.opponent),
+                        "model_variant": str(train_cfg.model_variant),
+                        "reward_system": str(reward_cfg.reward_system),
+                        "enable_arrival_credit": bool(
+                            getattr(reward_cfg, "enable_arrival_credit", False)
+                        ),
+                        "enable_flux_features": bool(train_cfg.enable_flux_features),
+                    },
+                )
+            scripted_graph_cfg = None
+            if (
+                train_cfg.opponent == "scripted"
+                and train_cfg.scripted_opponent == "graph"
+            ):
+                scripted_graph_cfg = GraphMaximizingConfig(
+                    channel_weights=arrival_credit_channel_weights(reward_cfg),
+                )
+            try:
+                stats = collect_episode(
+                    policy, buffer,
+                    max_steps=train_cfg.max_episode_steps,
+                    num_agents=episode_num_agents,
+                    reward_cfg=reward_cfg,
+                    device=device,
+                    seed=seed,
+                    scripted_expansion=(
+                        ScriptedExpansionConfig(
+                            turns=train_cfg.scripted_expansion_turns,
+                            nearest_k=train_cfg.scripted_expansion_nearest_k,
+                        )
+                        if train_cfg.scripted_expansion_turns > 0 else None
+                    ),
+                    opponent_indices=opponent_indices,
+                    scripted_opponent=train_cfg.scripted_opponent,
+                    scripted_graph_cfg=scripted_graph_cfg,
+                    game_logger=game_logger,
+                )
+            finally:
+                if game_logger is not None:
+                    game_logger.finish()  # idempotent: no-op if already closed
             end_idx = len(buffer)
             ep_stats_list.append((ep, start_idx, end_idx, seed, stats))
 
@@ -550,26 +599,17 @@ def _build_argparser() -> argparse.ArgumentParser:
     # doesn't override them.
     p.add_argument(
         "--enable-flux-metrics", action="store_true",
-        help="Turn on the 4 flux channels in the graph_native reward summary.",
+        help="Append 4 flux channels to arrival-credit metric vectors.",
     )
     p.add_argument("--flux-mode", choices=("raw", "linear", "exp_decay"), default=None,
                    help="Weighting mode used by rl.flux for in-flight fleets.")
     p.add_argument("--flux-tau", type=float, default=None,
                    help="Decay timescale (turns) for exp_decay mode.")
-    p.add_argument("--graph-flux-friendly-in-weight", type=float, default=None)
-    p.add_argument("--graph-flux-friendly-out-weight", type=float, default=None)
-    p.add_argument("--graph-flux-enemy-in-weight", type=float, default=None)
-    p.add_argument("--graph-flux-enemy-out-weight", type=float, default=None)
-    # ETA-weighted arrival-credit eligibility trace (Option B of the
-    # credit-assignment plan).  Defaults preserve previous behaviour
-    # (everything off) so existing training configurations are unaffected.
+    # ETA-weighted arrival-credit eligibility trace.
     p.add_argument(
         "--enable-arrival-credit", action="store_true",
-        help="Back-credit each launch transition with the ETA-discounted "
-             "realised graph-metric delta at the target slot when the "
-             "fleet arrives.  Uses the same 12-channel weight vector as "
-             "the graph_native potential shaping; safe to enable on top "
-             "of any reward system.",
+        help="Back-credit each launch with the ETA-discounted counterfactual "
+             "graph-metric delta when the fleet arrives.",
     )
     p.add_argument(
         "--arrival-credit-mode", choices=("raw", "linear", "exp_decay"), default=None,
@@ -594,16 +634,65 @@ def _build_argparser() -> argparse.ArgumentParser:
              "Encodes the trade-off the launch makes between gaining at "
              "target and weakening source.",
     )
+    p.add_argument(
+        "--arrival-credit-counterfactual", action="store_true",
+        help="Compare actual arrival metrics against a counterfactual "
+             "branch where the fleet did not arrive and stayed at source.",
+    )
+    p.add_argument(
+        "--arrival-credit-counterfactual-scope",
+        choices=("target", "target_source", "full_graph"),
+        default=None,
+        help="Metric scope for counterfactual arrival credit.",
+    )
+    p.add_argument(
+        "--no-arrival-credit-counterfactual-return-to-source",
+        action="store_false",
+        dest="arrival_credit_counterfactual_return_to_source",
+        default=None,
+        help="Do not add the arriving fleet back to the source in the "
+             "counterfactual branch.",
+    )
+    p.add_argument(
+        "--arrival-credit-counterfactual-horizon", type=float, default=None,
+        help="Optional short horizon after arrival. If >0, resolves the "
+             "soonest enemy arrival at affected self-owned planets when "
+             "its ETA is within this cap.",
+    )
+    p.add_argument(
+        "--arrival-credit-owner-filter",
+        choices=("self", "none"),
+        default=None,
+        help="Which planets contribute to the counterfactual full_graph "
+             "sum. 'self' (default) restricts the sum to planets owned by "
+             "the launching player in the ACTUAL state at arrival time; "
+             "'none' includes every real planet so source-side losses are "
+             "captured directly (use when the launch causes the source "
+             "to fall and you want it punished, not just neighbour-influence).",
+    )
     p.add_argument("--save-game-batches", action="store_true",
                    help="Save one .pt rollout/training batch per self-play game after GAE")
     p.add_argument("--batch-save-dir", default="checkpoints/game_batches")
+    p.add_argument(
+        "--game-log-dir",
+        default="",
+        help=(
+            "If set, every self-play episode writes a JSONL debug log "
+            "(<dir>/iter<NNNNN>_game<NNN>_seed<seed>.jsonl) capturing "
+            "per-turn state, actions, rewards and policy outputs. "
+            "Empty (default) disables logging."
+        ),
+    )
     p.add_argument("--scripted-expansion-turns", type=int, default=0,
                    help="Force early neutral-expansion launches for this many turns")
     p.add_argument("--scripted-expansion-nearest-k", type=int, default=5,
                    help="Choose best production/ships neutral target among this many nearest planets")
     p.add_argument("--opponent", choices=["self_play", "scripted"], default="self_play",
                    help="self_play: all slots use the live policy. "
-                        "scripted: slot 0 is the policy, all others are CaptureEfficiencyAgent.")
+                        "scripted: slot 0 is the policy, others use --scripted-opponent.")
+    p.add_argument("--scripted-opponent", choices=["capture", "graph"], default="capture",
+                   help="Scripted bot for non-policy slots when --opponent=scripted. "
+                        "capture=CaptureEfficiencyAgent, graph=GraphMaximizingAgent.")
     p.add_argument("--clip-range", type=float, default=0.2)
     p.add_argument("--ppo-epochs", type=int, default=4, dest="epochs",
                    help="Number of optimization epochs over each rollout buffer "
@@ -683,6 +772,9 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Reference production value preserved by --production-reward-beta")
     p.add_argument("--invalid-action-penalty", type=float, default=None)
     p.add_argument("--reward-scale", type=float, default=None)
+    p.add_argument("--terminal-scale", type=float, default=None,
+                   help="Multiplier applied to the env's terminal +/-1 win/lose "
+                        "reward.")
     p.add_argument("--draw-terminal-reward", type=float, default=None)
     p.add_argument("--eligibility-trace-horizon", type=int, default=None,
                    help="Number of past turns to spread the per-step reward "
@@ -735,12 +827,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         scripted_expansion_turns=args.scripted_expansion_turns,
         scripted_expansion_nearest_k=args.scripted_expansion_nearest_k,
         opponent=args.opponent,
+        scripted_opponent=args.scripted_opponent,
         entropy_coef_final=args.entropy_coef_final,
         entropy_anneal_iters=args.entropy_anneal_iters,
         enable_flux_features=args.enable_flux_features,
         enable_sinkhorn=args.enable_sinkhorn,
         sinkhorn_iters=args.sinkhorn_iters,
         sinkhorn_tau=args.sinkhorn_tau,
+        game_log_dir=args.game_log_dir,
     )
     ppo_cfg = PPOConfig(
         clip_range=args.clip_range,
@@ -781,6 +875,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         production_reward_reference=args.production_reward_reference,
         invalid_action_penalty=args.invalid_action_penalty,
         reward_scale=args.reward_scale,
+        terminal_scale=args.terminal_scale,
         draw_terminal_reward=args.draw_terminal_reward,
         eligibility_trace_horizon=args.eligibility_trace_horizon,
         eligibility_trace_decay=args.eligibility_trace_decay,
@@ -792,13 +887,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         enable_flux_metrics=(True if args.enable_flux_metrics else None),
         flux_mode=args.flux_mode,
         flux_tau=args.flux_tau,
-        graph_flux_friendly_in_weight=args.graph_flux_friendly_in_weight,
-        graph_flux_friendly_out_weight=args.graph_flux_friendly_out_weight,
-        graph_flux_enemy_in_weight=args.graph_flux_enemy_in_weight,
-        graph_flux_enemy_out_weight=args.graph_flux_enemy_out_weight,
-        # Arrival-credit eligibility trace (Option B).  As with the flux
-        # knobs, only forward ``True`` for the store_true flags so the
-        # preset's defaults survive when the user omits them.
+        # Arrival-credit eligibility trace (Option B).
         enable_arrival_credit=(True if args.enable_arrival_credit else None),
         arrival_credit_mode=args.arrival_credit_mode,
         arrival_credit_tau=args.arrival_credit_tau,
@@ -807,6 +896,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         arrival_credit_include_source=(
             True if args.arrival_credit_include_source else None
         ),
+        arrival_credit_counterfactual=(
+            True if args.arrival_credit_counterfactual else None
+        ),
+        arrival_credit_counterfactual_scope=args.arrival_credit_counterfactual_scope,
+        arrival_credit_counterfactual_return_to_source=(
+            args.arrival_credit_counterfactual_return_to_source
+        ),
+        arrival_credit_counterfactual_horizon=args.arrival_credit_counterfactual_horizon,
+        arrival_credit_owner_filter=args.arrival_credit_owner_filter,
     )
     train(train_cfg, ppo_cfg, reward_cfg, resume_from=args.resume_from)
 

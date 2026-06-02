@@ -99,6 +99,8 @@ def ppo_update(
             )
             if "flux_features" in batch and getattr(policy, "enable_flux_features", False):
                 forward_kwargs["flux_features"] = batch["flux_features"]
+            if "edge_flux_features" in batch and getattr(policy, "enable_flux_features", False):
+                forward_kwargs["edge_flux_features"] = batch["edge_flux_features"]
             out = policy(**forward_kwargs)
             ev = policy.evaluate_source_actions(
                 out,

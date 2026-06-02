@@ -38,6 +38,7 @@ from obs_builder import (
 from model import OrbitWarsPolicy, pack_observations, _beta_concentrations
 
 from .train import load_checkpoint as load_ppo_checkpoint
+from .rewards import RewardConfig
 from .dqn_train import load_dqn_checkpoint
 from model_q import OrbitWarsQNet
 from playground import render_board
@@ -45,6 +46,45 @@ from scripted_strategy import CaptureEfficiencyAgent, ScriptedConfig
 
 MAX_LAUNCHES_PER_PLAYER_TURN = 8
 MAX_PAIR_CANDIDATES = 64
+
+# Default RewardConfig drives the flux feature parameters (mode/tau/eta_norm)
+# whenever the loaded policy was built with ``enable_flux_features=True``.
+# Watch mode does not compute rewards, so the defaults are sufficient.
+_WATCH_REWARD_CFG = RewardConfig()
+
+
+def _pack_obs_for_policy(obs_list, *, device, net):
+    """Pack observations into a batch dict, attaching node+edge flux
+    features when the loaded policy needs them (e.g.
+    ``PygEdgeNativePolicy`` / ``PygPlanetGraphPolicy`` trained with
+    ``--enable-flux-features``).  Mirrors
+    ``rl.rollout._pack_with_flux`` so watch-time inference matches the
+    training-time forward path exactly."""
+    import numpy as np
+    batch = pack_observations(obs_list, device=device)
+    if not getattr(net, "enable_flux_features", False):
+        return batch
+    from .flux import compute_flux_matrices, compute_node_flux_features
+    cfg = _WATCH_REWARD_CFG
+    p_max = int(obs_list[0].planet_feats.shape[0])
+    mode = getattr(cfg, "flux_mode", "exp_decay")
+    tau = float(getattr(cfg, "flux_tau", 10.0))
+    eta_norm = float(getattr(cfg, "flux_eta_norm", 50.0))
+    ship_norm = float(getattr(cfg, "flux_ship_norm", 50.0))
+    inv_ship_norm = 1.0 / max(ship_norm, 1e-6)
+    node_flux_np = np.empty((len(obs_list), p_max, 4), dtype=np.float32)
+    edge_flux_np = np.zeros((len(obs_list), p_max, p_max, 2), dtype=np.float32)
+    for i, o in enumerate(obs_list):
+        mats = compute_flux_matrices(o, p_max=p_max, mode=mode, tau=tau, eta_norm=eta_norm)
+        node_flux_np[i] = compute_node_flux_features(
+            o, p_max=p_max, mode=mode, tau=tau,
+            eta_norm=eta_norm, ship_norm=ship_norm, matrices=mats,
+        )
+        edge_flux_np[i, :, :, 0] = mats.friendly * inv_ship_norm
+        edge_flux_np[i, :, :, 1] = mats.enemy * inv_ship_norm
+    batch["flux_features"] = torch.from_numpy(node_flux_np).to(device)
+    batch["edge_flux_features"] = torch.from_numpy(edge_flux_np).to(device)
+    return batch
 
 
 def _incoming_bucket_idx(eta: float) -> int:
@@ -73,7 +113,7 @@ def _act(net, env_obs, player: int, *,
     obs = build_observation(env_obs, player=player, angular_velocity=omega,
                             p_max=net.p_max, f_max=net.f_max,
                             planet_feature_dim=net.planet_dim)
-    batch = pack_observations([obs], device=device)
+    batch = _pack_obs_for_policy([obs], device=device, net=net)
 
     info_extra = {}
     if isinstance(net, OrbitWarsQNet):
@@ -140,7 +180,7 @@ def _act_all_sources(net, env_obs, player: int, *,
                 planet_feats=obs_work.planet_feats.copy(),
                 source_mask=obs_work.source_mask.copy(),
             )
-            batch = pack_observations([obs_decision], device=device)
+            batch = _pack_obs_for_policy([obs_decision], device=device, net=net)
             with torch.no_grad():
                 out = net(**batch)
             selected = None
@@ -220,7 +260,7 @@ def _act_all_sources(net, env_obs, player: int, *,
             planet_feats=obs_work.planet_feats.copy(),
             source_mask=obs_work.source_mask.copy(),
         )
-        batch = pack_observations([obs_decision], device=device)
+        batch = _pack_obs_for_policy([obs_decision], device=device, net=net)
         with torch.no_grad():
             out = net(**batch)
             action = net.act_source(

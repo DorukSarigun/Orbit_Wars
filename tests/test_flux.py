@@ -5,7 +5,7 @@ Covers:
     * Helpers: ``rl.flux`` computes flux matrices / node features under
       each parametric mode (``raw``, ``linear``, ``exp_decay``).
     * Phase 1: ``rl.rewards.compute_graph_metrics_summary`` returns a
-      12-channel summary when ``enable_flux_metrics`` is on, and
+      13-channel summary when ``enable_flux_metrics`` is on, and
       ``compute_graph_native_reward`` actually uses the new flux weights.
 """
 
@@ -190,6 +190,31 @@ def test_node_flux_ship_norm_scales_output():
     np.testing.assert_allclose(scaled, raw / 50.0)
 
 
+def test_pair_flux_edge_features_align_with_edge_index():
+    from rl.flux import compute_flux_matrices, compute_pair_flux_edge_features
+
+    obs = _synthetic_obs()
+    n = 3
+    dist = np.array(
+        [[0.0, 0.1, 0.2], [0.3, 0.0, 0.4], [0.5, 0.6, 0.0]],
+        dtype=np.float32,
+    )
+    edge_index = np.array(
+        [[0, 0, 0, 1, 1, 1, 2, 2, 2], [1, 2, 0, 0, 2, 1, 0, 1, 2]],
+        dtype=np.int64,
+    )
+    mats = compute_flux_matrices(obs, p_max=n, mode="raw")
+    edge_attr = compute_pair_flux_edge_features(
+        obs, edge_index, dist, n_real=n, mode="raw", ship_norm=1.0, matrices=mats,
+    )
+    assert edge_attr.shape == (9, 3)
+    src, dst = edge_index
+    np.testing.assert_allclose(edge_attr[:, 0], dist[src, dst])
+    np.testing.assert_allclose(edge_attr[:, 1], mats.friendly[src, dst])
+    np.testing.assert_allclose(edge_attr[:, 2], mats.enemy[src, dst])
+    assert edge_attr[0, 1] == pytest.approx(10.0)  # friendly 0->1
+
+
 def test_invalid_flux_mode_raises():
     from rl.flux import compute_flux_matrices
 
@@ -203,71 +228,31 @@ def test_invalid_flux_mode_raises():
 # ---------------------------------------------------------------------------
 
 
-def test_summary_dim_switches_on_flux_flag():
-    """``compute_graph_metrics_summary`` returns 8 vs 12 channels."""
+def test_metric_vector_dim_switches_on_flux_flag():
+    """``compute_planet_metric_vectors`` returns 10 vs 14 channels."""
     pytest.importorskip("torch")
     pytest.importorskip("torch_geometric")
-    from rl.rewards import RewardConfig, compute_graph_metrics_summary
+    from rl.rewards import RewardConfig, compute_planet_metric_vectors
 
     obs, _ = _build_real_obs_from_env()
-    s_off = compute_graph_metrics_summary(obs, cfg=RewardConfig(enable_flux_metrics=False))
-    s_on = compute_graph_metrics_summary(obs, cfg=RewardConfig(enable_flux_metrics=True))
-    assert len(s_off["node_sum"]) == 8
-    assert len(s_on["node_sum"]) == 12
+    m_off = compute_planet_metric_vectors(obs, cfg=RewardConfig(enable_flux_metrics=False))
+    m_on = compute_planet_metric_vectors(obs, cfg=RewardConfig(enable_flux_metrics=True))
+    assert m_off is not None and m_off.shape[1] == 10
+    assert m_on is not None and m_on.shape[1] == 14
 
 
-def test_flux_weights_change_reward_when_flux_enabled():
-    """Reward must differ when a flux weight is non-zero AND flux exists."""
-    pytest.importorskip("torch")
-    pytest.importorskip("torch_geometric")
-    from rl.rewards import (
-        RewardConfig,
-        compute_graph_metrics_summary,
-        compute_graph_native_reward,
+def test_flux_channel_weights_independent():
+    """Arrival-credit flux weights are independent configuration knobs."""
+    from rl.arrival_credit import build_channel_weights
+    from rl.rewards import RewardConfig
+
+    cfg = RewardConfig(
+        arrival_credit_flux_friendly_in_weight=3.0,
+        arrival_credit_flux_enemy_out_weight=-2.0,
     )
-
-    obs, _ = _build_real_obs_from_env()
-    if not obs.fleet_mask.any():
-        pytest.skip("no fleet in flight; nothing to credit")
-
-    base = RewardConfig(
-        reward_system="graph_native",
-        enable_flux_metrics=True,
-        graph_potential_discount=0.99,
-        reward_scale=1.0,                 # keep magnitudes visible
-        graph_reward_normalize=False,
-    )
-    weighted = RewardConfig(
-        reward_system="graph_native",
-        enable_flux_metrics=True,
-        graph_flux_friendly_in_weight=10.0,
-        graph_flux_friendly_out_weight=10.0,
-        graph_potential_discount=0.99,
-        reward_scale=1.0,
-        graph_reward_normalize=False,
-    )
-
-    # Fake "previous" summary by treating an empty-fleet snapshot as prev.
-    empty_obs = obs.__class__(
-        planet_feats=obs.planet_feats.copy(),
-        planet_mask=obs.planet_mask.copy(),
-        fleet_feats=np.zeros_like(obs.fleet_feats),
-        fleet_mask=np.zeros_like(obs.fleet_mask),
-        global_feats=obs.global_feats.copy(),
-        edge_bias=obs.edge_bias.copy(),
-        source_mask=obs.source_mask.copy(),
-        planet_ids=obs.planet_ids.copy(),
-        fleet_ids=np.full_like(obs.fleet_ids, -1),
-    )
-    prev = compute_graph_metrics_summary(empty_obs, cfg=base)
-    curr = compute_graph_metrics_summary(obs, cfg=base)
-
-    r_zero = compute_graph_native_reward(prev, curr, player=0, cfg=base, turn=4)
-    r_pos = compute_graph_native_reward(prev, curr, player=0, cfg=weighted, turn=4)
-    # ``base`` has all 12 weights at 0, so reward should be 0.
-    assert r_zero == pytest.approx(0.0)
-    # Weighted should be strictly positive (curr has more friendly flux).
-    assert r_pos > 0.0
+    w = build_channel_weights(cfg)
+    assert w[10] == pytest.approx(3.0)
+    assert w[13] == pytest.approx(-2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +261,7 @@ def test_flux_weights_change_reward_when_flux_enabled():
 
 
 def test_encoder_input_dim_grows_with_flux_flag():
-    """``PygPlanetGraphEncoder(enable_flux_features=True)`` ingests 46 cols."""
+    """``PygPlanetGraphEncoder(enable_flux_features=True)`` ingests 48 cols."""
     pytest.importorskip("torch")
     pytest.importorskip("torch_geometric")
     from model_graph_pyg import (
@@ -293,12 +278,12 @@ def test_encoder_input_dim_grows_with_flux_flag():
     # what the encoder actually expects on input.
     proj_in_off = enc_off.node_proj[1].in_features
     proj_in_on = enc_on.node_proj[1].in_features
-    assert proj_in_off == 42
-    assert proj_in_on == 46
+    assert proj_in_off == 44
+    assert proj_in_on == 48
 
 
 def test_observation_to_pyg_data_respects_flux_features():
-    """``Data.x`` widens to 46 columns when ``flux_features`` is passed."""
+    """``Data.x`` widens to 48 columns when ``flux_features`` is passed."""
     pytest.importorskip("torch")
     pytest.importorskip("torch_geometric")
     import torch
@@ -309,8 +294,8 @@ def test_observation_to_pyg_data_respects_flux_features():
     flux = torch.zeros(obs.planet_feats.shape[0], GRAPH_NODE_FLUX_DIM)
     data_off = observation_to_pyg_data(obs)
     data_on = observation_to_pyg_data(obs, flux_features=flux)
-    assert data_off.x.shape == (n, 42)
-    assert data_on.x.shape == (n, 46)
+    assert data_off.x.shape == (n, 44)
+    assert data_on.x.shape == (n, 48)
 
 
 def test_packed_observations_to_pyg_batch_with_flux_shape_error():
@@ -368,8 +353,15 @@ def test_policy_forward_with_flux_features_shape():
             planet_mask, fleet_mask, source_mask)
 
     flux = torch.zeros(B, p, 4)
+    # Missing edge_flux_features -> loud error (paired with node flux).
+    with pytest.raises(ValueError):
+        pol(planet_feats, fleet_feats, global_feats, edge_bias,
+            planet_mask, fleet_mask, source_mask, flux_features=flux)
+
+    edge_flux = torch.zeros(B, p, p, 2)
     out = pol(planet_feats, fleet_feats, global_feats, edge_bias,
-              planet_mask, fleet_mask, source_mask, flux_features=flux)
+              planet_mask, fleet_mask, source_mask,
+              flux_features=flux, edge_flux_features=edge_flux)
     assert out.tgt_logits.shape == (B, p, p)
     assert out.value.shape == (B,)
 
@@ -635,26 +627,19 @@ def test_train_cli_parses_new_flags():
 
 
 def test_flux_disabled_summary_ignores_weights():
-    """When ``enable_flux_metrics=False`` the 4 flux weights cannot leak in."""
+    """When ``enable_flux_metrics=False`` flux channels are not in metric vectors."""
     pytest.importorskip("torch")
     pytest.importorskip("torch_geometric")
-    from rl.rewards import (
-        RewardConfig,
-        compute_graph_metrics_summary,
-        compute_graph_native_reward,
-    )
+    from rl.arrival_credit import build_channel_weights
+    from rl.rewards import RewardConfig, compute_planet_metric_vectors
 
     obs, _ = _build_real_obs_from_env()
     cfg = RewardConfig(
-        reward_system="graph_native",
-        enable_flux_metrics=False,           # off
-        graph_flux_friendly_in_weight=10.0,  # would matter if it were on
-        graph_potential_discount=0.99,
-        reward_scale=1.0,
-        graph_reward_normalize=False,
+        enable_flux_metrics=False,
+        arrival_credit_flux_friendly_in_weight=10.0,
     )
-    s = compute_graph_metrics_summary(obs, cfg=cfg)
-    assert len(s["node_sum"]) == 8  # flux channels not appended
-    r = compute_graph_native_reward(s, s, player=0, cfg=cfg, turn=4)
-    # prev == curr -> only γ-discount delta on base 8 channels with all-zero weights.
-    assert r == pytest.approx(0.0)
+    mat = compute_planet_metric_vectors(obs, cfg=cfg)
+    assert mat is not None and mat.shape[1] == 10
+    w = build_channel_weights(cfg)
+    assert w.shape[0] == 14
+    assert w[10] == pytest.approx(10.0)

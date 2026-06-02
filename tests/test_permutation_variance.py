@@ -135,6 +135,46 @@ def _assert_head_io_equivariant(name, original, shuffled, align):
         raise AssertionError(f"Unhandled head: {name}")
 
 
+def _assert_policy_output_equivariant(policy, original_out, shuffled_out, align, p_real):
+    assert torch.allclose(
+        original_out.src_logits[0, :p_real],
+        shuffled_out.src_logits[0, align],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        original_out.src_logits[0, policy.p_max],
+        shuffled_out.src_logits[0, policy.p_max],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        original_out.tgt_logits[0, :p_real, :p_real],
+        shuffled_out.tgt_logits[0][align][:, align],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        original_out.ship_params[0, :p_real, :p_real],
+        shuffled_out.ship_params[0][align][:, align],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        original_out.tokens[0, :p_real],
+        shuffled_out.tokens[0, align],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        original_out.aux_owner_logits[0, :p_real],
+        shuffled_out.aux_owner_logits[0, align],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(original_out.value, shuffled_out.value, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("policy_cls", POLICIES)
 @pytest.mark.parametrize("fleets", [[], FLEETS])
 def test_grouped_edge_models_are_planet_order_equivariant(policy_cls, fleets):
@@ -174,40 +214,110 @@ def test_grouped_edge_models_are_planet_order_equivariant(policy_cls, fleets):
     for head_name in original_heads:
         _assert_head_io_equivariant(head_name, original_heads, shuffled_heads, align)
 
-    assert torch.allclose(
-        original_out.src_logits[0, :p_real],
-        shuffled_out.src_logits[0, align],
-        atol=1e-5,
-        rtol=1e-5,
+    _assert_policy_output_equivariant(policy, original_out, shuffled_out, align, p_real)
+
+
+pytest.importorskip("torch_geometric")
+from model_graph_pyg import PygPlanetGraphPolicy  # noqa: E402
+
+
+def _permute_observation_slots(obs, perm: list[int]):
+    """Permute real planet slots in a built Observation (in-place copy)."""
+    import copy as _copy
+
+    out = _copy.deepcopy(obs)
+    p_real = int(obs.planet_mask.sum())
+    perm = list(perm)
+    assert len(perm) == p_real
+    idx = np.array(perm, dtype=np.int64)
+
+    out.planet_feats[:p_real] = obs.planet_feats[idx]
+    out.planet_mask[:p_real] = obs.planet_mask[idx]
+    out.source_mask[:p_real] = obs.source_mask[idx]
+    out.planet_ids[:p_real] = obs.planet_ids[idx]
+    out.edge_bias[:p_real, :p_real] = obs.edge_bias[np.ix_(idx, idx)]
+    out.edge_bias[:p_real, p_real:] = obs.edge_bias[np.ix_(idx, np.arange(p_real, obs.edge_bias.shape[0]))]
+    out.edge_bias[p_real:, :p_real] = obs.edge_bias[np.ix_(np.arange(p_real, obs.edge_bias.shape[0]), idx)]
+    if out.fleet_src_slot.size:
+        slot_map = {int(old): new for new, old in enumerate(perm)}
+        for fi in range(len(out.fleet_src_slot)):
+            src = int(out.fleet_src_slot[fi])
+            if src in slot_map:
+                out.fleet_src_slot[fi] = slot_map[src]
+            tgt = int(out.fleet_tgt_slot[fi])
+            if tgt in slot_map:
+                out.fleet_tgt_slot[fi] = slot_map[tgt]
+    return out
+
+
+@pytest.mark.parametrize("fleets", [[], FLEETS])
+def test_pyg_planet_graph_is_planet_order_equivariant(fleets):
+    """PyG policy outputs must follow planet-id alignment under slot shuffle."""
+    shuffled_planets = [PLANETS[i] for i in PERMUTATION]
+    original_obs = build_observation(
+        _make_env_obs(PLANETS, fleets),
+        player=0,
+        angular_velocity=0.05,
+        p_max=8,
+        f_max=4,
+        turn=17,
+        max_turns=250,
     )
-    assert torch.allclose(
-        original_out.src_logits[0, policy.p_max],
-        shuffled_out.src_logits[0, policy.p_max],
-        atol=1e-5,
-        rtol=1e-5,
+    shuffled_obs = build_observation(
+        _make_env_obs(shuffled_planets, fleets),
+        player=0,
+        angular_velocity=0.05,
+        p_max=8,
+        f_max=4,
+        turn=17,
+        max_turns=250,
     )
-    assert torch.allclose(
-        original_out.tgt_logits[0, :p_real, :p_real],
-        shuffled_out.tgt_logits[0][align][:, align],
-        atol=1e-5,
-        rtol=1e-5,
+    planet_ids, align = _alignment(original_obs.planet_ids, shuffled_obs.planet_ids)
+    p_real = len(planet_ids)
+    align_np = align.numpy()
+
+    assert np.allclose(original_obs.planet_feats[:p_real], shuffled_obs.planet_feats[align_np])
+    assert np.allclose(
+        original_obs.edge_bias[:p_real, :p_real],
+        shuffled_obs.edge_bias[np.ix_(align_np, align_np)],
     )
-    assert torch.allclose(
-        original_out.ship_params[0, :p_real, :p_real],
-        shuffled_out.ship_params[0][align][:, align],
-        atol=1e-5,
-        rtol=1e-5,
+    assert np.allclose(original_obs.global_feats, shuffled_obs.global_feats)
+
+    torch.manual_seed(123)
+    policy = PygPlanetGraphPolicy(p_max=8, d_model=64, n_layers=2)
+    policy.eval()
+    with torch.no_grad():
+        original_out = policy(**pack_observations([original_obs]))
+        shuffled_out = policy(**pack_observations([shuffled_obs]))
+
+    _assert_policy_output_equivariant(policy, original_out, shuffled_out, align, p_real)
+
+
+@pytest.mark.parametrize("fleets", [[], FLEETS])
+def test_pyg_planet_graph_slot_permutation_in_place(fleets):
+    """Directly permute Observation slot order; logits must permute the same way."""
+    obs = build_observation(
+        _make_env_obs(PLANETS, fleets),
+        player=0,
+        angular_velocity=0.05,
+        p_max=8,
+        f_max=4,
+        turn=17,
+        max_turns=250,
     )
-    assert torch.allclose(
-        original_out.tokens[0, :p_real],
-        shuffled_out.tokens[0, align],
-        atol=1e-5,
-        rtol=1e-5,
+    p_real = int(obs.planet_mask.sum())
+    perm = PERMUTATION[:p_real]
+    shuffled_obs = _permute_observation_slots(obs, perm)
+    align = torch.tensor(
+        [perm.index(i) for i in range(p_real)],
+        dtype=torch.long,
     )
-    assert torch.allclose(
-        original_out.aux_owner_logits[0, :p_real],
-        shuffled_out.aux_owner_logits[0, align],
-        atol=1e-5,
-        rtol=1e-5,
-    )
-    assert torch.allclose(original_out.value, shuffled_out.value, atol=1e-5, rtol=1e-5)
+
+    torch.manual_seed(456)
+    policy = PygPlanetGraphPolicy(p_max=8, d_model=64, n_layers=2)
+    policy.eval()
+    with torch.no_grad():
+        original_out = policy(**pack_observations([obs]))
+        shuffled_out = policy(**pack_observations([shuffled_obs]))
+
+    _assert_policy_output_equivariant(policy, original_out, shuffled_out, align, p_real)

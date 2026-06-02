@@ -53,6 +53,7 @@ class PygEdgeNativePolicy(nn.Module):
         enable_sinkhorn: bool = False,
         sinkhorn_iters: int = 5,
         sinkhorn_tau: float = 1.0,
+        use_input_embed: bool = True,
     ):
         """Edge-native planet-graph PPO policy.
 
@@ -63,10 +64,16 @@ class PygEdgeNativePolicy(nn.Module):
         sampling, log-prob evaluation, and the rest of the PPO
         machinery are unchanged.
 
-        ``enable_flux_features`` widens the encoder input from 42 to 46
-        columns so the policy can consume the four
-        ``[friendly_in, friendly_out, enemy_in, enemy_out]`` flux
-        channels (Phase 3 of the credit-assignment plan).
+        ``enable_flux_features`` widens the encoder input by the
+        four node and two edge flux channels (node 43 -> 47, edge
+        15 -> 17): ``[friendly_in, friendly_out, enemy_in,
+        enemy_out]`` on nodes and ``[friendly_flux_ij, enemy_flux_ij]``
+        on directed edges (Phase 3 of the credit-assignment plan).
+
+        ``use_input_embed`` (default ``True``) gates the NodeEmbed /
+        EdgeEmbed projections inside the encoder.  When set to
+        ``False`` the GINE convs ingest the raw graph features
+        directly (matches the ``DirectFcPlanetGnn`` prototype).
         """
         super().__init__()
         self.p_max = p_max
@@ -77,11 +84,12 @@ class PygEdgeNativePolicy(nn.Module):
         self.sinkhorn_tau = float(sinkhorn_tau)
         # ``planet_dim`` is exposed as the *raw* feature dim for rollout
         # / build_observation compatibility.  The encoder receives
-        # augmented features (PYG_PLANET_FEATURE_DIM = 42, or 46 when
+        # augmented features (PYG_PLANET_FEATURE_DIM = 43, or 47 when
         # ``enable_flux_features`` is on) appended internally by
         # ``packed_observations_to_pyg_batch``.
         self.planet_dim = PLANET_FEATURE_DIM
         self.enable_flux_features = bool(enable_flux_features)
+        self.use_input_embed = bool(use_input_embed)
         encoder_planet_dim = (
             PYG_PLANET_FEATURE_DIM_FLUX if enable_flux_features else PYG_PLANET_FEATURE_DIM
         )
@@ -98,6 +106,7 @@ class PygEdgeNativePolicy(nn.Module):
             n_layers=n_layers,
             dropout=dropout,
             enable_flux_features=enable_flux_features,
+            use_input_embed=use_input_embed,
         )
 
         # Edge-native heads (Bilinear: fuses src/tgt/edge/global with O(B*P) heavy
@@ -137,15 +146,22 @@ class PygEdgeNativePolicy(nn.Module):
         fleet_mask: torch.Tensor,
         source_mask: torch.Tensor,
         flux_features: Optional[torch.Tensor] = None,
+        edge_flux_features: Optional[torch.Tensor] = None,
     ) -> PolicyOutput:
         # When the encoder was built with flux features, callers must
-        # supply a ``(B, P_max, 4)`` tensor; otherwise we fail loudly
+        # supply both the node ``(B, P_max, 4)`` and edge
+        # ``(B, P_max, P_max, 2)`` tensors; otherwise we fail loudly
         # rather than silently broadcasting zeros (which would mask bugs
         # in the rollout / buffer plumbing).
         if self.enable_flux_features and flux_features is None:
             raise ValueError(
                 "PygEdgeNativePolicy was built with enable_flux_features=True "
                 "but `flux_features` was not passed to forward()."
+            )
+        if self.enable_flux_features and edge_flux_features is None:
+            raise ValueError(
+                "PygEdgeNativePolicy was built with enable_flux_features=True "
+                "but `edge_flux_features` was not passed to forward()."
             )
         # 1. Pack observations into a PyG Batch.
         batch_dict: dict[str, torch.Tensor] = {
@@ -157,6 +173,7 @@ class PygEdgeNativePolicy(nn.Module):
         }
         if self.enable_flux_features:
             batch_dict["flux_features"] = flux_features  # type: ignore[assignment]
+            batch_dict["edge_flux_features"] = edge_flux_features  # type: ignore[assignment]
         graph_batch = packed_observations_to_pyg_batch(batch_dict)
 
         # 2. Encode with GINEConv layers.
@@ -167,7 +184,10 @@ class PygEdgeNativePolicy(nn.Module):
         # 3. Vectorized pairwise edge features (one batched ETA pass), then
         # project via the shared encoder edge_proj for consistency with
         # message-passing.
-        edge_pair = _batched_pair_edge_features(planet_feats, edge_bias, planet_mask)
+        edge_pair = _batched_pair_edge_features(
+            planet_feats, edge_bias, planet_mask,
+            edge_flux_features=edge_flux_features if self.enable_flux_features else None,
+        )
         edge_tok = self.encoder.edge_proj(edge_pair)  # (B, P, P, d_model)
 
         # 4. Edge logits / ship params via Bilinear (or Sinkhorn) edge head.
@@ -352,3 +372,58 @@ class PygEdgeNativePolicy(nn.Module):
             "log_prob": log_prob,
             "entropy": action_dist.entropy(),
         }
+
+    def evaluate_source_actions(
+        self,
+        out: PolicyOutput,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        ship_value: torch.Tensor,
+        is_noop: torch.Tensor,
+    ) -> dict:
+        """Conditional-on-src log_prob / entropy.
+
+        Mirrors :meth:`act_source` exactly so that callers that *fix* the
+        source slot (e.g. the scripted neutral-expansion bootstrap in
+        ``rl/rollout._scripted_neutral_expansion_action``) get a log
+        probability that's consistent with the action the network would
+        have sampled.  This is the edge-native counterpart of
+        :meth:`GroupedPlanetOrbitWarsPolicy.evaluate_source_actions` so
+        the rollout helpers stay polymorphic across policy variants.
+
+        The action distribution is built from
+        ``[src_logits[:, src], tgt_logits[:, src, :]]``: the per-source
+        noop logit followed by the row of edge logits leaving that
+        source.  The continuous ship-fraction term is taken from
+        ``ship_params[:, src, tgt]`` and only contributes when
+        ``is_noop`` is False.
+        """
+        src = src.long()
+        tgt = tgt.long()
+        ship_value = ship_value.float()
+        is_noop = is_noop.bool()
+        B = out.src_logits.shape[0]
+        idx_b = torch.arange(B, device=src.device)
+        # Per-source noop logit + per-source target logits, matching
+        # act_source's conditional categorical exactly.
+        noop_sel = out.src_logits[idx_b, src].unsqueeze(-1)
+        tgt_logits_sel = out.tgt_logits[idx_b, src]
+        action_logits = torch.cat([noop_sel, tgt_logits_sel], dim=1)
+        action_dist = torch.distributions.Categorical(logits=action_logits)
+        action_idx = torch.where(is_noop, torch.zeros_like(tgt), tgt + 1)
+
+        tgt_idx = torch.where(is_noop, torch.zeros_like(tgt), tgt)
+        ship_params_sel = out.ship_params[idx_b, src, tgt_idx]
+        ship_dist = _make_ship_dist(ship_params_sel)
+        ship_logp = ship_dist.log_prob(_clamp_for_log_prob(ship_value))
+        valid = (~is_noop).float()
+        log_prob = action_dist.log_prob(action_idx) + valid * ship_logp
+
+        # Population-level entropy: H(action | src) + Pr(launch | src) ·
+        # H(ship | src, tgt).  Same convention used by the grouped
+        # variant so PPO entropy bonuses stay consistent across heads.
+        action_probs = torch.softmax(action_logits, dim=-1)
+        p_nonnoop = 1.0 - action_probs[..., 0]
+        entropy = action_dist.entropy() + p_nonnoop * ship_dist.entropy()
+        value = out.value if out.value is not None else None
+        return {"log_prob": log_prob, "entropy": entropy, "value": value}
