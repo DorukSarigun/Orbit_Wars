@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -69,6 +70,9 @@ class TrainConfig:
     device: str = "cpu"
     routing_cost: bool = True
     # Opponent: "self_play" | "scripted" | "frozen" (P0 always = live policy).
+    num_agents: int = 2
+    random_num_agents: bool = False
+    num_agent_choices: tuple[int, ...] = (2, 4)
     opponent: str = "self_play"
     scripted_strategy: str = "production"
     opponent_ckpt: Optional[str] = None   # required when opponent == "frozen"
@@ -133,6 +137,24 @@ def load_checkpoint(path: str | Path, device: torch.device | None = None) -> tup
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+def _parse_num_agent_choices(raw: str) -> tuple[int, ...]:
+    values = tuple(int(x.strip()) for x in raw.split(",") if x.strip())
+    if not values:
+        raise argparse.ArgumentTypeError("--num-agent-choices cannot be empty")
+    invalid = [v for v in values if v not in (2, 4)]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            "Orbit Wars supports num_agents in {2, 4}; invalid: " + str(invalid))
+    return values
+
+
+def _episode_num_agents(train_cfg: TrainConfig, seed: int) -> int:
+    if not train_cfg.random_num_agents:
+        return int(train_cfg.num_agents)
+    choices = tuple(train_cfg.num_agent_choices)
+    return int(random.Random(int(seed)).choice(choices))
+
+
 def _entropy_coef_at(it: int, train_cfg: TrainConfig, base: float) -> float:
     if train_cfg.entropy_coef_final is None or train_cfg.entropy_anneal_iters <= 0:
         return base
@@ -179,7 +201,14 @@ def train(
         frozen_policy.eval()
         for p in frozen_policy.parameters():
             p.requires_grad_(False)
-        print(f"Frozen opponent (P1): {train_cfg.opponent_ckpt}")
+        uses_4p = train_cfg.num_agents == 4 or (
+            train_cfg.random_num_agents and 4 in train_cfg.num_agent_choices)
+        extra = f"; P2–P3 scripted ({train_cfg.scripted_strategy})" if uses_4p else ""
+        print(f"Frozen opponent (P1): {train_cfg.opponent_ckpt}{extra}")
+    if train_cfg.random_num_agents:
+        print(f"Random num_agents per episode from {tuple(train_cfg.num_agent_choices)}")
+    else:
+        print(f"num_agents={train_cfg.num_agents}")
 
     log_path = Path(train_cfg.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,11 +217,15 @@ def train(
         t0 = time.time()
         buffer = ReworkedBuffer()
         ep_stats = []
+        episode_num_agents_list: list[int] = []
         for ep in range(train_cfg.episodes_per_iter):
             seed = train_cfg.seed * 100_000 + it * 1_000 + ep
+            n_agents = _episode_num_agents(train_cfg, seed)
+            episode_num_agents_list.append(n_agents)
             stats = collect_episode(
                 policy, buffer,
                 max_steps=train_cfg.max_episode_steps,
+                num_agents=n_agents,
                 reward_cfg=reward_cfg,
                 potential_fn=economic_potential,
                 device=device,
@@ -215,9 +248,17 @@ def train(
         avg_len = sum(s.length for s in ep_stats) / n_ep
         avg_launches = sum(s.n_launches for s in ep_stats) / n_ep
         avg_p0_reward = sum(s.rewards.get(0, 0.0) for s in ep_stats) / n_ep
-        wins_p0 = sum(1 for s in ep_stats if s.winner == 0)
-        wins_p1 = sum(1 for s in ep_stats if s.winner == 1)
+        wins_by_player = {
+            p: sum(1 for s in ep_stats if s.winner == p)
+            for p in range(max(episode_num_agents_list) if episode_num_agents_list else 2)
+        }
+        wins_p0 = wins_by_player.get(0, 0)
+        wins_p1 = wins_by_player.get(1, 0)
         timeouts = sum(1 for s in ep_stats if s.winner is None)
+        n_agents_hist = {
+            str(n): sum(1 for x in episode_num_agents_list if x == n)
+            for n in sorted(set(episode_num_agents_list))
+        }
         avg_credit = sum(s.credit_total for s in ep_stats) / n_ep
         avg_capture = sum(s.n_capture for s in ep_stats) / n_ep
         avg_defense = sum(s.n_defense for s in ep_stats) / n_ep
@@ -231,6 +272,9 @@ def train(
             "avg_launches": round(avg_launches, 1),
             "avg_p0_shaped_reward": round(avg_p0_reward, 4),
             "wins_p0": wins_p0, "wins_p1": wins_p1, "timeouts": timeouts,
+            "wins_by_player": wins_by_player,
+            "episode_num_agents": episode_num_agents_list,
+            "num_agents_hist": n_agents_hist,
             "policy_loss": round(ppo_stats.policy_loss, 5),
             "value_loss": round(ppo_stats.value_loss, 5),
             "entropy": round(ppo_stats.entropy, 4),
@@ -246,9 +290,11 @@ def train(
         with log_path.open("a") as fp:
             fp.write(json.dumps(log) + "\n")
 
+        win_str = " ".join(f"P{p}={wins_by_player.get(p, 0)}" for p in sorted(wins_by_player))
+        na_str = ",".join(f"{k}:{v}" for k, v in n_agents_hist.items()) if n_agents_hist else "2:0"
         print(f"[iter {it:>4}/{train_cfg.iterations}] "
-              f"games={n_ep} len={avg_len:.0f} launch={avg_launches:.1f} "
-              f"P0={wins_p0} P1={wins_p1} TO={timeouts} | "
+              f"games={n_ep} na={na_str} len={avg_len:.0f} launch={avg_launches:.1f} "
+              f"{win_str} TO={timeouts} | "
               f"polL={log['policy_loss']:+.4f} valL={log['value_loss']:.4f} "
               f"H={log['entropy']:.3f} KL={log['approx_kl']:.4f} "
               + (f"cr={log['credit_total']:+.3f} cap={log['n_capture']:.1f} "
@@ -281,11 +327,17 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cpu")
     p.add_argument("--no-routing-cost", action="store_false", dest="routing_cost",
                    help="Disable the metric-based allocator routing cost matrix.")
+    p.add_argument("--num-agents", type=int, default=2, choices=[2, 4],
+                   help="Players per episode when --random-num-agents is off.")
+    p.add_argument("--random-num-agents", action="store_true",
+                   help="Sample 2 or 4 players per episode from --num-agent-choices.")
+    p.add_argument("--num-agent-choices", type=_parse_num_agent_choices, default="2,4",
+                   help="Comma-separated player counts for --random-num-agents (2 and/or 4).")
     p.add_argument("--opponent", choices=["self_play", "scripted", "frozen"],
                    default="self_play",
-                   help="self_play: both players = live policy. "
-                        "scripted: P0 = train, P1 = scripted bot. "
-                        "frozen: P0 = train, P1 = fixed checkpoint (--opponent-ckpt).")
+                   help="self_play: all seats = live policy. "
+                        "scripted: P0 = train, others = scripted bot. "
+                        "frozen: P0 = train, P1 = --opponent-ckpt; in 4p P2–P3 scripted.")
     p.add_argument("--opponent-ckpt", default=None,
                    help="Checkpoint path for P1 when --opponent=frozen.")
     p.add_argument("--scripted-strategy", default="production",
@@ -351,6 +403,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         gamma=args.gamma, gae_lambda=args.gae_lambda,
         learning_rate=args.lr, seed=args.seed, device=args.device,
         routing_cost=args.routing_cost,
+        num_agents=args.num_agents,
+        random_num_agents=args.random_num_agents,
+        num_agent_choices=args.num_agent_choices,
         opponent=args.opponent,
         opponent_ckpt=args.opponent_ckpt,
         scripted_strategy=args.scripted_strategy,

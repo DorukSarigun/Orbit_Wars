@@ -472,11 +472,41 @@ class EpisodeStats:
     length: int
     rewards: dict = field(default_factory=dict)
     winner: Optional[int] = None
+    num_agents: int = 2
     n_launches: int = 0
     # Decision-indexed credit diagnostics (0 when battle credit is off).
     credit_total: float = 0.0
     n_capture: int = 0
     n_defense: int = 0
+
+
+# Supported ``num_agents`` values for :func:`collect_episode` / training.
+ALLOWED_NUM_AGENTS: tuple[int, ...] = (2, 4)
+
+
+def _validate_num_agents(num_agents: int) -> int:
+    n = int(num_agents)
+    if n not in ALLOWED_NUM_AGENTS:
+        raise ValueError(f"num_agents must be one of {ALLOWED_NUM_AGENTS}, got {n}")
+    return n
+
+
+def _opponent_controller(player: int, opponent: str, num_agents: int) -> Optional[str]:
+    """How player ``player`` is controlled when not using the live training policy.
+
+    Returns ``None`` for the learning policy (self-play on all seats, or P0 in
+    bot modes).  Otherwise ``"scripted"`` or ``"frozen"``.
+    """
+    if opponent == "self_play":
+        return None
+    if player == 0:
+        return None
+    if opponent == "scripted":
+        return "scripted"
+    if opponent == "frozen":
+        # P1 = frozen checkpoint; any extra seats (4p) use the scripted bot.
+        return "frozen" if player == 1 else "scripted"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +517,7 @@ def collect_episode(
     buffer: ReworkedBuffer,
     *,
     max_steps: int = 300,
+    num_agents: int = 2,
     reward_cfg: Optional[RewardConfig] = None,
     potential_fn: Optional[Callable[[object, int, int, "RewardConfig"], float]] = None,
     device: Optional[torch.device] = None,
@@ -497,31 +528,32 @@ def collect_episode(
     frozen_policy: Optional[ReworkedHierarchicalPolicy] = None,
     frozen_deterministic: bool = True,
 ) -> EpisodeStats:
-    """Run one 2-player episode, writing one transition / *policy* player / turn.
+    """Run one episode (2 or 4 players), one transition per *training* player / turn.
 
     Reward = potential-based shaping ``gamma * Phi(s') - Phi(s)`` on the
     pluggable potential ``potential_fn`` (default :func:`economic_potential`),
     plus the terminal win/loss bonus.  ``Phi`` of a terminal state is taken as 0
     (no future), keeping the shaping telescoping and policy-invariant.
 
+    ``num_agents``:
+        ``2`` or ``4`` (Orbit Wars env contract).  Ownership features already
+        encode self + 3 enemy slots, so the reworked stack needs no arch change.
+
     ``opponent``:
-        * ``"self_play"`` (default) -- every player runs the live ``policy`` and
-          every player's transitions are stored (pure self-play).
-        * ``"scripted"`` -- player 0 runs the live ``policy`` (stored); players
-          1.. run the deterministic ``scripted_strategy`` bot
-          (:mod:`reworked_scripted`) and are **not** stored, so PPO only trains
-          on the learning agent's transitions against a fixed opponent.
-        * ``"frozen"`` -- player 0 = live ``policy`` (stored); player 1 =
-          ``frozen_policy`` (fixed checkpoint, greedy by default).  Only P0 is
-          trained -- use this to learn against a saved policy (e.g. v5 vs v6).
+        * ``"self_play"`` -- every seat runs the live ``policy``; all transitions
+          stored (2p or 4p self-play).
+        * ``"scripted"`` -- P0 = live policy (stored); P1..P{n-1} = scripted bot.
+        * ``"frozen"`` -- P0 = live policy; P1 = ``frozen_policy``; in 4p, P2–P3
+          scripted (same ``scripted_strategy``).
     """
     from kaggle_environments import make
+    num_agents = _validate_num_agents(num_agents)
     if opponent not in ("self_play", "scripted", "frozen"):
         raise ValueError(f"unknown opponent={opponent!r}")
     if opponent == "frozen" and frozen_policy is None:
         raise ValueError("opponent='frozen' requires frozen_policy")
 
-    if opponent == "scripted":
+    if opponent in ("scripted", "frozen"):
         try:
             from .reworked_scripted import scripted_action_row
         except ImportError:  # pragma: no cover - flat layout
@@ -530,9 +562,8 @@ def collect_episode(
     reward_cfg = reward_cfg or RewardConfig()
     potential_fn = potential_fn or economic_potential
     device = device or torch.device("cpu")
-    players = [0, 1]
-    # Opponents that act but do not produce training transitions.
-    non_training = set(players[1:]) if opponent in ("scripted", "frozen") else set()
+    players = list(range(num_agents))
+    non_training = {p for p in players if _opponent_controller(p, opponent, num_agents) is not None}
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
@@ -544,7 +575,7 @@ def collect_episode(
         import random as _random
         env.configuration["randomSeed"] = int(seed)
         _random.seed(int(seed))
-    env.reset(num_agents=2)
+    env.reset(num_agents=num_agents)
     state = env.step([[] for _ in players])
 
     def obs_of(p):
@@ -606,10 +637,10 @@ def collect_episode(
                                     p_max=P_MAX, f_max=F_MAX, turn=t, max_turns=max_steps)
             parsed = parse_planets(env_obs)
 
-            # Fixed opponent (scripted or frozen checkpoint): no transition stored.
-            if p in non_training:
+            ctrl = _opponent_controller(p, opponent, num_agents)
+            if ctrl is not None:
                 batch = pack_reworked_batch([(obs, p)], device=device, p_max=P_MAX)
-                if opponent == "scripted":
+                if ctrl == "scripted":
                     action_row = scripted_action_row(
                         scripted_strategy, batch["states"][0], p, p_max=P_MAX)
                 else:
@@ -767,13 +798,13 @@ def collect_episode(
             winner = max(rewards, key=rewards.get) if rewards else None
             ctot, ncap, ndef = _finalize_credit(t + 1)
             return EpisodeStats(length=t + 1, rewards=ep_rewards, winner=winner,
-                                n_launches=n_launches, credit_total=ctot,
-                                n_capture=ncap, n_defense=ndef)
+                                num_agents=num_agents, n_launches=n_launches,
+                                credit_total=ctot, n_capture=ncap, n_defense=ndef)
 
     ctot, ncap, ndef = _finalize_credit(max_steps)
     return EpisodeStats(length=max_steps, rewards=ep_rewards, winner=None,
-                        n_launches=n_launches, credit_total=ctot,
-                        n_capture=ncap, n_defense=ndef)
+                        num_agents=num_agents, n_launches=n_launches,
+                        credit_total=ctot, n_capture=ncap, n_defense=ndef)
 
 
 # ---------------------------------------------------------------------------
@@ -884,6 +915,7 @@ def ppo_update(
 
 __all__ = [
     "P_MAX", "F_MAX",
+    "ALLOWED_NUM_AGENTS",
     "action_to_env_launches",
     "RewardConfig", "economic_potential",
     "HierTransition", "ReworkedBuffer", "EpisodeStats",

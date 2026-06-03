@@ -85,6 +85,7 @@ def record_game_html(
     out_path: str | Path,
     *,
     policy_p1: Optional[torch.nn.Module] = None,
+    num_agents: int = 2,
     max_steps: int = 300,
     opponent: str = "scripted",
     scripted_strategy: str = "production",
@@ -98,15 +99,20 @@ def record_game_html(
     import random as _random
 
     device = device or torch.device("cpu")
+    num_agents = int(num_agents)
+    if num_agents not in (2, 4):
+        raise ValueError("num_agents must be 2 or 4")
     policy.eval().to(device)
     if policy_p1 is not None:
         policy_p1.eval().to(device)
-    players = [0, 1]
+    players = list(range(num_agents))
     if opponent == "scripted":
-        scripted_players = {1}
+        scripted_players = set(range(1, num_agents))
     elif opponent == "policy":
         if policy_p1 is None:
             raise ValueError("opponent='policy' requires policy_p1 (use --ckpt-p1).")
+        if num_agents != 2:
+            raise ValueError("opponent='policy' (head-to-head) supports num_agents=2 only")
         scripted_players = set()
     else:
         scripted_players = set()
@@ -115,7 +121,7 @@ def record_game_html(
     if seed is not None:
         env.configuration["randomSeed"] = int(seed)
         _random.seed(int(seed))
-    env.reset(num_agents=2)
+    env.reset(num_agents=num_agents)
     state = env.step([[] for _ in players])
 
     t = 0
@@ -150,6 +156,7 @@ def record_game_html(
         "length": t + 1,
         "winner": winner,
         "rewards": rewards,
+        "num_agents": num_agents,
         "opponent": opponent,
         "html_path": str(out_path),
         "html_size_kb": round(len(html) / 1024, 1),
@@ -176,6 +183,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--ckpt-p1", default=None,
                    help="Second checkpoint for player 1 (--opponent policy).")
     p.add_argument("--scripted-strategy", default="production")
+    p.add_argument("--num-agents", type=int, default=2, choices=[2, 4],
+                   help="Number of players in the replay.")
     p.add_argument("--max-steps", type=int, default=300)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--stochastic", action="store_true",
@@ -198,6 +207,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         record_game_html(
             policy, out,
             policy_p1=policy_p1,
+            num_agents=args.num_agents,
             max_steps=args.max_steps,
             opponent=args.opponent,
             scripted_strategy=args.scripted_strategy,
