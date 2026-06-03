@@ -174,6 +174,20 @@ class CreditConfig:
     norm: float = DEFAULT_NORM
     capture_weight: float = 1.0    # scale on +dpp(g) for a successful capture
     defense_weight: float = 1.0    # scale on +/-dpp(g) for a resolved defence
+    # Decision-indexed penalties for attacks that never paid off.  Both default
+    # to 0.0 so the pass is bit-identical to the capture/defence-only behaviour
+    # unless explicitly enabled.  They use the *campaign ledger* (all of a
+    # player's attack arrivals against a target accumulate until the planet's
+    # ownership resolves), which is robust to multi-source / staggered arrivals:
+    #   * ``lost_race_weight`` -- the target flips to a *different* player while
+    #     my fleets were committed to it (I spent ships and the rival took it).
+    #   * ``fail_weight``      -- the episode ends with the target never captured
+    #     by me (ships thrown at a planet I never took -- pure waste).
+    # A campaign that *succeeds* (planet flips to me) clears my pending ledger
+    # with no penalty, so softening waves of a winning multi-wave assault are
+    # never charged.
+    lost_race_weight: float = 0.0
+    fail_weight: float = 0.0
     # Optional extra discount of the realised value back toward the launch turn
     # (1.0 = none; the decision transition is the cause, so default is no extra
     # discount -- GAE already discounts from that transition forward).
@@ -186,8 +200,12 @@ class CreditStats:
     n_capture: int = 0
     n_defense_hold: int = 0
     n_defense_loss: int = 0
+    n_lost_race: int = 0
+    n_fail_attack: int = 0
     capture_credit: float = 0.0
     defense_credit: float = 0.0
+    lost_race_credit: float = 0.0
+    fail_credit: float = 0.0
 
 
 def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
@@ -229,6 +247,13 @@ def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
     # --- per-planet FIFO state ---------------------------------------------
     layers: dict = {}     # planet_id -> list[[tag, ships]]
     owner: dict = {}      # planet_id -> tracked owner
+    # Campaign ledger: attack LaunchRecords that have arrived on a target not
+    # yet owned by their launcher and whose outcome is still unresolved.  Keyed
+    # by planet id; resolved (and cleared) on the next ownership flip, swept for
+    # the never-captured case at episode end.  Only used when the lost-race /
+    # fail penalties are enabled, so the default pass is unchanged.
+    pending_attacks: dict = {}   # planet_id -> list[LaunchRecord]
+    track_campaign = bool(cfg.lost_race_weight or cfg.fail_weight)
 
     s0 = snaps[0]
     for pid, o in s0.owner.items():
@@ -287,6 +312,15 @@ def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
             o_cur = owner.get(pid, -1)
             mine_arrivals = arrivals_by_tgt.get(pid, [])
 
+            # Campaign ledger: log my attack waves landing on a not-yet-mine
+            # target.  Done before resolution so a same-turn capture/lost-race
+            # sees this turn's waves too.
+            if track_campaign:
+                for rec in mine_arrivals:
+                    if (rec.is_attack and rec.player in log.policy_players
+                            and o_cur != rec.player):
+                        pending_attacks.setdefault(pid, []).append(rec)
+
             # --- planet currently mine (a policy player's) -----------------
             if o_cur in log.policy_players:
                 # push my reinforcement arrivals as decision-tagged layers
@@ -341,6 +375,24 @@ def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
                     owner[pid] = o_post
                     layers[pid] = [[NATIVE, s_post]]
 
+            # Resolve the campaign ledger on an ownership flip: the new owner's
+            # waves won (cleared, no penalty -- positive credit, if any, is
+            # handled by the capture branch above); every *other* player's
+            # committed waves lost the race for this planet.
+            if track_campaign and o_post != o_cur:
+                pend = pending_attacks.pop(pid, None)
+                if pend and cfg.lost_race_weight:
+                    losers: dict = {}
+                    for r in pend:
+                        if r.player != o_post:
+                            losers[r.decision_id] = losers.get(r.decision_id, 0.0) + float(r.ships)
+                    if losers:
+                        prod = float(cur.production.get(pid, nxt.production.get(pid, 0.0)))
+                        val = cfg.lost_race_weight * dpp_of(pid, prod, t)
+                        _distribute(credit, losers, -val)
+                        stats.n_lost_race += 1
+                        stats.lost_race_credit -= val
+
         # keep untouched planets aligned (production already applied)
         for pid in list(layers.keys()):
             if pid in touched or pid not in nxt.owner:
@@ -349,6 +401,22 @@ def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
             if o_post != owner.get(pid, -1):
                 owner[pid] = o_post
                 layers[pid] = [[NATIVE, float(nxt.ships.get(pid, 0.0))]]
+
+    # Episode end: attack waves still pending never captured their target ->
+    # pure waste, charged to their decisions by ship share.
+    if track_campaign and cfg.fail_weight and pending_attacks:
+        last = snaps[-1]
+        for pid, pend in pending_attacks.items():
+            by_dec: dict = {}
+            for r in pend:
+                by_dec[r.decision_id] = by_dec.get(r.decision_id, 0.0) + float(r.ships)
+            if not by_dec:
+                continue
+            prod = float(last.production.get(pid, 0.0))
+            val = cfg.fail_weight * dpp_of(pid, prod, last.turn)
+            _distribute(credit, by_dec, -val)
+            stats.n_fail_attack += 1
+            stats.fail_credit -= val
 
     # apply optional event discount and finalise
     if cfg.event_discount != 1.0:

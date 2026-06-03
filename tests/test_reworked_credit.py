@@ -105,9 +105,89 @@ def test_big_attack_held_credits_reinforcer_positive():
     assert credit.get(0, 0.0) > 0.0, credit
 
 
+def test_failed_neutral_attack_penalizes_only_when_enabled():
+    # g0 mine, g5 neutral (garrison 30, prod 3). A 10-ship attack lands at t1,
+    # is absorbed, g5 stays neutral the whole game -> pure waste.
+    def _log():
+        log = EpisodeLog(max_turns=100, policy_players={0})
+        log.snapshots = [
+            _snap(0, {0: 0, 5: -1}, {0: 20, 5: 30}, {0: 0, 5: 3}, []),
+            _snap(1, {0: 0, 5: -1}, {0: 10, 5: 30}, {0: 0, 5: 3}, [100]),
+            _snap(2, {0: 0, 5: -1}, {0: 10, 5: 20}, {0: 0, 5: 3}, []),
+        ]
+        log.launches = [LaunchRecord(decision_id=0, player=0, launch_turn=0,
+                                     src_id=0, tgt_id=5, ships=10, is_attack=True,
+                                     fleet_id=100)]
+        return log
+
+    # Default config: no campaign penalties -> the failed attack costs nothing.
+    credit, stats = attribute_credits(_log(), CreditConfig())
+    assert abs(credit.get(0, 0.0)) < 1e-9, credit
+    assert stats.n_fail_attack == 0
+
+    # Enabled: the deciding turn is charged -dpp(target).
+    credit, stats = attribute_credits(_log(), CreditConfig(fail_weight=0.5))
+    assert credit.get(0, 0.0) < 0.0, credit
+    assert stats.n_fail_attack == 1
+    assert abs(credit[0] - (-0.5 * _dpp(3, 98))) < 1e-4, credit
+
+
+def test_lost_race_penalizes_when_rival_captures():
+    # g5 neutral; my 10-ship attack lands at t1 but the planet flips to enemy
+    # player 1 (not a policy player) that turn -> I lost the race.
+    def _log():
+        log = EpisodeLog(max_turns=100, policy_players={0})
+        log.snapshots = [
+            _snap(0, {0: 0, 5: -1}, {0: 20, 5: 5}, {0: 0, 5: 3}, []),
+            _snap(1, {0: 0, 5: -1}, {0: 10, 5: 5}, {0: 0, 5: 3}, [100]),
+            _snap(2, {0: 0, 5: 1}, {0: 10, 5: 8}, {0: 0, 5: 3}, []),
+        ]
+        log.launches = [LaunchRecord(decision_id=0, player=0, launch_turn=0,
+                                     src_id=0, tgt_id=5, ships=10, is_attack=True,
+                                     fleet_id=100)]
+        return log
+
+    credit, stats = attribute_credits(_log(), CreditConfig())
+    assert abs(credit.get(0, 0.0)) < 1e-9, credit
+    assert stats.n_lost_race == 0
+
+    credit, stats = attribute_credits(_log(), CreditConfig(lost_race_weight=1.0))
+    assert credit.get(0, 0.0) < 0.0, credit
+    assert stats.n_lost_race == 1
+
+
+def test_multiwave_capture_does_not_penalize_softening_wave():
+    # Staggered assault on neutral g5 (garrison 30): wave A (decision 0, 18
+    # ships) lands t1 and only softens (12 left); wave B (decision 1, 18 ships)
+    # lands t2 and captures.  Even with both penalties on, the softening wave
+    # earns NO penalty (its campaign succeeded), only B gets +capture.
+    log = EpisodeLog(max_turns=100, policy_players={0})
+    log.snapshots = [
+        _snap(0, {0: 0, 5: -1}, {0: 50, 5: 30}, {0: 0, 5: 3}, []),
+        _snap(1, {0: 0, 5: -1}, {0: 32, 5: 30}, {0: 0, 5: 3}, [100]),
+        _snap(2, {0: 0, 5: -1}, {0: 14, 5: 12}, {0: 0, 5: 3}, [200]),
+        _snap(3, {0: 0, 5: 0}, {0: 14, 5: 6}, {0: 0, 5: 3}, []),
+    ]
+    log.launches = [
+        LaunchRecord(decision_id=0, player=0, launch_turn=0, src_id=0, tgt_id=5,
+                     ships=18, is_attack=True, fleet_id=100),
+        LaunchRecord(decision_id=1, player=0, launch_turn=1, src_id=0, tgt_id=5,
+                     ships=18, is_attack=True, fleet_id=200),
+    ]
+    cfg = CreditConfig(fail_weight=0.5, lost_race_weight=1.0)
+    credit, stats = attribute_credits(log, cfg)
+    assert stats.n_capture == 1
+    assert stats.n_fail_attack == 0 and stats.n_lost_race == 0
+    assert credit.get(1, 0.0) > 0.0, credit          # capturing wave rewarded
+    assert abs(credit.get(0, 0.0)) < 1e-9, credit     # softening wave untouched
+
+
 if __name__ == "__main__":
     test_capture_credits_attacker_positive()
     test_defense_loss_charges_reinforcer_negative()
     test_small_attack_absorbed_by_native_credits_nothing()
     test_big_attack_held_credits_reinforcer_positive()
+    test_failed_neutral_attack_penalizes_only_when_enabled()
+    test_lost_race_penalizes_when_rival_captures()
+    test_multiwave_capture_does_not_penalize_softening_wave()
     print("all credit tests passed")

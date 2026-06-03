@@ -68,10 +68,10 @@ class TrainConfig:
     seed: int = 0
     device: str = "cpu"
     routing_cost: bool = True
-    # Opponent: "self_play" (all slots = live policy) or "scripted" (slot 0 =
-    # policy, others = deterministic reworked_scripted bot).
+    # Opponent: "self_play" | "scripted" | "frozen" (P0 always = live policy).
     opponent: str = "self_play"
     scripted_strategy: str = "production"
+    opponent_ckpt: Optional[str] = None   # required when opponent == "frozen"
     # Model arch (rebuilt on load).
     d_model: int = 128
     n_layers: int = 3
@@ -171,6 +171,16 @@ def train(
     print(f"ReworkedHierarchicalPolicy: {n_params:,} params, "
           f"d_model={train_cfg.d_model}, n_layers={train_cfg.n_layers}, device={device}")
 
+    frozen_policy = None
+    if train_cfg.opponent == "frozen":
+        if not train_cfg.opponent_ckpt:
+            raise ValueError("TrainConfig.opponent='frozen' requires opponent_ckpt")
+        frozen_policy, _ = load_checkpoint(train_cfg.opponent_ckpt, device=device)
+        frozen_policy.eval()
+        for p in frozen_policy.parameters():
+            p.requires_grad_(False)
+        print(f"Frozen opponent (P1): {train_cfg.opponent_ckpt}")
+
     log_path = Path(train_cfg.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -190,6 +200,7 @@ def train(
                 routing_cost=train_cfg.routing_cost,
                 opponent=train_cfg.opponent,
                 scripted_strategy=train_cfg.scripted_strategy,
+                frozen_policy=frozen_policy,
             )
             ep_stats.append(stats)
 
@@ -270,9 +281,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cpu")
     p.add_argument("--no-routing-cost", action="store_false", dest="routing_cost",
                    help="Disable the metric-based allocator routing cost matrix.")
-    p.add_argument("--opponent", choices=["self_play", "scripted"], default="self_play",
-                   help="self_play: all slots run the live policy. "
-                        "scripted: slot 0 = policy (trained), others = scripted bot.")
+    p.add_argument("--opponent", choices=["self_play", "scripted", "frozen"],
+                   default="self_play",
+                   help="self_play: both players = live policy. "
+                        "scripted: P0 = train, P1 = scripted bot. "
+                        "frozen: P0 = train, P1 = fixed checkpoint (--opponent-ckpt).")
+    p.add_argument("--opponent-ckpt", default=None,
+                   help="Checkpoint path for P1 when --opponent=frozen.")
     p.add_argument("--scripted-strategy", default="production",
                    help="Scripted bot strategy when --opponent=scripted "
                         "(see reworked_scripted.SCRIPTED_STRATEGIES).")
@@ -309,6 +324,12 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="scale on +dpp(target) for a successful capture")
     p.add_argument("--credit-defense-weight", type=float, default=1.0,
                    help="scale on +/-dpp for a resolved defence (hold/loss)")
+    p.add_argument("--credit-lost-race-weight", type=float, default=0.0,
+                   help="penalty scale on -dpp(target) when a rival captures a "
+                        "planet my fleets were committed to (campaign ledger)")
+    p.add_argument("--credit-fail-weight", type=float, default=0.0,
+                   help="penalty scale on -dpp(target) for attack waves that "
+                        "never capture their target by episode end")
     p.add_argument("--no-shaping", action="store_false", dest="enable_shaping",
                    help="Disable potential-based shaping (terminal reward only).")
     # I/O.
@@ -321,6 +342,8 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = _build_argparser().parse_args(argv)
+    if args.opponent == "frozen" and not args.opponent_ckpt:
+        _build_argparser().error("--opponent frozen requires --opponent-ckpt")
     train_cfg = TrainConfig(
         iterations=args.iterations,
         episodes_per_iter=args.episodes_per_iter,
@@ -329,6 +352,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         learning_rate=args.lr, seed=args.seed, device=args.device,
         routing_cost=args.routing_cost,
         opponent=args.opponent,
+        opponent_ckpt=args.opponent_ckpt,
         scripted_strategy=args.scripted_strategy,
         d_model=args.d_model, n_layers=args.n_layers, aux_owner=args.aux_owner,
         entropy_coef=args.entropy_coef,
@@ -356,6 +380,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         enable_battle_credit=args.enable_battle_credit,
         credit_capture_weight=args.credit_capture_weight,
         credit_defense_weight=args.credit_defense_weight,
+        credit_lost_race_weight=args.credit_lost_race_weight,
+        credit_fail_weight=args.credit_fail_weight,
     )
     train(train_cfg, ppo_cfg, reward_cfg, resume_from=args.resume_from)
 

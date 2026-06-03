@@ -534,6 +534,16 @@ def bernoulli_sample_log_prob(
     probs = torch.sigmoid(logits) * mask_f
     if deterministic:
         sample = (probs > 0.5).to(logits.dtype)
+        # Training samples Bernoulli draws; logits often sit below 0 so every
+        # candidate has sigmoid < 0.5.  Threshold-only decoding would pick NO
+        # targets -> zero launches in watch / frozen-opponent play.  If nothing
+        # clears 0.5, fall back to the single best masked candidate (still
+        # deterministic and reproducible).
+        none_sel = (sample.sum(dim=1) < 0.5) & (mask_f.sum(dim=1) > 0.5)
+        if none_sel.any():
+            best = probs.argmax(dim=1, keepdim=True)
+            pick = torch.zeros_like(sample).scatter_(1, best, 1.0)
+            sample = torch.where(none_sel.unsqueeze(1), pick, sample)
     else:
         sample = torch.bernoulli(probs, generator=generator)
     logp = -F.binary_cross_entropy_with_logits(logits, sample, reduction="none")

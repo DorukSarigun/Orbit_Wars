@@ -89,6 +89,74 @@ def _target_masks(state, p_max: int, player: int) -> "tuple[np.ndarray, np.ndarr
 # ---------------------------------------------------------------------------
 # Action -> concrete env launches
 # ---------------------------------------------------------------------------
+def _comet_remaining_life(p) -> int:
+    """Turns an owned comet stays on the board before it expires (and takes its
+    garrison with it).  ``-1`` if ``p`` is not a comet with a known path."""
+    if not getattr(p, "is_comet", False):
+        return -1
+    path = getattr(p, "comet_path", None)
+    if not path:
+        return -1
+    return (len(path) - 1) - int(getattr(p, "comet_path_index", -1))
+
+
+def _nearest_safe_friendly(comet, friendly, evac_turns: int):
+    """Closest friendly planet to ``comet`` that will not itself expire within
+    ``evac_turns`` (so we never evacuate onto another doomed comet)."""
+    best = None
+    best_d = float("inf")
+    for p in friendly:
+        if int(p.id) == int(comet.id):
+            continue
+        rem = _comet_remaining_life(p)
+        if rem >= 0 and rem <= evac_turns:
+            continue  # destination comet is also about to die
+        d = (float(p.x) - float(comet.x)) ** 2 + (float(p.y) - float(comet.y)) ** 2
+        if d < best_d:
+            best_d = d
+            best = p
+    return best
+
+
+def _comet_evacuation_launches(player, parsed_planets, launches, ids,
+                               angular_velocity, max_speed, evac_turns):
+    """Extra launches that rescue ships stranded on an owned comet about to
+    expire.  Ships already committed off the comet this turn (by the allocator)
+    are subtracted; the rest are sent to the nearest safe friendly planet.
+
+    These are *scripted* logistics moves (like the allocator output) and are
+    deliberately NOT added to the RL launch log -- they carry no policy
+    decision credit; the credit pass already absorbs the comet's disappearance.
+    """
+    if evac_turns <= 0:
+        return []
+    committed: dict = {}
+    for L in launches:
+        if 0 <= L.src < len(ids):
+            sid = int(ids[L.src])
+            committed[sid] = committed.get(sid, 0) + int(L.ships)
+    friendly = [p for p in parsed_planets if int(p.owner) == int(player)]
+    out: list = []
+    for c in parsed_planets:
+        if int(c.owner) != int(player):
+            continue
+        rem = _comet_remaining_life(c)
+        if rem < 0 or rem > evac_turns:
+            continue
+        garrison = int(round(float(c.ships))) - committed.get(int(c.id), 0)
+        if garrison <= 0:
+            continue
+        dest = _nearest_safe_friendly(c, friendly, evac_turns)
+        if dest is None:
+            continue
+        res = compute_launch(c, dest, garrison, parsed_planets, angular_velocity,
+                             max_speed=max_speed)
+        if res is None or int(res["ships"]) <= 0:
+            continue
+        out.append([c.id, float(res["angle"]), int(res["ships"])])
+    return out
+
+
 def action_to_env_launches(
     obs,
     player: int,
@@ -100,6 +168,7 @@ def action_to_env_launches(
     capture_margin: float = 1.0,
     attack_require_full: bool = True,
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
+    comet_evac_turns: int = 2,
 ) -> "tuple[list, list]":
     """Turn one sampled hierarchical action into env launches.
 
@@ -120,26 +189,27 @@ def action_to_env_launches(
     sel = set(attack_targets) | set(defend_targets)
     priority_order = [int(t) for t in order if 0 <= int(t) < n and int(t) in sel]
 
-    if not priority_order:
-        return [], []
-
-    inputs = build_allocator_inputs(
-        obs, player,
-        potential_weight=float(action_row["potential_weight"]),
-        horizon=float(action_row["horizon"]),
-        routing_cost=routing_cost,
-        max_speed=max_speed,
-    )
-    launches = allocate_launches(
-        **inputs,
-        player=player,
-        priority_order=priority_order,
-        attack_targets=attack_targets,
-        defend_targets=defend_targets,
-        commit_fraction=commit_frac,
-        capture_margin=capture_margin,
-        attack_require_full=attack_require_full,
-    )
+    # The RL action may pick no targets, but we still run comet evacuation below
+    # (stranded ships must be rescued regardless of what the policy ordered).
+    launches: list = []
+    if priority_order:
+        inputs = build_allocator_inputs(
+            obs, player,
+            potential_weight=float(action_row["potential_weight"]),
+            horizon=float(action_row["horizon"]),
+            routing_cost=routing_cost,
+            max_speed=max_speed,
+        )
+        launches = allocate_launches(
+            **inputs,
+            player=player,
+            priority_order=priority_order,
+            attack_targets=attack_targets,
+            defend_targets=defend_targets,
+            commit_fraction=commit_frac,
+            capture_margin=capture_margin,
+            attack_require_full=attack_require_full,
+        )
 
     planet_by_id = {int(p.id): p for p in parsed_planets}
     ids = np.asarray(obs.planet_ids).reshape(-1)
@@ -156,6 +226,11 @@ def action_to_env_launches(
         if res is None:
             continue
         env_action.append([src.id, float(res["angle"]), int(res["ships"])])
+
+    # Scripted safety net: evacuate ships off owned comets about to expire.
+    env_action.extend(_comet_evacuation_launches(
+        player, parsed_planets, launches, ids,
+        angular_velocity, max_speed, comet_evac_turns))
     return env_action, launches
 
 
@@ -201,6 +276,11 @@ class RewardConfig:
     enable_battle_credit: bool = False
     credit_capture_weight: float = 1.0  # scale on +dpp(g) for a successful capture
     credit_defense_weight: float = 1.0  # scale on +/-dpp(g) for a resolved defence
+    # Decision-indexed penalties for attacks that never paid off (campaign
+    # ledger; robust to multi-source / staggered arrivals).  Default 0.0 keeps
+    # the credit pass identical to capture/defence-only behaviour.
+    credit_lost_race_weight: float = 0.0  # target captured by a rival mid-assault
+    credit_fail_weight: float = 0.0       # target never captured by episode end
 
 
 def _ship_stock(planets, fleets, *, count_inflight: bool) -> dict:
@@ -414,6 +494,8 @@ def collect_episode(
     routing_cost: bool = True,
     opponent: str = "self_play",
     scripted_strategy: str = "production",
+    frozen_policy: Optional[ReworkedHierarchicalPolicy] = None,
+    frozen_deterministic: bool = True,
 ) -> EpisodeStats:
     """Run one 2-player episode, writing one transition / *policy* player / turn.
 
@@ -429,8 +511,16 @@ def collect_episode(
           1.. run the deterministic ``scripted_strategy`` bot
           (:mod:`reworked_scripted`) and are **not** stored, so PPO only trains
           on the learning agent's transitions against a fixed opponent.
+        * ``"frozen"`` -- player 0 = live ``policy`` (stored); player 1 =
+          ``frozen_policy`` (fixed checkpoint, greedy by default).  Only P0 is
+          trained -- use this to learn against a saved policy (e.g. v5 vs v6).
     """
     from kaggle_environments import make
+    if opponent not in ("self_play", "scripted", "frozen"):
+        raise ValueError(f"unknown opponent={opponent!r}")
+    if opponent == "frozen" and frozen_policy is None:
+        raise ValueError("opponent='frozen' requires frozen_policy")
+
     if opponent == "scripted":
         try:
             from .reworked_scripted import scripted_action_row
@@ -441,8 +531,8 @@ def collect_episode(
     potential_fn = potential_fn or economic_potential
     device = device or torch.device("cpu")
     players = [0, 1]
-    # Which players are scripted (not stored / not trained).
-    scripted_players = set(players[1:]) if opponent == "scripted" else set()
+    # Opponents that act but do not produce training transitions.
+    non_training = set(players[1:]) if opponent in ("scripted", "frozen") else set()
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
@@ -466,7 +556,7 @@ def collect_episode(
     # Decision-indexed delayed credit: capture a ground-truth episode log and a
     # fleet -> decision map, then run a single FIFO attribution pass at the end.
     use_credit = bool(reward_cfg.enable_battle_credit)
-    policy_players = set(players) - scripted_players
+    policy_players = set(players) - non_training
     ep_log = EpisodeLog(max_turns=max_steps, policy_players=policy_players) if use_credit else None
 
     def _finalize_credit(final_turn: int) -> tuple:
@@ -482,6 +572,8 @@ def collect_episode(
             gamma_eco=reward_cfg.gamma_eco, norm=reward_cfg.potential_norm,
             capture_weight=reward_cfg.credit_capture_weight,
             defense_weight=reward_cfg.credit_defense_weight,
+            lost_race_weight=reward_cfg.credit_lost_race_weight,
+            fail_weight=reward_cfg.credit_fail_weight,
         )
         credits, cstats = attribute_credits(ep_log, ccfg)
         for decision_id, c in credits.items():
@@ -514,10 +606,33 @@ def collect_episode(
                                     p_max=P_MAX, f_max=F_MAX, turn=t, max_turns=max_steps)
             parsed = parse_planets(env_obs)
 
-            # Scripted opponent: deterministic action_row, no transition stored.
-            if p in scripted_players:
+            # Fixed opponent (scripted or frozen checkpoint): no transition stored.
+            if p in non_training:
                 batch = pack_reworked_batch([(obs, p)], device=device, p_max=P_MAX)
-                action_row = scripted_action_row(scripted_strategy, batch["states"][0], p, p_max=P_MAX)
+                if opponent == "scripted":
+                    action_row = scripted_action_row(
+                        scripted_strategy, batch["states"][0], p, p_max=P_MAX)
+                else:
+                    attack_np, defend_np = _target_masks(batch["states"][0], P_MAX, p)
+                    with torch.no_grad():
+                        frozen_policy.eval()
+                        act, _, _ = frozen_policy.act(
+                            node_feats=batch["node_feats"],
+                            edge_feats=batch["edge_feats"],
+                            global_feats=batch["global_feats"],
+                            planet_mask=batch["planet_mask"],
+                            attack_mask=torch.from_numpy(attack_np)[None].to(device),
+                            defend_mask=torch.from_numpy(defend_np)[None].to(device),
+                            deterministic=frozen_deterministic,
+                        )
+                    action_row = {
+                        "attack_sel": act["attack_sel"][0].cpu().numpy(),
+                        "defend_sel": act["defend_sel"][0].cpu().numpy(),
+                        "order": act["order"][0].cpu().numpy(),
+                        "commit_frac": act["commit_frac"][0].cpu().numpy(),
+                        "potential_weight": float(act["potential_weight"][0]),
+                        "horizon": float(act["horizon"][0]),
+                    }
                 env_action, _ = action_to_env_launches(
                     obs, p, action_row, parsed, av, routing_cost=routing_cost)
                 env_actions[p] = env_action
