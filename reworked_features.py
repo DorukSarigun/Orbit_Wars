@@ -917,6 +917,89 @@ def edge_features(
     return out
 
 
+DEFAULT_AFFORD_NORM: float = 50.0
+DEFAULT_CAPTURE_MARGIN: float = 1.0
+
+
+def capture_affordability(
+    distance_matrix: np.ndarray,
+    owner: np.ndarray,
+    ships: np.ndarray,
+    production: np.ndarray,
+    *,
+    player: int,
+    incoming_enemy: "np.ndarray | None" = None,
+    board_size: float = DEFAULT_BOARD_SIZE,
+    max_speed: float = DEFAULT_MAX_SHIP_SPEED,
+    capture_margin: float = DEFAULT_CAPTURE_MARGIN,
+    norm: float = DEFAULT_AFFORD_NORM,
+) -> np.ndarray:
+    r"""Per-planet **signed capacity margin** (deployable force − demand), in
+    normalised ship units.
+
+    A single legible channel that mirrors the allocator's demand sizing so the
+    policy can perceive *capacity* — "can I actually afford / hold this?" —
+    without re-deriving the logistics solver from raw channels.  Positive ⇒ a
+    standalone-rational target (we could fund it if we focused); negative ⇒
+    over-reach.  The *joint* budgeting across several selected targets is still
+    the Plackett-Luce ranking + allocator's job; this is only the per-target
+    standalone gauge.
+
+    Deployable mass reachable to planet ``T`` is the agent's total ship stock
+    that could converge on it (all own garrisons except ``T``'s own):
+
+    .. math::
+        \text{reach}(T) = \sum_{h\in\text{mine},\, h\ne T} s_h
+
+    **Attack** (``T`` not mine).  Mirror of the allocator's attack demand
+    (neutrals do not reinforce, enemies do):
+
+    .. math::
+        \text{demand}(T) = s_T + r_T\,\text{eta}_{\min}(T) + \text{margin},\quad
+        r_T = \begin{cases}0 & \text{neutral}\\ \text{prod}_T & \text{enemy}\end{cases}
+
+    with ``eta_min`` the nearest own-source ETA.  Margin ``= reach − demand``.
+    If no own source can reach ``T`` the attack is infeasible ⇒ ``−demand``.
+
+    **Defend** (``T`` mine).  Garrison plus reachable reinforcement against the
+    incoming enemy estimate: ``margin = s_T + reach(T) − incoming(T)``.
+
+    Returns ``(n,)`` ``float32`` margin ``/ norm`` (``~O(1)``).
+    """
+    owner_a = np.asarray(owner).reshape(-1)
+    n = owner_a.shape[0]
+    ships_a = np.asarray(ships, dtype=np.float64).reshape(n)
+    prod_a = np.asarray(production, dtype=np.float64).reshape(n)
+    is_mine = owner_a == int(player)
+    is_neutral = owner_a == -1
+
+    raw = np.asarray(distance_matrix, dtype=np.float64) * float(board_size)  # (n, n)
+    speed = np.asarray(fleet_speed(ships_a, max_speed=max_speed), dtype=np.float64)
+    speed_safe = np.clip(speed, 1e-6, None)
+    eta = raw / speed_safe[:, None]  # eta[h, T] from source h
+
+    # Nearest OWN-source ETA to each target (exclude own garrison h == T).
+    eta_mine = np.where(is_mine[:, None], eta, np.inf)
+    np.fill_diagonal(eta_mine, np.inf)
+    eta_nearest = eta_mine.min(axis=0)            # (n,)
+    has_src = np.isfinite(eta_nearest)
+    eta_for_demand = np.where(has_src, eta_nearest, 0.0)
+
+    total_mine = float(np.where(is_mine, ships_a, 0.0).sum())
+    reach = total_mine - np.where(is_mine, ships_a, 0.0)  # exclude T's own garrison
+
+    reinforce = np.where(is_neutral, 0.0, prod_a)         # neutrals don't reinforce
+    attack_demand = ships_a + reinforce * eta_for_demand + float(capture_margin)
+    margin_attack = np.where(has_src, reach - attack_demand, -attack_demand)
+
+    inc = (np.zeros(n) if incoming_enemy is None
+           else np.asarray(incoming_enemy, dtype=np.float64).reshape(n))
+    margin_defend = ships_a + reach - inc
+
+    margin = np.where(is_mine, margin_defend, margin_attack)
+    return (margin / max(float(norm), 1e-6)).astype(np.float32)
+
+
 def incoming_enemy_estimate(
     distance_matrix: np.ndarray,
     owner: np.ndarray,

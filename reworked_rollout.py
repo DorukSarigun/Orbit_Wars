@@ -45,6 +45,9 @@ try:  # package layout
     from .reworked_features import (
         discounted_production_potential, DEFAULT_GAMMA, DEFAULT_NORM,
     )
+    from .reworked_credit import (
+        EpisodeLog, LaunchRecord, TurnSnapshot, CreditConfig, attribute_credits,
+    )
 except ImportError:  # pragma: no cover - flat layout / direct execution
     from obs_builder import build_observation  # type: ignore
     from feature_extraction import parse_planets, parse_fleets, BOARD_SIZE, DEFAULT_MAX_SHIP_SPEED  # type: ignore
@@ -54,6 +57,9 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
     from reworked_model import ReworkedHierarchicalPolicy  # type: ignore
     from reworked_features import (  # type: ignore
         discounted_production_potential, DEFAULT_GAMMA, DEFAULT_NORM,
+    )
+    from reworked_credit import (  # type: ignore
+        EpisodeLog, LaunchRecord, TurnSnapshot, CreditConfig, attribute_credits,
     )
 
 
@@ -181,6 +187,20 @@ class RewardConfig:
     shaping_weight: float = 1.0
     terminal_weight: float = 1.0
     enable_shaping: bool = True         # ablation switch (shaping on/off)
+    # Behavioural (non-telescoping) cost terms -- these intentionally shift the
+    # optimal policy toward not wasting ships (the telescoping potential alone
+    # weights ship loss at ~1/potential_norm, effectively negligible).
+    loss_norm: float = 50.0             # ship-count scale for the cost terms (~O(1))
+    loss_weight: float = 1.0            # penalty per OWN ship destroyed (combat + sun)
+    launch_weight: float = 0.1          # small penalty per ship committed to a launch
+    # Decision-indexed delayed credit (FIFO inventory accounting, see
+    # :mod:`reworked_credit`).  When on, the production/ownership value of a
+    # planet is credited to the *decision* whose ships fought for it (capture /
+    # defence), so it is removed from the telescoping potential below to avoid
+    # double counting; the ship-stock term stays.
+    enable_battle_credit: bool = False
+    credit_capture_weight: float = 1.0  # scale on +dpp(g) for a successful capture
+    credit_defense_weight: float = 1.0  # scale on +/-dpp(g) for a resolved defence
 
 
 def _ship_stock(planets, fleets, *, count_inflight: bool) -> dict:
@@ -199,6 +219,36 @@ def _ship_stock(planets, fleets, *, count_inflight: bool) -> dict:
             if fl.owner != -1:
                 stock[fl.owner] = stock.get(fl.owner, 0.0) + float(fl.ships)
     return stock
+
+
+def _own_ship_stock(env_obs, player: int, *, count_inflight: bool = True) -> float:
+    """Total ships the player currently controls (garrisons + own in-flight)."""
+    planets = parse_planets(env_obs)
+    fleets = parse_fleets(env_obs) if count_inflight else []
+    stock = _ship_stock(planets, fleets, count_inflight=count_inflight)
+    return float(stock.get(player, 0.0))
+
+
+def _own_production(env_obs, player: int) -> float:
+    """Per-turn ship growth from the player's currently-owned planets."""
+    return float(sum(p.production for p in parse_planets(env_obs) if p.owner == player))
+
+
+def _build_snapshot(env_obs, turn: int) -> "TurnSnapshot":
+    """Ground-truth board snapshot for the offline credit pass.
+
+    Planets / fleets are global (shared across all player observations), so a
+    single canonical observation is enough.
+    """
+    planets = parse_planets(env_obs)
+    fleets = parse_fleets(env_obs)
+    return TurnSnapshot(
+        turn=int(turn),
+        owner={int(p.id): int(p.owner) for p in planets},
+        ships={int(p.id): float(p.ships) for p in planets},
+        production={int(p.id): float(p.production) for p in planets},
+        fleet_ids={int(f.id) for f in fleets},
+    )
 
 
 def economic_potential(env_obs, player: int, remaining_turns: int, cfg: RewardConfig) -> float:
@@ -229,12 +279,19 @@ def economic_potential(env_obs, player: int, remaining_turns: int, cfg: RewardCo
 
     prod = np.array([float(p.production) for p in planets], dtype=np.float64)
     owner = np.array([int(p.owner) for p in planets], dtype=np.int64)
-    # dpp_raw (future ships) on the same currency as ships, then /norm at the end.
-    dpp_raw = np.asarray(
-        discounted_production_potential(prod, int(remaining_turns),
-                                        gamma=cfg.gamma_eco, norm=1.0),
-        dtype=np.float64,
-    )
+    # When decision-indexed battle credit is active the production/ownership
+    # value is attributed per-decision in reworked_credit, so drop it from the
+    # telescoping potential to avoid double counting (ship stock stays).
+    ships_only = cfg.enable_battle_credit
+    if ships_only:
+        dpp_raw = np.zeros_like(prod)
+    else:
+        # dpp_raw (future ships) on the same currency as ships, then /norm at the end.
+        dpp_raw = np.asarray(
+            discounted_production_potential(prod, int(remaining_turns),
+                                            gamma=cfg.gamma_eco, norm=1.0),
+            dtype=np.float64,
+        )
     stock = _ship_stock(planets, fleets, count_inflight=cfg.count_inflight)
 
     def side_value(is_mine: bool) -> float:
@@ -336,6 +393,10 @@ class EpisodeStats:
     rewards: dict = field(default_factory=dict)
     winner: Optional[int] = None
     n_launches: int = 0
+    # Decision-indexed credit diagnostics (0 when battle credit is off).
+    credit_total: float = 0.0
+    n_capture: int = 0
+    n_defense: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -351,24 +412,48 @@ def collect_episode(
     device: Optional[torch.device] = None,
     seed: Optional[int] = None,
     routing_cost: bool = True,
+    opponent: str = "self_play",
+    scripted_strategy: str = "production",
 ) -> EpisodeStats:
-    """Run one 2-player self-play episode, writing one transition / player / turn.
+    """Run one 2-player episode, writing one transition / *policy* player / turn.
 
     Reward = potential-based shaping ``gamma * Phi(s') - Phi(s)`` on the
     pluggable potential ``potential_fn`` (default :func:`economic_potential`),
     plus the terminal win/loss bonus.  ``Phi`` of a terminal state is taken as 0
     (no future), keeping the shaping telescoping and policy-invariant.
+
+    ``opponent``:
+        * ``"self_play"`` (default) -- every player runs the live ``policy`` and
+          every player's transitions are stored (pure self-play).
+        * ``"scripted"`` -- player 0 runs the live ``policy`` (stored); players
+          1.. run the deterministic ``scripted_strategy`` bot
+          (:mod:`reworked_scripted`) and are **not** stored, so PPO only trains
+          on the learning agent's transitions against a fixed opponent.
     """
     from kaggle_environments import make
+    if opponent == "scripted":
+        try:
+            from .reworked_scripted import scripted_action_row
+        except ImportError:  # pragma: no cover - flat layout
+            from reworked_scripted import scripted_action_row  # type: ignore
 
     reward_cfg = reward_cfg or RewardConfig()
     potential_fn = potential_fn or economic_potential
     device = device or torch.device("cpu")
     players = [0, 1]
+    # Which players are scripted (not stored / not trained).
+    scripted_players = set(players[1:]) if opponent == "scripted" else set()
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
+        # kaggle_environments only honours ``randomSeed`` at ``make`` time; the
+        # board is generated lazily on the first ``step`` from the *global* RNG,
+        # which ``make`` itself advances by a variable amount.  Re-seeding the
+        # global RNG right before reset is what actually makes the episode (and
+        # thus the offline credit attribution) reproducible.
+        import random as _random
         env.configuration["randomSeed"] = int(seed)
+        _random.seed(int(seed))
     env.reset(num_agents=2)
     state = env.step([[] for _ in players])
 
@@ -378,12 +463,49 @@ def collect_episode(
     ep_rewards = {p: 0.0 for p in players}
     n_launches = 0
 
+    # Decision-indexed delayed credit: capture a ground-truth episode log and a
+    # fleet -> decision map, then run a single FIFO attribution pass at the end.
+    use_credit = bool(reward_cfg.enable_battle_credit)
+    policy_players = set(players) - scripted_players
+    ep_log = EpisodeLog(max_turns=max_steps, policy_players=policy_players) if use_credit else None
+
+    def _finalize_credit(final_turn: int) -> tuple:
+        """Capture the terminal snapshot and write FIFO battle credit onto the
+        buffer transitions (decision_id == buffer index) before GAE runs.
+
+        Returns ``(credit_total, n_capture, n_defense)`` for diagnostics.
+        """
+        if not use_credit:
+            return 0.0, 0, 0
+        ep_log.add_snapshot(_build_snapshot(obs_of(0), final_turn))
+        ccfg = CreditConfig(
+            gamma_eco=reward_cfg.gamma_eco, norm=reward_cfg.potential_norm,
+            capture_weight=reward_cfg.credit_capture_weight,
+            defense_weight=reward_cfg.credit_defense_weight,
+        )
+        credits, cstats = attribute_credits(ep_log, ccfg)
+        for decision_id, c in credits.items():
+            if 0 <= decision_id < len(buffer):
+                buffer.add_reward(decision_id, reward_cfg.shaping_weight * float(c))
+        return cstats.total, cstats.n_capture, cstats.n_defense_hold + cstats.n_defense_loss
+
     for t in range(max_steps):
         env_actions = [[] for _ in players]
         pending: dict[int, int] = {}   # player -> buffer index
         phi_before: dict[int, float] = {}
+        stock_before: dict[int, float] = {}   # own ship stock before the step
+        prod_before: dict[int, float] = {}    # own production this turn
+        launched_ships: dict[int, int] = {}   # ships committed to launches this turn
         remaining_before = max(0, max_steps - t)
         remaining_after = max(0, max_steps - (t + 1))
+
+        # Credit bookkeeping: snapshot the (global) board the agents act on now
+        # and remember the next fleet id so post-step fleets can be matched.
+        turn_launches: dict[int, list] = {}   # player -> [LaunchRecord, ...]
+        nfid_before = 0
+        if use_credit:
+            ep_log.add_snapshot(_build_snapshot(obs_of(0), t))
+            nfid_before = int(obs_of(0).get("next_fleet_id", 0) or 0)
 
         for p in players:
             env_obs = obs_of(p)
@@ -391,7 +513,20 @@ def collect_episode(
             obs = build_observation(env_obs, player=p, angular_velocity=av,
                                     p_max=P_MAX, f_max=F_MAX, turn=t, max_turns=max_steps)
             parsed = parse_planets(env_obs)
+
+            # Scripted opponent: deterministic action_row, no transition stored.
+            if p in scripted_players:
+                batch = pack_reworked_batch([(obs, p)], device=device, p_max=P_MAX)
+                action_row = scripted_action_row(scripted_strategy, batch["states"][0], p, p_max=P_MAX)
+                env_action, _ = action_to_env_launches(
+                    obs, p, action_row, parsed, av, routing_cost=routing_cost)
+                env_actions[p] = env_action
+                n_launches += len(env_action)
+                continue
+
             phi_before[p] = potential_fn(env_obs, p, remaining_before, reward_cfg)
+            stock_before[p] = _own_ship_stock(env_obs, p, count_inflight=reward_cfg.count_inflight)
+            prod_before[p] = _own_production(env_obs, p)
 
             batch = pack_reworked_batch([(obs, p)], device=device, p_max=P_MAX)
             st0 = batch["states"][0]
@@ -416,6 +551,7 @@ def collect_episode(
                 obs, p, action_row, parsed, av, routing_cost=routing_cost)
             env_actions[p] = env_action
             n_launches += len(env_action)
+            launched_ships[p] = int(sum(L.ships for L in launches))
 
             tr = HierTransition(
                 player=p,
@@ -435,16 +571,71 @@ def collect_episode(
             )
             pending[p] = buffer.add(tr)
 
+            # Build per-fleet launch records (decision_id == buffer index).
+            if use_credit and launches:
+                ids = np.asarray(obs.planet_ids).reshape(-1)
+                owner_by_id = {int(pl.id): int(pl.owner) for pl in parsed}
+                recs = []
+                for L in launches:
+                    if not (0 <= L.src < len(ids) and 0 <= L.tgt < len(ids)):
+                        continue
+                    src_id = int(ids[L.src]); tgt_id = int(ids[L.tgt])
+                    recs.append(LaunchRecord(
+                        decision_id=pending[p], player=p, launch_turn=t,
+                        src_id=src_id, tgt_id=tgt_id, ships=int(L.ships),
+                        is_attack=owner_by_id.get(tgt_id, -1) != p,
+                    ))
+                turn_launches[p] = recs
+
         state = env.step(list(env_actions))
         done = bool(getattr(env, "done", False)) or any(
             getattr(state[p], "status", "ACTIVE") == "DONE" for p in players)
 
-        for p in players:
+        # Match the env fleets just created (id >= nfid_before) to this turn's
+        # launch records by (owner, source, ships); compute_launch preserves the
+        # ship count exactly, so the match is unambiguous up to identical orders.
+        if use_credit and turn_launches:
+            new_fleets = sorted(
+                (f for f in parse_fleets(obs_of(0)) if int(f.id) >= nfid_before),
+                key=lambda f: int(f.id),
+            )
+            for p, recs in turn_launches.items():
+                pool = list(recs)
+                for f in new_fleets:
+                    if int(f.owner) != p:
+                        continue
+                    for k, rec in enumerate(pool):
+                        if rec.fleet_id < 0 and rec.src_id == int(f.from_planet_id) \
+                           and rec.ships == int(f.ships):
+                            rec.fleet_id = int(f.id)
+                            ep_log.add_launch(rec)
+                            pool.pop(k)
+                            break
+
+        for p in pending:  # only policy players have stored transitions
             r = 0.0
             if reward_cfg.enable_shaping:
                 # Phi(terminal) := 0 (no future) -> shaping stays telescoping.
                 phi_after = 0.0 if done else potential_fn(obs_of(p), p, remaining_after, reward_cfg)
                 r += reward_cfg.shaping_weight * (reward_cfg.gamma * phi_after - phi_before[p])
+
+            # Behavioural cost terms (non-telescoping): penalise ships actually
+            # DESTROYED this turn (combat losses, sun crashes, failed attacks)
+            # and a small per-ship launch cost to discourage gratuitous spray.
+            # Launches are internal moves, so destroyed is measured net of the
+            # ships we just committed staying in our (in-flight) stock.
+            norm = max(reward_cfg.loss_norm, 1e-6)
+            if reward_cfg.loss_weight != 0.0:
+                stock_after = (0.0 if done else
+                               _own_ship_stock(obs_of(p), p, count_inflight=reward_cfg.count_inflight))
+                # Terminal stock is unknowable per-player here; skip loss term on
+                # the final turn (terminal win/loss already dominates then).
+                if not done:
+                    destroyed = max(0.0, stock_before[p] + prod_before[p] - stock_after)
+                    r -= reward_cfg.loss_weight * destroyed / norm
+            if reward_cfg.launch_weight != 0.0:
+                r -= reward_cfg.launch_weight * float(launched_ships.get(p, 0)) / norm
+
             if done:
                 rp = getattr(state[p], "reward", None)
                 term = float(rp) if rp is not None else 0.0
@@ -459,9 +650,15 @@ def collect_episode(
                 rp = getattr(state[p], "reward", None)
                 rewards[p] = float(rp) if rp is not None else 0.0
             winner = max(rewards, key=rewards.get) if rewards else None
-            return EpisodeStats(length=t + 1, rewards=ep_rewards, winner=winner, n_launches=n_launches)
+            ctot, ncap, ndef = _finalize_credit(t + 1)
+            return EpisodeStats(length=t + 1, rewards=ep_rewards, winner=winner,
+                                n_launches=n_launches, credit_total=ctot,
+                                n_capture=ncap, n_defense=ndef)
 
-    return EpisodeStats(length=max_steps, rewards=ep_rewards, winner=None, n_launches=n_launches)
+    ctot, ncap, ndef = _finalize_credit(max_steps)
+    return EpisodeStats(length=max_steps, rewards=ep_rewards, winner=None,
+                        n_launches=n_launches, credit_total=ctot,
+                        n_capture=ncap, n_defense=ndef)
 
 
 # ---------------------------------------------------------------------------

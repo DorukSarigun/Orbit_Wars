@@ -53,8 +53,8 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
 # Derived per-node metrics appended to the 10 raw standard channels:
 #   discounted_production_potential, closeness_centrality,
 #   potential_threat, potential_support, friendly_compactness
-NUM_DERIVED_NODE_METRICS: int = 5
-REWORKED_NODE_FEATURE_DIM: int = STANDARD_NODE_FEATURE_DIM + NUM_DERIVED_NODE_METRICS  # 15
+NUM_DERIVED_NODE_METRICS: int = 6
+REWORKED_NODE_FEATURE_DIM: int = STANDARD_NODE_FEATURE_DIM + NUM_DERIVED_NODE_METRICS  # 16
 REWORKED_GLOBAL_FEATURE_DIM: int = 14  # mirrors obs_builder.GLOBAL_FEATURE_DIM
 
 _NEG_INF = float("-inf")
@@ -502,12 +502,18 @@ class ReworkedHierarchicalPolicy(nn.Module):
             out["posture_h_alpha"], out["posture_h_beta"], action["posture_u"])
         log_prob = a_logp + d_logp + pl_logp + c_logp + p_logp
 
+        # All terms are per-dimension MEANS (board-size invariant); the two
+        # global posture Betas are averaged so each of the four heads
+        # contributes on the same ~O(0.5 nat) scale.
+        posture_ent = 0.5 * (
+            torch.distributions.Beta(out["posture_pw_alpha"], out["posture_pw_beta"]).entropy()
+            + torch.distributions.Beta(out["posture_h_alpha"], out["posture_h_beta"]).entropy()
+        )
         entropy = (
             bernoulli_entropy(out["attack_logits"], attack_mask)
             + bernoulli_entropy(out["defend_logits"], defend_mask)
             + _beta_entropy(out["commit_alpha"], out["commit_beta"], defend_mask)
-            + torch.distributions.Beta(out["posture_pw_alpha"], out["posture_pw_beta"]).entropy()
-            + torch.distributions.Beta(out["posture_h_alpha"], out["posture_h_beta"]).entropy()
+            + posture_ent
         )
         return {"log_prob": log_prob, "value": out["value"], "entropy": entropy}
 
@@ -546,17 +552,24 @@ def bernoulli_log_prob(
 
 
 def bernoulli_entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Summed Bernoulli entropy over masked candidates ``(B,)``."""
+    """**Mean** Bernoulli entropy over masked candidates ``(B,)``.
+
+    Averaged (not summed) over the valid set so the regulariser scale is
+    board-size invariant (~O(0.5 nat) regardless of how many planets exist).
+    A summed entropy grows with the number of targets, which makes the entropy
+    bonus dwarf the (advantage-driven) policy gradient and pins the policy at
+    maximum randomness — observed as a flat H that never anneals.
+    """
     mask_f = mask.to(logits.dtype)
     ent = torch.distributions.Bernoulli(logits=logits.clamp(-30.0, 30.0)).entropy()
-    return (ent * mask_f).sum(dim=1)
+    return (ent * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
 
 
 def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Summed Beta entropy over masked (own) planets ``(B,)``."""
+    """**Mean** Beta entropy over masked (own) planets ``(B,)`` (see above)."""
     mask_f = mask.to(alpha.dtype)
     ent = torch.distributions.Beta(alpha, beta).entropy()
-    return (ent * mask_f).sum(dim=1)
+    return (ent * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
 
 
 def plackett_luce_sample(

@@ -60,6 +60,7 @@ try:  # package layout
         friendly_compactness,
         edge_features,
         incoming_enemy_estimate,
+        capture_affordability,
         STANDARD_NODE_FEATURE_DIM,
         REWORKED_EDGE_FEATURE_DIM,
         DEFAULT_BOARD_SIZE,
@@ -90,6 +91,7 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
         friendly_compactness,
         edge_features,
         incoming_enemy_estimate,
+        capture_affordability,
         STANDARD_NODE_FEATURE_DIM,
         REWORKED_EDGE_FEATURE_DIM,
         DEFAULT_BOARD_SIZE,
@@ -221,15 +223,18 @@ def board_state_from_obs(
 def build_reworked_node_features(
     state: BoardState,
     *,
+    incoming_enemy: Optional[np.ndarray] = None,
     board_size: float = DEFAULT_BOARD_SIZE,
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     threat_support_norm: float = THREAT_SUPPORT_NORM,
 ) -> np.ndarray:
     """Assemble the ``(n, REWORKED_NODE_FEATURE_DIM)`` node feature matrix.
 
-    Layout: 10 ``standard_node_features`` channels followed by the 5 derived
+    Layout: 10 ``standard_node_features`` channels followed by the 6 derived
     metrics ``[discounted_prod, closeness, potential_threat, potential_support,
-    friendly_compactness]``.
+    friendly_compactness, capture_affordability]``.  ``incoming_enemy`` (raw
+    ship units) sizes the defend side of the affordability margin; if ``None``
+    it is treated as zero (attack-side margins are unaffected).
     """
     n = state.n
     player = state.player
@@ -265,8 +270,14 @@ def build_reworked_node_features(
         friendly_compactness(dist, state.owner, player=player),
         dtype=np.float32,
     ).reshape(n, 1)
+    aff = np.asarray(
+        capture_affordability(dist, state.owner, state.ships, state.production,
+                              player=player, incoming_enemy=incoming_enemy,
+                              board_size=board_size, max_speed=max_speed),
+        dtype=np.float32,
+    ).reshape(n, 1)
 
-    node = np.concatenate([std, dpp, clo, thr, sup, cmp_], axis=1)
+    node = np.concatenate([std, dpp, clo, thr, sup, cmp_, aff], axis=1)
     return node.astype(np.float32)
 
 
@@ -308,15 +319,30 @@ def build_reworked_features(
 
     Returns a dict with NumPy arrays:
 
-    * ``node_feats``   ``(n, 15)``
+    * ``node_feats``   ``(n, 16)``
     * ``edge_feats``   ``(n, n, 4)``
     * ``global_feats`` ``(14,)``  (re-uses the existing global block)
     * ``planet_mask``  ``(n,)`` bool (all True; real planets only)
     * ``state``        the :class:`BoardState` (handy for the allocator)
     """
     state = board_state_from_obs(obs, player, remaining_turns=remaining_turns)
+    # incoming_enemy (raw ship units) sizes the defend side of the affordability
+    # margin; computed from the live fleet arrays, same as the allocator sees.
+    incoming = incoming_enemy_estimate(
+        state.distance_matrix, state.owner, state.ships,
+        player=player,
+        fleet_src=obs.fleet_src_slot,
+        fleet_tgt=obs.fleet_tgt_slot,
+        fleet_eta=obs.fleet_eta_raw,
+        fleet_ships=obs.fleet_ships_raw,
+        fleet_is_self=obs.fleet_is_self,
+        fleet_is_enemy=obs.fleet_is_enemy,
+        fleet_mask=obs.fleet_mask,
+        board_size=board_size, max_speed=max_speed,
+    )
     node = build_reworked_node_features(
-        state, board_size=board_size, max_speed=max_speed,
+        state, incoming_enemy=incoming,
+        board_size=board_size, max_speed=max_speed,
         threat_support_norm=threat_support_norm,
     )
     edge = build_reworked_edge_features(obs, state, **(flux_kwargs or {}))

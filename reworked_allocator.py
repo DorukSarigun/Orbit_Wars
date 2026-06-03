@@ -415,11 +415,18 @@ def _allocate_mcf(
     n_priority = len(priority_order)
     dropped: set = set()
 
-    # Outer loop: solve, then drop any attack that cannot be *fully* funded
-    # (a partial attack only wastes ships) and re-solve.  Dropping frees supply
-    # for the remaining targets, so re-solving can complete a previously
-    # starved lower-priority attack.  The active attack set shrinks every
-    # iteration -> terminates.
+    # Outer loop: solve, then drop the SINGLE highest-priority attack that
+    # cannot be *fully* funded, and re-solve.  Critical subtlety: because the
+    # LP fills strictly by priority (lexicographic ``priority_weight``), an
+    # unaffordable *top*-priority target hogs all the supply, starving every
+    # lower target to 0 received.  If we dropped *all* under-funded attacks at
+    # once we would also drop those affordable lower targets that only looked
+    # starved -> the whole allocation collapses to nothing whenever the single
+    # most-expensive target is unaffordable (observed pathology).  Instead we
+    # drop only the blocker (highest priority = smallest ``pos`` among the
+    # under-funded attacks); re-solving lets its freed supply cascade down to
+    # the affordable lower-priority targets.  One drop per iteration -> the
+    # active set strictly shrinks -> terminates.
     flow: dict[tuple[int, int], int] = {}
     act: list = active
     while True:
@@ -438,10 +445,12 @@ def _allocate_mcf(
             received[T] = received.get(T, 0) + s
 
         if attack_require_full:
-            newly = [a["T"] for a in act
+            under = [a for a in act
                      if a["is_attack"] and received.get(a["T"], 0) + 1e-6 < a["need"]]
-            if newly:
-                dropped.update(newly)
+            if under:
+                # Drop only the highest-priority (smallest pos) blocker.
+                blocker = min(under, key=lambda a: a["pos"])
+                dropped.add(blocker["T"])
                 continue
         break
 
@@ -557,6 +566,18 @@ def allocate_launches(
     attack_set = {int(t) for t in attack_targets}
     defend_set = {int(t) for t in defend_targets}
 
+    # Demand-sizing reinforcement rate.  The ``production[T]·ETA`` term in the
+    # attack/defend demand models the defender producing ships while our fleet
+    # flies.  NEUTRAL planets do **not** reinforce (they only grow once owned),
+    # so counting their production rating here over-sizes neutral-capture demand
+    # by ``production·ETA`` -- which can be 2-3x the real cost for distant
+    # targets and makes early expansion far harder than it should be.  Zero it
+    # for neutrals; enemy targets (which do reinforce) and own defended planets
+    # keep their true rate.  ``production`` is only used for demand sizing in the
+    # solvers, so this substitution is globally correct.
+    reinforce_rate = production.copy()
+    reinforce_rate[owner == -1] = 0.0
+
     is_mine, surplus = _compute_surplus(
         owner, ships, player=player, commit_fraction=commit_fraction,
         source_reserve_frac=source_reserve_frac, n=n,
@@ -578,8 +599,8 @@ def allocate_launches(
     )
 
     if use_mcf:
-        return _allocate_mcf(distance_matrix, ships, production, **common)
-    return _allocate_greedy(distance_matrix, ships, production, **common)
+        return _allocate_mcf(distance_matrix, ships, reinforce_rate, **common)
+    return _allocate_greedy(distance_matrix, ships, reinforce_rate, **common)
 
 
 __all__ = ["Launch", "allocate_launches"]

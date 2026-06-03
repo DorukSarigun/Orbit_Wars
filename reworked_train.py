@@ -68,6 +68,10 @@ class TrainConfig:
     seed: int = 0
     device: str = "cpu"
     routing_cost: bool = True
+    # Opponent: "self_play" (all slots = live policy) or "scripted" (slot 0 =
+    # policy, others = deterministic reworked_scripted bot).
+    opponent: str = "self_play"
+    scripted_strategy: str = "production"
     # Model arch (rebuilt on load).
     d_model: int = 128
     n_layers: int = 3
@@ -184,6 +188,8 @@ def train(
                 device=device,
                 seed=seed,
                 routing_cost=train_cfg.routing_cost,
+                opponent=train_cfg.opponent,
+                scripted_strategy=train_cfg.scripted_strategy,
             )
             ep_stats.append(stats)
 
@@ -201,6 +207,9 @@ def train(
         wins_p0 = sum(1 for s in ep_stats if s.winner == 0)
         wins_p1 = sum(1 for s in ep_stats if s.winner == 1)
         timeouts = sum(1 for s in ep_stats if s.winner is None)
+        avg_credit = sum(s.credit_total for s in ep_stats) / n_ep
+        avg_capture = sum(s.n_capture for s in ep_stats) / n_ep
+        avg_defense = sum(s.n_defense for s in ep_stats) / n_ep
         elapsed = time.time() - t0
 
         log = {
@@ -218,6 +227,9 @@ def train(
             "approx_kl": round(ppo_stats.approx_kl, 5),
             "ppo_epochs_run": ppo_stats.epochs_run,
             "learning_rate": optimizer.param_groups[0]["lr"],
+            "credit_total": round(avg_credit, 4),
+            "n_capture": round(avg_capture, 1),
+            "n_defense": round(avg_defense, 1),
             "elapsed_sec": round(elapsed, 1),
         }
         with log_path.open("a") as fp:
@@ -228,7 +240,9 @@ def train(
               f"P0={wins_p0} P1={wins_p1} TO={timeouts} | "
               f"polL={log['policy_loss']:+.4f} valL={log['value_loss']:.4f} "
               f"H={log['entropy']:.3f} KL={log['approx_kl']:.4f} "
-              f"e={ppo_stats.epochs_run}/{ppo_cfg.epochs} ({elapsed:.1f}s)")
+              + (f"cr={log['credit_total']:+.3f} cap={log['n_capture']:.1f} "
+                 f"def={log['n_defense']:.1f} " if reward_cfg.enable_battle_credit else "")
+              + f"e={ppo_stats.epochs_run}/{ppo_cfg.epochs} ({elapsed:.1f}s)")
 
         if (it + 1) % train_cfg.checkpoint_every == 0 or it == train_cfg.iterations - 1:
             ckpt_dir = Path(train_cfg.checkpoint_dir)
@@ -256,6 +270,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cpu")
     p.add_argument("--no-routing-cost", action="store_false", dest="routing_cost",
                    help="Disable the metric-based allocator routing cost matrix.")
+    p.add_argument("--opponent", choices=["self_play", "scripted"], default="self_play",
+                   help="self_play: all slots run the live policy. "
+                        "scripted: slot 0 = policy (trained), others = scripted bot.")
+    p.add_argument("--scripted-strategy", default="production",
+                   help="Scripted bot strategy when --opponent=scripted "
+                        "(see reworked_scripted.SCRIPTED_STRATEGIES).")
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--n-layers", type=int, default=3)
     p.add_argument("--no-aux-owner", action="store_false", dest="aux_owner",
@@ -275,6 +295,20 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--shaping-weight", type=float, default=1.0)
     p.add_argument("--terminal-weight", type=float, default=1.0)
     p.add_argument("--ship-weight", type=float, default=1.0)
+    p.add_argument("--loss-weight", type=float, default=1.0,
+                   help="penalty per OWN ship destroyed (combat + sun)")
+    p.add_argument("--launch-weight", type=float, default=0.1,
+                   help="small penalty per ship committed to a launch")
+    p.add_argument("--loss-norm", type=float, default=50.0,
+                   help="ship-count scale for the loss/launch cost terms")
+    p.add_argument("--battle-credit", action="store_true", dest="enable_battle_credit",
+                   help="decision-indexed delayed credit via FIFO inventory accounting "
+                        "(captures/defences credited to the deciding turn; drops the "
+                        "production term from the potential to avoid double counting)")
+    p.add_argument("--credit-capture-weight", type=float, default=1.0,
+                   help="scale on +dpp(target) for a successful capture")
+    p.add_argument("--credit-defense-weight", type=float, default=1.0,
+                   help="scale on +/-dpp for a resolved defence (hold/loss)")
     p.add_argument("--no-shaping", action="store_false", dest="enable_shaping",
                    help="Disable potential-based shaping (terminal reward only).")
     # I/O.
@@ -294,6 +328,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         gamma=args.gamma, gae_lambda=args.gae_lambda,
         learning_rate=args.lr, seed=args.seed, device=args.device,
         routing_cost=args.routing_cost,
+        opponent=args.opponent,
+        scripted_strategy=args.scripted_strategy,
         d_model=args.d_model, n_layers=args.n_layers, aux_owner=args.aux_owner,
         entropy_coef=args.entropy_coef,
         entropy_coef_final=args.entropy_coef_final,
@@ -314,6 +350,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         terminal_weight=args.terminal_weight,
         ship_weight=args.ship_weight,
         enable_shaping=args.enable_shaping,
+        loss_weight=args.loss_weight,
+        launch_weight=args.launch_weight,
+        loss_norm=args.loss_norm,
+        enable_battle_credit=args.enable_battle_credit,
+        credit_capture_weight=args.credit_capture_weight,
+        credit_defense_weight=args.credit_defense_weight,
     )
     train(train_cfg, ppo_cfg, reward_cfg, resume_from=args.resume_from)
 
