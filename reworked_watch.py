@@ -10,6 +10,10 @@ Usage::
     python -m reworked_watch --ckpt checkpoints_reworked_scripted/latest.pt \
         --opponent scripted --html replay.html
     python -m reworked_watch --ckpt .../latest.pt --opponent self_play --html r.html
+    # P0 vs a second checkpoint (e.g. v5 vs v6):
+    python -m reworked_watch --ckpt checkpoints_reworked_v5/policy_iter00139.pt \
+        --ckpt-p1 checkpoints_reworked_v6_credit/policy_iter00139.pt \
+        --opponent policy --html v5_vs_v6.html
 """
 
 from __future__ import annotations
@@ -80,6 +84,7 @@ def record_game_html(
     policy,
     out_path: str | Path,
     *,
+    policy_p1: Optional[torch.nn.Module] = None,
     max_steps: int = 300,
     opponent: str = "scripted",
     scripted_strategy: str = "production",
@@ -90,15 +95,26 @@ def record_game_html(
 ) -> dict:
     """Play one game and write the native interactive HTML replay."""
     from kaggle_environments import make
+    import random as _random
 
     device = device or torch.device("cpu")
     policy.eval().to(device)
+    if policy_p1 is not None:
+        policy_p1.eval().to(device)
     players = [0, 1]
-    scripted_players = {1} if opponent == "scripted" else set()
+    if opponent == "scripted":
+        scripted_players = {1}
+    elif opponent == "policy":
+        if policy_p1 is None:
+            raise ValueError("opponent='policy' requires policy_p1 (use --ckpt-p1).")
+        scripted_players = set()
+    else:
+        scripted_players = set()
 
     env = make("orbit_wars", debug=False)
     if seed is not None:
         env.configuration["randomSeed"] = int(seed)
+        _random.seed(int(seed))
     env.reset(num_agents=2)
     state = env.step([[] for _ in players])
 
@@ -110,6 +126,10 @@ def record_game_html(
                 env_obs = state[p]["observation"]
                 if p in scripted_players:
                     ea = _scripted_env_action(env_obs, p, t, max_steps, device, scripted_strategy)
+                elif opponent == "policy" and p == 1:
+                    ea = _policy_env_action(policy_p1, env_obs, p, t, max_steps, device, deterministic)
+                elif opponent == "self_play":
+                    ea = _policy_env_action(policy, env_obs, p, t, max_steps, device, deterministic)
                 else:
                     ea = _policy_env_action(policy, env_obs, p, t, max_steps, device, deterministic)
                 env_actions.append(ea)
@@ -135,8 +155,13 @@ def record_game_html(
         "html_size_kb": round(len(html) / 1024, 1),
     }
     if verbose:
-        who = "policy(P0)" if winner == 0 else (f"P{winner}" if winner >= 0 else "DRAW")
-        opp = f"vs {scripted_strategy} bot" if opponent == "scripted" else "self-play"
+        who = "P0" if winner == 0 else (f"P{winner}" if winner >= 0 else "DRAW")
+        if opponent == "scripted":
+            opp = f"vs {scripted_strategy} bot"
+        elif opponent == "policy":
+            opp = "vs policy(P1)"
+        else:
+            opp = "self-play"
         print(f"[replay] {who} wins @ step {t+1} ({opp}) -> {out_path} "
               f"({summary['html_size_kb']} KB)")
     return summary
@@ -146,7 +171,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(description="Watch a trained reworked policy (HTML replay)")
     p.add_argument("--ckpt", required=True, help="Path to a reworked checkpoint .pt")
     p.add_argument("--html", default="replay.html", help="Output HTML replay path")
-    p.add_argument("--opponent", choices=["self_play", "scripted"], default="scripted")
+    p.add_argument("--opponent", choices=["self_play", "scripted", "policy"], default="scripted",
+                   help="'policy' = P0 uses --ckpt, P1 uses --ckpt-p1 (two checkpoints).")
+    p.add_argument("--ckpt-p1", default=None,
+                   help="Second checkpoint for player 1 (--opponent policy).")
     p.add_argument("--scripted-strategy", default="production")
     p.add_argument("--max-steps", type=int, default=300)
     p.add_argument("--seed", type=int, default=None)
@@ -158,12 +186,18 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     device = torch.device(args.device)
     policy, _ = load_checkpoint(args.ckpt, device=device)
+    policy_p1 = None
+    if args.opponent == "policy":
+        if not args.ckpt_p1:
+            p.error("--opponent policy requires --ckpt-p1")
+        policy_p1, _ = load_checkpoint(args.ckpt_p1, device=device)
 
     base = Path(args.html)
     for g in range(args.games):
         out = base if args.games == 1 else base.with_name(f"{base.stem}_{g:03d}{base.suffix}")
         record_game_html(
             policy, out,
+            policy_p1=policy_p1,
             max_steps=args.max_steps,
             opponent=args.opponent,
             scripted_strategy=args.scripted_strategy,
