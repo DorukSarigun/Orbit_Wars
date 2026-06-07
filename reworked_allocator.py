@@ -74,6 +74,12 @@ class Launch:
     tgt: int      # target planet slot
     ships: int    # ship count to send
     kind: str     # "attack" or "defend" (the demand this launch serves)
+    # Launch heading (radians) once the launch is realised into an env fleet.
+    # Set by ``*_to_env`` after ``compute_launch``; used to disambiguate the
+    # env-fleet -> decision matching when two launches leave the same source with
+    # the same ship count but head to different targets (the target itself is not
+    # carried on the env fleet, but the heading uniquely encodes it).
+    angle: float = 0.0
 
 
 def _eta_matrix_from_surplus(

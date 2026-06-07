@@ -1000,6 +1000,88 @@ def capture_affordability(
     return (margin / max(float(norm), 1e-6)).astype(np.float32)
 
 
+def eta_aware_capture_value(
+    distance_matrix: np.ndarray,
+    owner: np.ndarray,
+    ships: np.ndarray,
+    production: np.ndarray,
+    *,
+    player: int,
+    remaining_turns: "int | np.ndarray",
+    incoming_enemy: "np.ndarray | None" = None,
+    board_size: float = DEFAULT_BOARD_SIZE,
+    max_speed: float = DEFAULT_MAX_SHIP_SPEED,
+    capture_margin: float = DEFAULT_CAPTURE_MARGIN,
+    gamma: float = DEFAULT_GAMMA,
+    value_norm: float = DEFAULT_NORM,
+    eps: float = 1.0,
+) -> np.ndarray:
+    r"""Per-target **ETA-aware, cost-normalised capture value** ("bang for buck").
+
+    ``incoming_enemy`` is accepted for signature parity with
+    :func:`capture_affordability` (so the pipeline can pass the same array) but
+    is unused here: this is an *offensive* value (attack demand sizing), whereas
+    ``incoming_enemy`` sizes the *defensive* side.
+
+    .. math::
+        \text{rate}(T) = \frac{V(T)\,\gamma^{\text{eta}_{\min}(T)}}
+                              {\text{demand}(T) + \varepsilon}
+
+    where
+
+    * ``V(T)`` is :func:`discounted_production_potential` — the planet's
+      intrinsic economic worth (production over the remaining horizon).
+    * :math:`\gamma^{\text{eta}_{\min}(T)}` is the **arrival discount** using the
+      nearest own-source ETA, so a *nearby* high-value target outranks a *far*
+      one of equal production (it starts producing for us sooner).  This closes
+      the time-value gap in the raw ``dpp`` channel, which is ETA-blind.
+    * ``demand(T)`` mirrors the allocator's full-capture cost (garrison +
+      reinforcement over ETA + margin), so the channel is **cost-normalised**:
+      cheap-and-valuable targets float to the top.
+
+    The point of this single fused channel is to hand the Plackett-Luce priority
+    head a direct "valuable + close + affordable" signal instead of forcing it
+    to re-derive that trade-off from ``dpp`` / affordability / threat separately
+    (the source of the observed under-prioritisation of nearby high-production
+    planets).
+
+    Owned planets and targets unreachable by any own source return ``0`` (not a
+    capture opportunity).  Returns ``(n,)`` ``float32``, non-negative.
+    """
+    owner_a = np.asarray(owner).reshape(-1)
+    n = owner_a.shape[0]
+    ships_a = np.asarray(ships, dtype=np.float64).reshape(n)
+    prod_a = np.asarray(production, dtype=np.float64).reshape(n)
+    is_mine = owner_a == int(player)
+    is_neutral = owner_a == -1
+
+    raw = np.asarray(distance_matrix, dtype=np.float64) * float(board_size)  # (n, n)
+    speed = np.asarray(fleet_speed(ships_a, max_speed=max_speed), dtype=np.float64)
+    speed_safe = np.clip(speed, 1e-6, None)
+    eta = raw / speed_safe[:, None]  # eta[h, T] from source h
+
+    eta_mine = np.where(is_mine[:, None], eta, np.inf)
+    np.fill_diagonal(eta_mine, np.inf)
+    eta_nearest = eta_mine.min(axis=0)            # (n,)
+    has_src = np.isfinite(eta_nearest)
+    eta_for_demand = np.where(has_src, eta_nearest, 0.0)
+
+    # Allocator-mirrored full-capture demand (neutrals don't reinforce).
+    reinforce = np.where(is_neutral, 0.0, prod_a)
+    demand = ships_a + reinforce * eta_for_demand + float(capture_margin)
+
+    value = np.asarray(
+        discounted_production_potential(
+            prod_a, remaining_turns, gamma=gamma, norm=value_norm),
+        dtype=np.float64,
+    ).reshape(n)
+    arrival_discount = np.power(float(gamma), np.clip(eta_for_demand, 0.0, None))
+
+    rate = value * arrival_discount / (demand + float(eps))
+    rate = np.where(is_mine | (~has_src), 0.0, rate)
+    return rate.astype(np.float32)
+
+
 def incoming_enemy_estimate(
     distance_matrix: np.ndarray,
     owner: np.ndarray,

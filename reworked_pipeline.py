@@ -61,6 +61,7 @@ try:  # package layout
         edge_features,
         incoming_enemy_estimate,
         capture_affordability,
+        eta_aware_capture_value,
         STANDARD_NODE_FEATURE_DIM,
         REWORKED_EDGE_FEATURE_DIM,
         DEFAULT_BOARD_SIZE,
@@ -92,6 +93,7 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
         edge_features,
         incoming_enemy_estimate,
         capture_affordability,
+        eta_aware_capture_value,
         STANDARD_NODE_FEATURE_DIM,
         REWORKED_EDGE_FEATURE_DIM,
         DEFAULT_BOARD_SIZE,
@@ -227,14 +229,22 @@ def build_reworked_node_features(
     board_size: float = DEFAULT_BOARD_SIZE,
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     threat_support_norm: float = THREAT_SUPPORT_NORM,
+    include_value_rate: bool = False,
 ) -> np.ndarray:
-    """Assemble the ``(n, REWORKED_NODE_FEATURE_DIM)`` node feature matrix.
+    """Assemble the ``(n, node_dim)`` node feature matrix.
 
     Layout: 10 ``standard_node_features`` channels followed by the 6 derived
     metrics ``[discounted_prod, closeness, potential_threat, potential_support,
     friendly_compactness, capture_affordability]``.  ``incoming_enemy`` (raw
     ship units) sizes the defend side of the affordability margin; if ``None``
     it is treated as zero (attack-side margins are unaffected).
+
+    When ``include_value_rate`` is True an extra channel
+    ``eta_aware_capture_value`` is appended (``node_dim =
+    REWORKED_NODE_FEATURE_DIM + 1``): an ETA- and cost-normalised "bang for
+    buck" target value that lets the priority head rank nearby high-production
+    captures directly.  Default off keeps the legacy
+    ``REWORKED_NODE_FEATURE_DIM`` layout byte-for-byte unchanged.
     """
     n = state.n
     player = state.player
@@ -277,7 +287,19 @@ def build_reworked_node_features(
         dtype=np.float32,
     ).reshape(n, 1)
 
-    node = np.concatenate([std, dpp, clo, thr, sup, cmp_, aff], axis=1)
+    channels = [std, dpp, clo, thr, sup, cmp_, aff]
+    if include_value_rate:
+        vrate = np.asarray(
+            eta_aware_capture_value(
+                dist, state.owner, state.ships, state.production,
+                player=player, remaining_turns=state.remaining_turns,
+                incoming_enemy=incoming_enemy,
+                board_size=board_size, max_speed=max_speed),
+            dtype=np.float32,
+        ).reshape(n, 1)
+        channels.append(vrate)
+
+    node = np.concatenate(channels, axis=1)
     return node.astype(np.float32)
 
 
@@ -314,6 +336,7 @@ def build_reworked_features(
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     threat_support_norm: float = THREAT_SUPPORT_NORM,
     flux_kwargs: Optional[dict] = None,
+    include_value_rate: bool = False,
 ) -> dict:
     """Full single-observation feature bundle for the reworked encoder.
 
@@ -344,6 +367,7 @@ def build_reworked_features(
         state, incoming_enemy=incoming,
         board_size=board_size, max_speed=max_speed,
         threat_support_norm=threat_support_norm,
+        include_value_rate=include_value_rate,
     )
     edge = build_reworked_edge_features(obs, state, **(flux_kwargs or {}))
     glob = np.asarray(obs.global_feats, dtype=np.float32).reshape(-1)
@@ -366,6 +390,7 @@ def pack_reworked_batch(
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     threat_support_norm: float = THREAT_SUPPORT_NORM,
     flux_kwargs: Optional[dict] = None,
+    include_value_rate: bool = False,
 ) -> dict:
     """Pack ``(obs, player)`` pairs into batched torch tensors for the encoder.
 
@@ -388,6 +413,7 @@ def pack_reworked_batch(
             board_size=board_size, max_speed=max_speed,
             threat_support_norm=threat_support_norm,
             flux_kwargs=flux_kwargs,
+            include_value_rate=include_value_rate,
         )
         for (obs, player) in obs_player_pairs
     ]
@@ -396,7 +422,8 @@ def pack_reworked_batch(
     ns = [b["state"].n for b in bundles]
     P = int(p_max) if p_max is not None else max(ns + [1])
 
-    node = np.zeros((B, P, REWORKED_NODE_FEATURE_DIM), dtype=np.float32)
+    node_dim = REWORKED_NODE_FEATURE_DIM + (1 if include_value_rate else 0)
+    node = np.zeros((B, P, node_dim), dtype=np.float32)
     edge = np.zeros((B, P, P, REWORKED_EDGE_FEATURE_DIM), dtype=np.float32)
     glob = np.zeros((B, REWORKED_GLOBAL_FEATURE_DIM), dtype=np.float32)
     mask = np.zeros((B, P), dtype=bool)

@@ -88,8 +88,13 @@ class LaunchRecord:
     tgt_id: int
     ships: int
     is_attack: bool          # target not owned by the player at launch time
+    angle: float = 0.0       # launch heading (rad); disambiguates same-source,
+                             # same-ships fleets that head to different targets
     fleet_id: int = -1       # env fleet id, filled after the step
     resolve_turn: int = -1   # turn the fleet left the board (filled offline)
+    campaign_id: int = -1    # remastered multi-turn attack campaign (edge v10)
+    t_local: int = -1        # target slot index (edge policy) — credit key
+    src_under_threat: bool = False  # source had enemy fleets inbound at launch time
 
 
 @dataclass
@@ -103,18 +108,37 @@ class TurnSnapshot:
 
 
 @dataclass
+class TurnDecision:
+    """Maps a policy turn to its stored buffer index (edge / hier transition)."""
+    player: int
+    turn: int
+    record_idx: int
+
+
+@dataclass
 class EpisodeLog:
     """Everything the offline credit pass needs; filled during the rollout."""
     max_turns: int
     snapshots: list = field(default_factory=list)        # list[TurnSnapshot], one per turn (+1 terminal)
     launches: list = field(default_factory=list)         # list[LaunchRecord]
     policy_players: set = field(default_factory=set)      # players whose transitions are stored
+    decisions: list = field(default_factory=list)        # list[TurnDecision]
+    planet_slot: dict = field(default_factory=dict)      # planet_id -> padded slot index
 
     def add_snapshot(self, snap: TurnSnapshot) -> None:
         self.snapshots.append(snap)
 
     def add_launch(self, rec: LaunchRecord) -> None:
         self.launches.append(rec)
+
+    def add_decision(self, player: int, turn: int, record_idx: int) -> None:
+        self.decisions.append(TurnDecision(int(player), int(turn), int(record_idx)))
+
+    def record_idx_at(self, player: int, turn: int) -> int:
+        for d in reversed(self.decisions):
+            if d.player == int(player) and d.turn == int(turn):
+                return int(d.record_idx)
+        return -1
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +212,35 @@ class CreditConfig:
     # never charged.
     lost_race_weight: float = 0.0
     fail_weight: float = 0.0
+    # Over-extension / source-loss penalty.  A launch removes ships from its
+    # SOURCE planet; if that source is then lost shortly after, the ships that
+    # *left* escaped the defence-loss penalty (only the ships that stayed are
+    # charged today).  This term charges the decisions that recently stripped a
+    # planet *that subsequently fell*, so over-extending a threatened/valuable
+    # base is penalised -- while still allowing a deliberate sacrifice (the
+    # capture/defence gain elsewhere can outweigh it).  Applies to ALL outgoing
+    # launches (attack and reinforcement alike).  Default 0.0 keeps the pass
+    # identical to before unless enabled.
+    #   * ``source_loss_weight``  -- scale on -dpp(source) charged to recent strips.
+    #   * ``source_loss_window``  -- only departures within this many turns before
+    #     the fall are blamed (older strips are causally irrelevant).
+    # The penalty is shared between "stayed and died" (the existing defence-loss
+    # term on the consumed garrison ``M``) and "left and weakened it" (this term)
+    # by ship share of ``S + M`` (S = recent departures), so a heavily-stripped
+    # planet blames its strips more and a small strip is barely charged.
+    source_loss_weight: float = 0.0
+    source_loss_window: int = 10
+    # Attack-only airborne opportunity cost (ship-turns in flight).  Small
+    # fleets are slower (``fleet_speed(ships)``) so they spend more turns
+    # aloft; spraying many 1-ship attacks ties up capital longer than one
+    # concentrated wave.  Charged when the fleet resolves (``resolve_turn`` is
+    # known), attributed to the same ``decision_id`` as battle credit.
+    # Penalty per fleet: ``-airborne_weight * ships * airborne_turns / norm``,
+    # where ``airborne_turns = resolve_turn - launch_turn`` (ground-truth from
+    # the episode log).  Reinforcements (``is_attack=False``) are excluded.
+    # Default 0.0 keeps behaviour identical unless enabled.
+    airborne_weight: float = 0.0
+    airborne_norm: float = 50.0
     # Optional extra discount of the realised value back toward the launch turn
     # (1.0 = none; the decision transition is the cause, so default is no extra
     # discount -- GAE already discounts from that transition forward).
@@ -202,10 +255,14 @@ class CreditStats:
     n_defense_loss: int = 0
     n_lost_race: int = 0
     n_fail_attack: int = 0
+    n_source_loss: int = 0
     capture_credit: float = 0.0
     defense_credit: float = 0.0
     lost_race_credit: float = 0.0
     fail_credit: float = 0.0
+    source_loss_credit: float = 0.0
+    n_airborne: int = 0
+    airborne_credit: float = 0.0
 
 
 def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
@@ -254,6 +311,11 @@ def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
     # fail penalties are enabled, so the default pass is unchanged.
     pending_attacks: dict = {}   # planet_id -> list[LaunchRecord]
     track_campaign = bool(cfg.lost_race_weight or cfg.fail_weight)
+    # Source-loss (over-extension) ledger: per-planet record of recent outgoing
+    # decision-tagged departures ``(turn, decision_id, ships)``.  Charged when
+    # the planet is lost; only used when the penalty is enabled.
+    departures: dict = {}        # planet_id -> list[(turn, decision_id, ships)]
+    track_source_loss = bool(cfg.source_loss_weight)
 
     s0 = snaps[0]
     for pid, o in s0.owner.items():
@@ -280,6 +342,10 @@ def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
         for rec in launches_by_turn.get(t, []):
             if rec.src_id in layers and owner.get(rec.src_id) == rec.player:
                 _consume_fifo(layers[rec.src_id], float(rec.ships))
+                # Remember the strip so we can blame it if the source later falls.
+                if track_source_loss and rec.player in log.policy_players:
+                    departures.setdefault(rec.src_id, []).append(
+                        (t, rec.decision_id, float(rec.ships)))
 
         # (1) production: every owned planet grows by its production (NATIVE)
         for pid in list(layers.keys()):
@@ -349,6 +415,25 @@ def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
                     if any(tag != NATIVE for tag in consumed):
                         stats.n_defense_loss += 1
                         stats.defense_credit -= val
+                    # Over-extension: also charge decisions that recently STRIPPED
+                    # this planet (their ships left, so they escaped the defence
+                    # penalty above).  Share -dpp(pid) by ship count of S + M, so
+                    # the strips and the ships that stayed split the blame.
+                    if track_source_loss:
+                        recent = [(dec, sh) for (tt, dec, sh) in departures.get(pid, [])
+                                  if (t - tt) <= cfg.source_loss_window]
+                        S = float(sum(sh for _, sh in recent))
+                        if S > 1e-9:
+                            denom = S + max(0.0, float(M))
+                            by_dec: dict = {}
+                            for dec, sh in recent:
+                                by_dec[dec] = by_dec.get(dec, 0.0) + sh
+                            sval = cfg.source_loss_weight * dpp_of(pid, prod, t)
+                            for dec, sh in by_dec.items():
+                                credit[dec] = credit.get(dec, 0.0) - sval * (sh / denom)
+                            stats.n_source_loss += 1
+                            stats.source_loss_credit -= sval * (S / denom)
+                    departures.pop(pid, None)
                     owner[pid] = o_post
                     layers[pid] = [[NATIVE, s_post]]
 
@@ -417,6 +502,26 @@ def attribute_credits(log: EpisodeLog, cfg: Optional[CreditConfig] = None
             _distribute(credit, by_dec, -val)
             stats.n_fail_attack += 1
             stats.fail_credit -= val
+
+    # Attack-only airborne penalty (after resolve_turn is filled above).
+    if cfg.airborne_weight > 0.0:
+        norm = max(float(cfg.airborne_norm), 1e-6)
+        for rec in log.launches:
+            if (rec.player not in log.policy_players
+                    or not rec.is_attack
+                    or rec.fleet_id < 0
+                    or rec.resolve_turn < 0
+                    or rec.ships <= 0):
+                continue
+            # Ground-truth time in flight: fleet launched at ``launch_turn``,
+            # first appears in snap[launch_turn+1], leaves at ``resolve_turn``.
+            airborne = int(rec.resolve_turn) - int(rec.launch_turn)
+            if airborne < 1:
+                continue
+            val = cfg.airborne_weight * float(rec.ships) * float(airborne) / norm
+            credit[rec.decision_id] = credit.get(rec.decision_id, 0.0) - val
+            stats.n_airborne += 1
+            stats.airborne_credit -= val
 
     # apply optional event discount and finalise
     if cfg.event_discount != 1.0:

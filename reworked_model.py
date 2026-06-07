@@ -298,6 +298,7 @@ class ReworkedHierarchicalPolicy(nn.Module):
             n_layers=n_layers,
             dropout=dropout,
         )
+        self.node_dim = int(node_dim)
         self.d_model = d_model
 
         # Per-planet target heads: input = [node_token, broadcast graph_summary].
@@ -577,6 +578,7 @@ def bernoulli_entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """**Mean** Beta entropy over masked (own) planets ``(B,)`` (see above)."""
+    alpha, beta = _sanitize_beta_params(alpha, beta)
     mask_f = mask.to(alpha.dtype)
     ent = torch.distributions.Beta(alpha, beta).entropy()
     return (ent * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
@@ -691,6 +693,17 @@ def plackett_luce_log_prob(
 
 
 _COMMIT_EPS = 1e-4
+_BETA_PARAM_MAX = 50.0   # cap Beta concentration (prevents log_prob blow-ups in PPO)
+
+
+def _sanitize_beta_params(
+    alpha: torch.Tensor, beta: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Finite, strictly-positive Beta parameters for stable distributions."""
+    lo = 1.0 + _COMMIT_EPS
+    a = torch.nan_to_num(alpha, nan=lo, posinf=_BETA_PARAM_MAX, neginf=lo)
+    b = torch.nan_to_num(beta, nan=lo, posinf=_BETA_PARAM_MAX, neginf=lo)
+    return a.clamp(lo, _BETA_PARAM_MAX), b.clamp(lo, _BETA_PARAM_MAX)
 
 
 def sample_commit_fractions(
@@ -706,11 +719,12 @@ def sample_commit_fractions(
 
     Returns ``(fractions (B, P), log_prob (B,))``.
     """
+    alpha, beta = _sanitize_beta_params(alpha, beta)
     dist = torch.distributions.Beta(alpha, beta)
     frac = dist.rsample() if alpha.requires_grad else dist.sample()
     frac_clamped = frac.clamp(_COMMIT_EPS, 1.0 - _COMMIT_EPS)
     mask = source_mask.to(torch.bool)
-    logp = (dist.log_prob(frac_clamped) * mask).sum(dim=1)
+    logp = (dist.log_prob(frac_clamped) * mask).sum(dim=1).clamp(-40.0, 40.0)
     fractions = torch.where(mask, frac_clamped, torch.zeros_like(frac_clamped))
     return fractions, logp
 
@@ -722,10 +736,11 @@ def commit_fraction_log_prob(
     source_mask: torch.Tensor,       # (B, P) bool
 ) -> torch.Tensor:
     """Masked Beta log-prob of stored commit ``fractions`` (PPO evaluation)."""
+    alpha, beta = _sanitize_beta_params(alpha, beta)
     dist = torch.distributions.Beta(alpha, beta)
     frac = fractions.clamp(_COMMIT_EPS, 1.0 - _COMMIT_EPS)
     mask = source_mask.to(torch.bool)
-    return (dist.log_prob(frac) * mask).sum(dim=1)
+    return (dist.log_prob(frac) * mask).sum(dim=1).clamp(-40.0, 40.0)
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +828,510 @@ def posture_from_norm(u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return _scale_posture(u[..., 0], u[..., 1])
 
 
+# ===========================================================================
+# v8 launch policy: source-centric, allocator-free
+# ===========================================================================
+# Each OWN planet (source) chooses, in one turn:
+#   * commit_h ~ Beta(alpha, beta)              -- garrison fraction to deploy
+#   * split_h  ~ Dirichlet(conc_{h, valid t})   -- distribution over targets
+# and launches ``floor(commit_h * garrison_h * split_{h,t})`` to every target
+# (dropping sub-``min_send`` slivers).  Because the split sums to 1 the per-source
+# committed mass never exceeds the garrison -> feasibility is automatic and no
+# min-cost-flow allocator is needed.  Attack vs. reinforcement is derived from
+# the target's owner, so no separate attack/defend heads are required.
+
+_DIR_CONC_EPS = 1e-3   # concentration floor (keeps Beta/Gamma well-defined)
+_DIR_CONC_MAX = 50.0   # cap Dirichlet concentration (prevents PPO log_prob spikes)
+_DIR_EPS = 1e-6        # numerical floor for logs / denominators
+_LOGP_CLAMP = 40.0     # per-term log-prob clamp for PPO stability
+
+
+def _sanitize_dirichlet_conc(conc: torch.Tensor) -> torch.Tensor:
+    """Finite, strictly-positive Dirichlet concentrations."""
+    c = torch.nan_to_num(conc, nan=_DIR_CONC_EPS, posinf=_DIR_CONC_MAX, neginf=_DIR_CONC_EPS)
+    return c.clamp(_DIR_CONC_EPS, _DIR_CONC_MAX)
+
+
+def _dirichlet_row_logp(
+    conc: torch.Tensor,   # (B, P, P) concentration (rows = sources, cols = targets)
+    x: torch.Tensor,      # (B, P, P) simplex weights per source row
+    valid: torch.Tensor,  # (B, P, P) bool: valid (source, target) pairs
+) -> torch.Tensor:
+    r"""Per-row masked Dirichlet log-density ``(B, P)``.
+
+    .. math::
+        \log p(x \mid a) = \log\Gamma(\textstyle\sum_i a_i)
+            - \sum_i \log\Gamma(a_i) + \sum_i (a_i - 1)\log x_i
+
+    summed only over the valid columns of each source row.  Invalid columns are
+    excluded (they contribute nothing to either the normaliser or the kernel).
+    """
+    vf = valid.to(conc.dtype)
+    a_sum = (conc * vf).sum(dim=2)                                  # (B, P)
+    sum_lgamma = (torch.lgamma(conc.clamp_min(_DIR_EPS)) * vf).sum(dim=2)
+    xv = x.clamp_min(_DIR_EPS)
+    kernel = ((conc - 1.0) * torch.log(xv) * vf).sum(dim=2)        # (B, P)
+    return (torch.lgamma(a_sum.clamp_min(_DIR_EPS)) - sum_lgamma + kernel).clamp(
+        -_LOGP_CLAMP, _LOGP_CLAMP)
+
+
+def masked_dirichlet_log_prob(
+    conc: torch.Tensor,   # (B, P, P)
+    x: torch.Tensor,      # (B, P, P)
+    valid: torch.Tensor,  # (B, P, P) bool
+) -> torch.Tensor:
+    """Summed masked Dirichlet log-prob over source rows ``(B,)`` (PPO eval)."""
+    conc = _sanitize_dirichlet_conc(conc)
+    x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
+    row = _dirichlet_row_logp(conc, x, valid)                      # (B, P)
+    row_valid = valid.any(dim=2)                                   # (B, P) source rows
+    return (row * row_valid.to(row.dtype)).sum(dim=1).clamp(-_LOGP_CLAMP, _LOGP_CLAMP)
+
+
+def masked_dirichlet_sample_log_prob(
+    conc: torch.Tensor,   # (B, P, P)
+    valid: torch.Tensor,  # (B, P, P) bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample a per-row Dirichlet split over valid targets + its log-prob.
+
+    Draws via the Gamma construction: ``g_t ~ Gamma(conc_t, 1)``, zero the
+    invalid columns, then normalise each row over its valid columns.  Returns
+    ``(weights (B, P, P) with 0 on invalid cols, log_prob (B,))``.
+    """
+    conc = _sanitize_dirichlet_conc(conc)
+    conc_pos = conc.clamp_min(_DIR_EPS)
+    dist = torch.distributions.Gamma(conc_pos, torch.ones_like(conc_pos))
+    g = dist.rsample() if conc.requires_grad else dist.sample()
+    vf = valid.to(conc.dtype)
+    g = g * vf
+    denom = g.sum(dim=2, keepdim=True).clamp_min(_DIR_EPS)
+    w = g / denom
+    return w, masked_dirichlet_log_prob(conc, w, valid)
+
+
+def masked_dirichlet_mean(
+    conc: torch.Tensor,   # (B, P, P)
+    valid: torch.Tensor,  # (B, P, P) bool
+) -> torch.Tensor:
+    """Deterministic Dirichlet mean ``a / sum(a)`` per row (0 on invalid cols)."""
+    conc = _sanitize_dirichlet_conc(conc)
+    vf = valid.to(conc.dtype)
+    a = conc * vf
+    a0 = a.sum(dim=2, keepdim=True).clamp_min(_DIR_EPS)
+    return a / a0
+
+
+def masked_dirichlet_entropy(
+    conc: torch.Tensor,   # (B, P, P)
+    valid: torch.Tensor,  # (B, P, P) bool
+) -> torch.Tensor:
+    r"""**Mean** masked Dirichlet entropy over source rows ``(B,)``.
+
+    Closed form ``H(a) = \log B(a) + (a_0 - K)\psi(a_0)
+    - \sum_i (a_i - 1)\psi(a_i)`` restricted to the valid columns (``K`` of
+    them).  Each row's entropy is divided by its support size ``K`` and then
+    averaged over source rows, so the regulariser stays ~O(1) per dimension and
+    board-size invariant -- mirroring the per-dimension *mean* convention of
+    :func:`bernoulli_entropy` / :func:`_beta_entropy` (a raw Dirichlet entropy
+    scales with the number of targets and would otherwise dwarf the policy
+    gradient / pin the policy at maximum spread).
+    """
+    conc = _sanitize_dirichlet_conc(conc)
+    vf = valid.to(conc.dtype)
+    a0 = (conc * vf).sum(dim=2)                                    # (B, P)
+    K = vf.sum(dim=2)                                              # (B, P)
+    sum_lgamma = (torch.lgamma(conc.clamp_min(_DIR_EPS)) * vf).sum(dim=2)
+    log_beta = sum_lgamma - torch.lgamma(a0.clamp_min(_DIR_EPS))
+    dig_a0 = torch.digamma(a0.clamp_min(_DIR_EPS))
+    sum_term = ((conc - 1.0) * torch.digamma(conc.clamp_min(_DIR_EPS)) * vf).sum(dim=2)
+    H = log_beta + (a0 - K) * dig_a0 - sum_term                   # (B, P)
+    H = H / K.clamp_min(1.0)                                      # per-dimension scale
+    row_valid = valid.any(dim=2).to(conc.dtype)                   # (B, P)
+    denom = row_valid.sum(dim=1).clamp_min(1.0)
+    return (H * row_valid).sum(dim=1) / denom
+
+
+class ReworkedLaunchPolicy(nn.Module):
+    r"""Allocator-free, source-centric launch policy (v8).
+
+    The agent decides launches **directly**: for every own planet (source) it
+    samples a garrison commit fraction ``Beta(alpha, beta)`` and a target
+    distribution ``Dirichlet`` over the reachable planets, then sends
+    ``floor(commit * garrison * split_t)`` ships to each target.  This replaces
+    the hierarchical ``attack/defend`` Bernoulli + Plackett-Luce ordering +
+    per-source commit + global posture heads of :class:`ReworkedHierarchicalPolicy`
+    and removes the min-cost-flow allocator entirely (feasibility is automatic
+    because the per-source split is a simplex).
+
+    Heads only read the encoder's equivariant ``node_tokens`` / ``edge_tokens``
+    and invariant ``graph_summary`` (no index parameters), so the policy is
+    permutation-symmetric.  The Dirichlet concentration is an **additive** edge
+    score (source bias + target bias + low-rank interaction + edge term) to
+    avoid materialising a ``(B, P, P, 4d)`` concatenation.
+
+    Per-turn action log-prob::
+
+        log_prob = Sum_{h in own} [ Beta(commit_h) + Dirichlet(split_h) ]
+    """
+
+    def __init__(
+        self,
+        *,
+        node_dim: int = REWORKED_NODE_FEATURE_DIM,
+        edge_dim: int = REWORKED_EDGE_FEATURE_DIM,
+        global_dim: int = REWORKED_GLOBAL_FEATURE_DIM,
+        d_model: int = 128,
+        n_layers: int = 3,
+        dropout: float = 0.0,
+        aux_owner: bool = True,
+        interaction_rank: int = 16,
+    ):
+        super().__init__()
+        self.encoder = ReworkedPlanetGraphEncoder(
+            node_dim=node_dim, edge_dim=edge_dim, global_dim=global_dim,
+            d_model=d_model, n_layers=n_layers, dropout=dropout,
+        )
+        self.node_dim = int(node_dim)
+        self.d_model = d_model
+        r = int(interaction_rank)
+
+        # Per-source commit fraction Beta(alpha, beta).
+        self.commit_head = nn.Sequential(
+            nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 2),
+        )
+        # Dirichlet concentration over targets, built additively (memory-safe):
+        #   conc[h, t] = softplus( src_bias_h + tgt_bias_t
+        #                          + <qs_h, qt_t> + edge_term_{h,t} ) + eps
+        self.dir_src = nn.Linear(2 * d_model, 1)
+        self.dir_tgt = nn.Linear(2 * d_model, 1)
+        self.dir_src_int = nn.Linear(2 * d_model, r)
+        self.dir_tgt_int = nn.Linear(2 * d_model, r)
+        self.dir_edge = nn.Linear(d_model, 1)
+
+        self.value_head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1),
+        )
+        self.aux_owner_head = nn.Linear(d_model, 5) if aux_owner else None
+
+    def forward(
+        self,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        global_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        source_mask: torch.Tensor,        # (B, P) bool: own planets that can send
+    ) -> dict:
+        enc = self.encoder(node_feats, edge_feats, global_feats, planet_mask)
+        tok = torch.nan_to_num(enc["node_tokens"], nan=0.0, posinf=0.0, neginf=0.0)
+        summary = torch.nan_to_num(enc["graph_summary"], nan=0.0, posinf=0.0, neginf=0.0)
+        edge_tok = torch.nan_to_num(enc["edge_tokens"], nan=0.0, posinf=0.0, neginf=0.0)
+        B, P, _ = tok.shape
+
+        s_bc = summary[:, None, :].expand(-1, P, -1)
+        node_in = torch.cat([tok, s_bc], dim=-1)  # (B, P, 2d)
+
+        commit_params = F.softplus(self.commit_head(node_in)) + 1.0   # (B, P, 2)
+        ca = commit_params[..., 0]
+        cb = commit_params[..., 1]
+        src_bool = source_mask.to(torch.bool)
+        ones = torch.ones_like(ca)
+        commit_alpha = torch.where(src_bool, ca, ones)   # non-source -> Beta(1,1)
+        commit_beta = torch.where(src_bool, cb, ones)
+        commit_alpha, commit_beta = _sanitize_beta_params(commit_alpha, commit_beta)
+
+        s = self.dir_src(node_in).squeeze(-1)            # (B, P) source bias
+        t = self.dir_tgt(node_in).squeeze(-1)            # (B, P) target bias
+        qs = self.dir_src_int(node_in)                   # (B, P, r)
+        qt = self.dir_tgt_int(node_in)                   # (B, P, r)
+        inter = torch.einsum("bhr,btr->bht", qs, qt)     # (B, P, P)
+        e = self.dir_edge(edge_tok).squeeze(-1)          # (B, P, P)
+        dir_logit = s[:, :, None] + t[:, None, :] + inter + e
+        dir_conc = _sanitize_dirichlet_conc(F.softplus(dir_logit) + _DIR_CONC_EPS)
+
+        value = self.value_head(summary).squeeze(-1)      # (B,)
+        out = {
+            "commit_alpha": commit_alpha,
+            "commit_beta": commit_beta,
+            "dir_conc": dir_conc,
+            "value": value,
+            "node_tokens": tok,
+        }
+        if self.aux_owner_head is not None:
+            out["aux_owner_logits"] = self.aux_owner_head(tok)   # (B, P, 5)
+        return out
+
+    @torch.no_grad()
+    def act(
+        self,
+        *,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        global_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        source_mask: torch.Tensor,        # (B, P) bool
+        dest_mask: torch.Tensor,          # (B, P, P) bool: valid (source, target)
+        deterministic: bool = False,
+        generator: Optional[torch.Generator] = None,
+    ) -> tuple[dict, torch.Tensor, torch.Tensor]:
+        """Sample (or take the mode of) a full launch action + summed log-prob.
+
+        Returns ``(action, log_prob (B,), value (B,))`` with
+        ``action = {"commit" (B, P), "split_w" (B, P, P)}``.
+        """
+        out = self.forward(node_feats, edge_feats, global_feats, planet_mask, source_mask)
+        ca, cb = out["commit_alpha"], out["commit_beta"]
+        valid = dest_mask.to(torch.bool)
+        src_bool = source_mask.to(torch.bool)
+
+        if deterministic:
+            commit = (ca / (ca + cb)).clamp(_COMMIT_EPS, 1.0 - _COMMIT_EPS)
+            commit = torch.where(src_bool, commit, torch.zeros_like(commit))
+            c_logp = commit_fraction_log_prob(ca, cb, commit, source_mask)
+            w = masked_dirichlet_mean(out["dir_conc"], valid)
+            d_logp = masked_dirichlet_log_prob(out["dir_conc"], w, valid)
+        else:
+            commit, c_logp = sample_commit_fractions(ca, cb, source_mask)
+            w, d_logp = masked_dirichlet_sample_log_prob(out["dir_conc"], valid)
+
+        log_prob = (c_logp + d_logp).clamp(-_LOGP_CLAMP, _LOGP_CLAMP)
+        action = {"commit": commit, "split_w": w}
+        return action, log_prob, out["value"]
+
+    def evaluate_actions(
+        self,
+        *,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        global_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        source_mask: torch.Tensor,
+        dest_mask: torch.Tensor,
+        action: dict,
+    ) -> dict:
+        """Re-evaluate a stored launch ``action`` under current params (PPO)."""
+        out = self.forward(node_feats, edge_feats, global_feats, planet_mask, source_mask)
+        valid = dest_mask.to(torch.bool)
+        c_logp = commit_fraction_log_prob(
+            out["commit_alpha"], out["commit_beta"], action["commit"], source_mask)
+        d_logp = masked_dirichlet_log_prob(out["dir_conc"], action["split_w"], valid)
+        log_prob = (c_logp + d_logp).clamp(-_LOGP_CLAMP, _LOGP_CLAMP)
+        entropy = (
+            _beta_entropy(out["commit_alpha"], out["commit_beta"], source_mask)
+            + masked_dirichlet_entropy(out["dir_conc"], valid)
+        )
+        return {"log_prob": log_prob, "value": out["value"], "entropy": entropy}
+
+
+class ReworkedEdgePolicy(nn.Module):
+    r"""Directed-edge, allocator-free launch policy (v9, per-target credit).
+
+    Every valid directed edge ``h -> t`` is an **independent** decision:
+
+    * ``gate ~ Bernoulli(sigmoid(gate_logit_{h,t}))`` -- send along this edge?
+    * ``frac ~ Beta(a_{h,t}, b_{h,t})`` -- fraction of source ``h``'s garrison to
+      commit (only counts when ``gate = 1``).
+
+    Ships sent ``= floor(frac * garrison_h)``, feasibility-scaled per source at
+    execution time (no hard per-source simplex).  Over-extension is therefore
+    not *forbidden* but *taught*: the source-loss credit term penalises stripping
+    a planet that subsequently falls, so a deliberate sacrifice (capture
+    elsewhere worth more) stays available to the policy.
+
+    Because the per-edge log-prob factorises fully over edges, the joint
+    log-prob partitions cleanly under **any** grouping.  We group by **target**:
+    all edges ``(. -> t)`` form target ``t``'s campaign, so its
+    capture/defence/fail/source-loss credit attaches to a single per-target
+    advantage.  Different sources to the same target share the learning signal
+    (same purpose); different targets are independent.  ``act`` / ``evaluate``
+    therefore return log-prob and entropy **per target** ``(B, P)`` -- not
+    summed -- which the per-campaign PPO objective consumes directly.
+
+    The gate uses an additive low-rank edge score (source bias + target bias +
+    low-rank interaction + edge term) so target selection is expressive; the
+    magnitude Beta uses a cheaper additive (source + target + edge) score.  All
+    heads read only equivariant node/edge tokens + the invariant summary, so the
+    policy is permutation-symmetric and index-free.
+    """
+
+    def __init__(
+        self,
+        *,
+        node_dim: int = REWORKED_NODE_FEATURE_DIM,
+        edge_dim: int = REWORKED_EDGE_FEATURE_DIM,
+        global_dim: int = REWORKED_GLOBAL_FEATURE_DIM,
+        d_model: int = 128,
+        n_layers: int = 3,
+        dropout: float = 0.0,
+        aux_owner: bool = True,
+        interaction_rank: int = 16,
+    ):
+        super().__init__()
+        self.encoder = ReworkedPlanetGraphEncoder(
+            node_dim=node_dim, edge_dim=edge_dim, global_dim=global_dim,
+            d_model=d_model, n_layers=n_layers, dropout=dropout,
+        )
+        self.node_dim = int(node_dim)
+        self.d_model = d_model
+        r = int(interaction_rank)
+
+        # Per-edge gate (Bernoulli) logit, built additively (memory-safe):
+        #   gate_logit[h, t] = src_h + tgt_t + <qs_h, qt_t> + edge_term_{h,t}
+        self.gate_src = nn.Linear(2 * d_model, 1)
+        self.gate_tgt = nn.Linear(2 * d_model, 1)
+        self.gate_src_int = nn.Linear(2 * d_model, r)
+        self.gate_tgt_int = nn.Linear(2 * d_model, r)
+        self.gate_edge = nn.Linear(d_model, 1)
+
+        # Per-edge magnitude Beta(alpha, beta) -- additive (source + target +
+        # edge) pre-activations, softplus'd to keep concentrations >= 1.
+        self.mag_a_src = nn.Linear(2 * d_model, 1)
+        self.mag_a_tgt = nn.Linear(2 * d_model, 1)
+        self.mag_a_edge = nn.Linear(d_model, 1)
+        self.mag_b_src = nn.Linear(2 * d_model, 1)
+        self.mag_b_tgt = nn.Linear(2 * d_model, 1)
+        self.mag_b_edge = nn.Linear(d_model, 1)
+
+        self.value_head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1),
+        )
+        self.aux_owner_head = nn.Linear(d_model, 5) if aux_owner else None
+
+    def forward(
+        self,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        global_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+    ) -> dict:
+        enc = self.encoder(node_feats, edge_feats, global_feats, planet_mask)
+        tok = torch.nan_to_num(enc["node_tokens"], nan=0.0, posinf=0.0, neginf=0.0)
+        summary = torch.nan_to_num(enc["graph_summary"], nan=0.0, posinf=0.0, neginf=0.0)
+        edge_tok = torch.nan_to_num(enc["edge_tokens"], nan=0.0, posinf=0.0, neginf=0.0)
+        B, P, _ = tok.shape
+
+        s_bc = summary[:, None, :].expand(-1, P, -1)
+        node_in = torch.cat([tok, s_bc], dim=-1)  # (B, P, 2d)
+
+        gs = self.gate_src(node_in).squeeze(-1)          # (B, P)
+        gt = self.gate_tgt(node_in).squeeze(-1)          # (B, P)
+        gqs = self.gate_src_int(node_in)                 # (B, P, r)
+        gqt = self.gate_tgt_int(node_in)                 # (B, P, r)
+        ginter = torch.einsum("bhr,btr->bht", gqs, gqt)  # (B, P, P)
+        ge = self.gate_edge(edge_tok).squeeze(-1)        # (B, P, P)
+        gate_logit = gs[:, :, None] + gt[:, None, :] + ginter + ge
+
+        ma = (self.mag_a_src(node_in).squeeze(-1)[:, :, None]
+              + self.mag_a_tgt(node_in).squeeze(-1)[:, None, :]
+              + self.mag_a_edge(edge_tok).squeeze(-1))
+        mb = (self.mag_b_src(node_in).squeeze(-1)[:, :, None]
+              + self.mag_b_tgt(node_in).squeeze(-1)[:, None, :]
+              + self.mag_b_edge(edge_tok).squeeze(-1))
+        mag_alpha = F.softplus(ma) + 1.0                 # (B, P, P)
+        mag_beta = F.softplus(mb) + 1.0
+        mag_alpha, mag_beta = _sanitize_beta_params(mag_alpha, mag_beta)
+
+        value = self.value_head(summary).squeeze(-1)     # (B,)
+        out = {
+            "gate_logit": gate_logit,
+            "mag_alpha": mag_alpha,
+            "mag_beta": mag_beta,
+            "value": value,
+            "node_tokens": tok,
+        }
+        if self.aux_owner_head is not None:
+            out["aux_owner_logits"] = self.aux_owner_head(tok)
+        return out
+
+    @torch.no_grad()
+    def act(
+        self,
+        *,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        global_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        edge_mask: torch.Tensor,          # (B, P, P) bool: valid directed edges
+        deterministic: bool = False,
+        generator: Optional[torch.Generator] = None,
+    ) -> tuple[dict, torch.Tensor, torch.Tensor]:
+        """Sample per-edge gate + magnitude; return per-TARGET log-prob.
+
+        Returns ``(action, target_logp (B, P), value (B,))`` with
+        ``action = {"gate" (B, P, P), "frac" (B, P, P)}``.  ``target_logp[b, t]``
+        is the summed log-prob of all edges landing on target ``t``.
+        """
+        out = self.forward(node_feats, edge_feats, global_feats, planet_mask)
+        gl = out["gate_logit"]
+        a, b = _sanitize_beta_params(out["mag_alpha"], out["mag_beta"])
+        m = edge_mask.to(gl.dtype)
+        probs = torch.sigmoid(gl) * m
+        dist = torch.distributions.Beta(a, b)
+
+        if deterministic:
+            gate = (probs > 0.5).to(gl.dtype)
+            # Avoid a no-op turn: if a board gated everything off but has valid
+            # edges, fire the single most-probable edge (reproducible).
+            none_sel = (gate.flatten(1).sum(dim=1) < 0.5) & (m.flatten(1).sum(dim=1) > 0.5)
+            if bool(none_sel.any()):
+                flat = probs.flatten(1)
+                best = flat.argmax(dim=1, keepdim=True)
+                pick = torch.zeros_like(flat).scatter_(1, best, 1.0).view_as(gate)
+                gate = torch.where(none_sel[:, None, None], pick, gate)
+            frac = (a / (a + b)).clamp(_COMMIT_EPS, 1.0 - _COMMIT_EPS)
+        else:
+            gate = torch.bernoulli(probs, generator=generator)
+            frac = dist.sample().clamp(_COMMIT_EPS, 1.0 - _COMMIT_EPS)
+
+        gate = gate * m
+        gate_logp = -F.binary_cross_entropy_with_logits(gl, gate, reduction="none") * m
+        mag_logp = dist.log_prob(frac.clamp(_COMMIT_EPS, 1.0 - _COMMIT_EPS)) * gate
+        edge_logp = gate_logp + mag_logp
+        target_logp = edge_logp.sum(dim=1).clamp(-_LOGP_CLAMP, _LOGP_CLAMP)  # sum over source
+        action = {"gate": gate, "frac": frac}
+        return action, target_logp, out["value"]
+
+    def evaluate_actions(
+        self,
+        *,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+        global_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        edge_mask: torch.Tensor,
+        action: dict,
+    ) -> dict:
+        """Re-evaluate a stored edge ``action`` (PPO), per target.
+
+        Returns ``target_logp`` / ``entropy_target`` ``(B, P)``, the
+        ``target_valid`` mask ``(B, P)`` and the state ``value`` ``(B,)``.
+        """
+        out = self.forward(node_feats, edge_feats, global_feats, planet_mask)
+        gl = out["gate_logit"]
+        a, b = _sanitize_beta_params(out["mag_alpha"], out["mag_beta"])
+        m = edge_mask.to(gl.dtype)
+        dist = torch.distributions.Beta(a, b)
+
+        gate = action["gate"].to(gl.dtype) * m
+        frac = action["frac"].clamp(_COMMIT_EPS, 1.0 - _COMMIT_EPS)
+        gate_logp = -F.binary_cross_entropy_with_logits(gl, gate, reduction="none") * m
+        mag_logp = dist.log_prob(frac) * gate
+        edge_logp = gate_logp + mag_logp
+        target_logp = edge_logp.sum(dim=1).clamp(-_LOGP_CLAMP, _LOGP_CLAMP)
+
+        bern_ent = torch.distributions.Bernoulli(logits=gl.clamp(-30.0, 30.0)).entropy()
+        beta_ent = dist.entropy()
+        probs = torch.sigmoid(gl)
+        edge_ent = (bern_ent + probs * beta_ent) * m
+        ent_target = edge_ent.sum(dim=1)
+        target_valid = m.sum(dim=1) > 0.5
+        return {
+            "target_logp": target_logp,
+            "value": out["value"],
+            "entropy_target": ent_target,
+            "target_valid": target_valid,
+        }
+
+
 __all__ = [
     "NUM_DERIVED_NODE_METRICS",
     "REWORKED_NODE_FEATURE_DIM",
@@ -820,6 +1339,12 @@ __all__ = [
     "DenseGINELayer",
     "ReworkedPlanetGraphEncoder",
     "ReworkedHierarchicalPolicy",
+    "ReworkedLaunchPolicy",
+    "ReworkedEdgePolicy",
+    "masked_dirichlet_log_prob",
+    "masked_dirichlet_sample_log_prob",
+    "masked_dirichlet_mean",
+    "masked_dirichlet_entropy",
     "plackett_luce_sample",
     "plackett_luce_log_prob",
     "sample_commit_fractions",
