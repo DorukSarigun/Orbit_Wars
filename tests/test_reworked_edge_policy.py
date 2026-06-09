@@ -13,6 +13,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -23,6 +24,7 @@ from reworked_model import (  # noqa: E402
     REWORKED_NODE_FEATURE_DIM, REWORKED_EDGE_FEATURE_DIM, REWORKED_GLOBAL_FEATURE_DIM,
 )
 from reworked_pipeline import BoardState  # noqa: E402
+from reworked_remastered_reward import apply_remastered_credits  # noqa: E402
 from reworked_rollout import (  # noqa: E402
     _edge_valid_mask, _edge_target_valid_mask, edge_action_to_env, MIN_SEND, P_MAX,
     EdgeTransition, ReworkedBuffer,
@@ -131,11 +133,11 @@ def test_edge_policy_act_evaluate_consistency():
     pm = torch.ones(B, P, dtype=torch.bool)
     em = _edge_mask(B, P, source_rows=[0, 1])
 
-    action, target_logp, value = pol.act(
+    action, target_logp, target_value = pol.act(
         node_feats=nf, edge_feats=ef, global_feats=gf, planet_mask=pm, edge_mask=em)
     assert action["gate"].shape == (B, P, P)
     assert action["frac"].shape == (B, P, P)
-    assert target_logp.shape == (B, P) and value.shape == (B,)
+    assert target_logp.shape == (B, P) and target_value.shape == (B, P)
     assert torch.isfinite(target_logp).all()
     # gate is zero on invalid edges
     assert float((action["gate"] * (~em)).abs().sum()) < 1e-6
@@ -185,6 +187,7 @@ def test_edge_gae_per_target_matches_campaign_credit():
             gate=np.zeros((P, P), np.float32),
             frac=np.zeros((P, P), np.float32),
             old_target_logp=np.zeros(P, np.float32),
+            old_target_value=np.full(P, float(value), np.float32),
             target_valid=np.asarray(valid, bool),
             value=float(value),
             reward=float(reward),
@@ -203,14 +206,83 @@ def test_edge_gae_per_target_matches_campaign_credit():
     for tr in buf.data:
         tv = tr.target_valid
         ct = np.asarray(tr.credit_target, dtype=np.float32)
-        assert np.allclose(np.asarray(tr.adv_target)[tv], ct[tv])
-        # inactive targets carry no advantage
+        otv = np.asarray(tr.old_target_value, dtype=np.float32)
+        # No terminal_reward set -> return == campaign credit (MC).
+        assert np.allclose(np.asarray(tr.ret_target)[tv], ct[tv])
+        # Advantage subtracts the per-target value baseline (sampling time).
+        assert np.allclose(np.asarray(tr.adv_target)[tv], ct[tv] - otv[tv])
+        # inactive targets carry no advantage / return
         assert float(np.asarray(tr.adv_target)[~tv].sum()) == 0.0
+        assert float(np.asarray(tr.ret_target)[~tv].sum()) == 0.0
     # turn 0: target 1 (+credit) should out-advantage target 2 (-credit)
     a0 = buf.data[0].adv_target
     assert a0[1] > a0[2]
-    assert abs(a0[1] - 0.5) < 1e-6
-    assert abs(a0[2] + 0.3) < 1e-6
+    assert abs(a0[1] - (0.5 - 0.4)) < 1e-6
+    assert abs(a0[2] - (-0.3 - 0.4)) < 1e-6
+
+
+def test_edge_terminal_reward_spreads_into_returns():
+    """Episodic terminal must reach the per-target return (edge ignores tr.reward)."""
+    P = 4
+    buf = ReworkedBuffer()
+
+    def _mk(credit, valid, done, terminal=0.0):
+        return EdgeTransition(
+            player=0,
+            node_feats=np.zeros((P, REWORKED_NODE_FEATURE_DIM), np.float32),
+            edge_feats=np.zeros((P, P, REWORKED_EDGE_FEATURE_DIM), np.float32),
+            global_feats=np.zeros(REWORKED_GLOBAL_FEATURE_DIM, np.float32),
+            planet_mask=np.ones(P, bool),
+            edge_mask=np.zeros((P, P), bool),
+            gate=np.zeros((P, P), np.float32),
+            frac=np.zeros((P, P), np.float32),
+            old_target_logp=np.zeros(P, np.float32),
+            old_target_value=np.zeros(P, np.float32),
+            target_valid=np.asarray(valid, bool),
+            value=0.0,
+            done=done,
+            terminal_reward=float(terminal),
+            credit_target=np.asarray(credit, np.float32),
+        )
+
+    buf.data.append(_mk(credit=[0, 0.0, 0, 0], valid=[False, True, False, False], done=False))
+    buf.data.append(_mk(credit=[0, 0.0, 0, 0], valid=[False, True, False, False],
+                        done=True, terminal=1.0))
+    buf.compute_gae(gamma=0.99, lam=0.95)
+    # Total terminal preserved across the player's active turns (sum == terminal).
+    total = float(buf.data[0].ret_target[1] + buf.data[1].ret_target[1])
+    assert abs(total - 1.0) < 1e-6
+    # Later turn weighs more under discounted spread.
+    assert buf.data[1].ret_target[1] > buf.data[0].ret_target[1] > 0.0
+
+
+def test_passive_defense_credit_reaches_adv_target():
+    """Passive loss on a slot with gate off must still train that decision."""
+    P = 8
+    slot = 3
+    tr = EdgeTransition(
+        player=0,
+        node_feats=np.zeros((P, REWORKED_NODE_FEATURE_DIM), np.float32),
+        edge_feats=np.zeros((P, P, REWORKED_EDGE_FEATURE_DIM), np.float32),
+        global_feats=np.zeros(REWORKED_GLOBAL_FEATURE_DIM, np.float32),
+        planet_mask=np.ones(P, bool),
+        edge_mask=np.zeros((P, P), bool),
+        gate=np.zeros((P, P), np.float32),
+        frac=np.zeros((P, P), np.float32),
+        old_target_logp=np.zeros(P, np.float32),
+        old_target_value=np.zeros(P, np.float32),
+        target_valid=np.zeros(P, bool),  # agent did NOT reinforce this planet
+        value=0.0,
+        credit_target=np.zeros(P, np.float32),
+    )
+    buf = ReworkedBuffer()
+    buf.data.append(tr)
+    apply_remastered_credits(buf, {(0, slot): -0.42})
+    assert bool(buf.data[0].target_valid[slot])
+    assert float(buf.data[0].credit_target[slot]) == pytest.approx(-0.42)
+    buf.compute_gae()
+    assert float(buf.data[0].adv_target[slot]) == pytest.approx(-0.42)
+    assert float(buf.data[0].ret_target[slot]) == pytest.approx(-0.42)
 
 
 if __name__ == "__main__":
@@ -220,4 +292,6 @@ if __name__ == "__main__":
     test_edge_policy_act_evaluate_consistency()
     test_edge_policy_deterministic_reproducible()
     test_edge_gae_per_target_matches_campaign_credit()
+    test_edge_terminal_reward_spreads_into_returns()
+    test_passive_defense_credit_reaches_adv_target()
     print("all edge policy tests passed")

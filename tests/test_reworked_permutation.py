@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from reworked_model import (  # noqa: E402
     ReworkedHierarchicalPolicy,
+    ReworkedEdgePolicy,
     ReworkedPlanetGraphEncoder,
     REWORKED_NODE_FEATURE_DIM,
     REWORKED_EDGE_FEATURE_DIM,
@@ -108,6 +109,51 @@ def test_permutation_equivariance_padded():
     assert all(res.values()), f"equivariance failed (padded): {res}"
 
 
+def test_encoder_edge_tokens_permute():
+    """Edge tokens (B,j,i,d) must relabel as e[:, perm, perm] under planet perm."""
+    torch.manual_seed(7)
+    enc = ReworkedPlanetGraphEncoder(d_model=64, n_layers=2, n_heads=4).eval()
+    B, P = 2, 8
+    node, edge, glob, mask, _, _ = _random_inputs(B, P, n_valid=6)
+    perm = torch.randperm(P)
+    with torch.no_grad():
+        o1 = enc(node, edge, glob, mask)
+        np_, ep_, gp_, mp_, _, _ = _permute(perm, node, edge, glob, mask,
+                                             torch.zeros(B, P, dtype=torch.bool),
+                                             torch.zeros(B, P, dtype=torch.bool))
+        o2 = enc(np_, ep_, gp_, mp_)
+    nt1 = o1["node_tokens"][:, perm]
+    nt2 = o2["node_tokens"]
+    et1 = o1["edge_tokens"][:, perm][:, :, perm]
+    et2 = o2["edge_tokens"]
+    assert torch.allclose(nt1, nt2, atol=1e-5)
+    assert torch.allclose(et1, et2, atol=1e-5)
+    assert torch.allclose(o1["graph_summary"], o2["graph_summary"], atol=1e-5)
+
+
+def test_edge_policy_target_value_equivariant():
+    """Per-target value/log-prob heads permute with planet relabelling."""
+    torch.manual_seed(11)
+    pol = ReworkedEdgePolicy(d_model=64, n_layers=2, aux_owner=False).eval()
+    B, P = 2, 7
+    g = torch.Generator().manual_seed(0)
+    node = torch.randn(B, P, REWORKED_NODE_FEATURE_DIM, generator=g)
+    edge = torch.randn(B, P, P, REWORKED_EDGE_FEATURE_DIM, generator=g)
+    glob = torch.randn(B, REWORKED_GLOBAL_FEATURE_DIM, generator=g)
+    mask = torch.ones(B, P, dtype=torch.bool)
+    em = torch.ones(B, P, P, dtype=torch.bool)
+    eye = torch.eye(P, dtype=torch.bool).unsqueeze(0)
+    em = em & ~eye
+    perm = torch.randperm(P)
+    with torch.no_grad():
+        o1 = pol.forward(node, edge, glob, mask)
+        o2 = pol.forward(node[:, perm], edge[:, perm][:, :, perm], glob, mask[:, perm])
+    tv_a = _finite(o1["target_value"])[:, perm]
+    assert torch.allclose(tv_a, _finite(o2["target_value"]), atol=1e-5)
+    gl_a = _finite(o1["gate_logit"])[:, perm][:, :, perm]
+    assert torch.allclose(gl_a, _finite(o2["gate_logit"]), atol=1e-5)
+
+
 if __name__ == "__main__":
     for tag, kw in [("full", dict(n_valid=None)), ("padded", dict(P=12, n_valid=7))]:
         r = check(**kw)
@@ -115,4 +161,8 @@ if __name__ == "__main__":
         print(f"[{tag}] {'PASS' if ok else 'FAIL'}")
         for k, v in r.items():
             print(f"    {'ok ' if v else 'BAD'} {k}")
+    test_encoder_edge_tokens_permute()
+    print("[encoder edge permute] PASS")
+    test_edge_policy_target_value_equivariant()
+    print("[edge target_value permute] PASS")
     print("done")

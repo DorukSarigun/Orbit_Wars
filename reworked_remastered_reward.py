@@ -14,6 +14,8 @@ Defense loss (planet flips away from us)::
 
 ``V = dpp(planet)``.  ``K`` = ships destroyed in the campaign.  ``S_end`` = own
 stock at ``t_resolve``.  Rewards split across participating turns by launch share.
+Attack launches whose fleets **arrive after** capture (``resolve_turn > t_capture``)
+are reclassified as **defense** reinforcements — they do not share capture credit.
 If a planet is lost without any reinforcement launch, the production penalty still
 applies to the **decision turn** that last owned the planet (``TurnDecision`` ref).
 """
@@ -198,19 +200,44 @@ class CampaignLedger:
 
     def close_remaining(self, *, t_end: int, prod_lookup: dict[int, float],
                         owner_lookup: dict[int, int]) -> None:
-        """Close unresolved campaigns at episode end (unrealized — zero credit)."""
+        """Close unresolved campaigns at episode end.
+
+        * **Attack** with wasted ships (``K > 0``) → ``fail`` (chip spam penalised).
+        * **Attack** with no committed loss → ``void`` (opened but never fought).
+        * **Defense** still held → ``void`` (no loss event; zero credit by design).
+        """
         for key in list(self._active.keys()):
             camp = self._active.pop(key)
             camp.t_resolve = int(t_end)
             camp.prod_at_close = float(prod_lookup.get(camp.tgt_id, 0.0))
             camp.S_end = _stock_at_resolve(camp)
-            camp.outcome = OUTCOME_VOID
+            if camp.role == ROLE_ATTACK and camp.K > 1e-9:
+                camp.outcome = "fail"
+            else:
+                camp.outcome = OUTCOME_VOID
             self.closed.append(camp)
 
 
 # ---------------------------------------------------------------------------
 # Reward formulas
 # ---------------------------------------------------------------------------
+def _player_garrison_stock(snapshot: TurnSnapshot, player: int,
+                           *, count_inflight: bool = True) -> float:
+    """``player``'s total ship stock at one snapshot.
+
+    Garrisons on owned planets plus (when ``count_inflight``) the player's
+    in-flight fleets, so the passive-defense ``S_end`` matches the active-campaign
+    stock convention (``_stock_at_resolve`` is recorded with the same flag).
+    """
+    total = 0.0
+    for pid, owner in snapshot.owner.items():
+        if int(owner) == int(player):
+            total += float(snapshot.ships.get(int(pid), 0.0))
+    if count_inflight:
+        total += float(getattr(snapshot, "fleet_stock", {}).get(int(player), 0.0))
+    return max(total, 1.0)
+
+
 def _stock_at_resolve(camp: PlanetCampaign) -> float:
     t = int(camp.t_resolve)
     if t in camp.stock_by_turn:
@@ -542,8 +569,12 @@ def _accumulate_and_close(log: EpisodeLog, ledger: CampaignLedger,
                         else:
                             survived = s_post * (float(r.ships) / total)
                             acamp.K += max(0.0, float(r.ships) - survived)
-                    ledger.close(o_after, pid, ROLE_ATTACK, outcome="capture",
-                                 t_resolve=t_step, prod=prod)
+                    closed_atk = ledger.close(
+                        o_after, pid, ROLE_ATTACK, outcome="capture",
+                        t_resolve=t_step, prod=prod)
+                    if closed_atk is not None:
+                        _spin_off_post_capture_reinforcements(
+                            log, ledger, closed_atk, t_step)
 
             # --- Defense loss: planet was ours, now isn't ---
             if o_before in log.policy_players and o_after != o_before:
@@ -624,7 +655,13 @@ def _campaign_net_reward(camp: PlanetCampaign, max_turns: int,
         if camp.outcome == "capture":
             return capture_reward(V, camp.K, camp.S_end, delta, max_turns, cfg)
         if camp.outcome in ("lost", "fail"):
-            return fail_reward(V, camp.K, camp.S_end, cfg)
+            # Price the waste by the value the agent was *pursuing* when it
+            # committed (horizon from ``t_decision``), not the value left at
+            # resolve: an attack that resolves at the episode end would otherwise
+            # have ``R_rem -> 0 -> V -> 0`` and escape the value-relative penalty.
+            R_dec = max(0, max_turns - camp.t_decision)
+            V_dec = dpp_value(camp.prod_at_close, R_dec, cfg)
+            return fail_reward(V_dec, camp.K, camp.S_end, cfg)
         if camp.outcome == OUTCOME_VOID:
             return 0.0
     elif camp.role == ROLE_DEFENSE:
@@ -643,6 +680,96 @@ def _distribute(camp: PlanetCampaign, R: float,
         by_slot[key] = by_slot.get(key, 0.0) + c.ships
     total = sum(by_slot.values())
     if total <= 1e-9:
+        return
+    for key, ships in by_slot.items():
+        slot_credits[key] = slot_credits.get(key, 0.0) + R * (ships / total)
+
+
+def _launch_record_idx(
+    r: LaunchRecord, camp: PlanetCampaign, log: EpisodeLog,
+) -> int:
+    """Buffer index for the decision turn that issued ``r``."""
+    rec_idx = log.record_idx_at(int(r.player), int(r.launch_turn))
+    if rec_idx >= 0:
+        return rec_idx
+    t_local = int(getattr(r, "t_local", -1))
+    for c in camp.contrib:
+        if (int(c.launch_turn) == int(r.launch_turn)
+                and int(c.t_local) == t_local
+                and abs(float(c.ships) - float(r.ships)) < 1e-6):
+            return int(c.record_idx)
+    return -1
+
+
+def _capture_eligible_launches(
+    camp: PlanetCampaign, log: EpisodeLog,
+) -> list[LaunchRecord]:
+    """Launches that arrived on or before capture — eligible for capture credit."""
+    t_cap = int(camp.t_resolve)
+    return [
+        r for r in log.launches
+        if int(r.campaign_id) == int(camp.campaign_id)
+        and r.is_attack
+        and int(r.player) == int(camp.player)
+        and int(r.tgt_id) == int(camp.tgt_id)
+        and int(r.resolve_turn) >= 0
+        and int(r.resolve_turn) <= t_cap
+    ]
+
+
+def _spin_off_post_capture_reinforcements(
+    log: EpisodeLog,
+    ledger: CampaignLedger,
+    camp: PlanetCampaign,
+    t_resolve: int,
+) -> None:
+    """Attack launches landing after capture → defense campaign (no capture share)."""
+    t_cap = int(t_resolve)
+    for r in log.launches:
+        if int(r.campaign_id) != int(camp.campaign_id):
+            continue
+        if not r.is_attack:
+            continue
+        if int(r.player) != int(camp.player) or int(r.tgt_id) != int(camp.tgt_id):
+            continue
+        if int(r.resolve_turn) < 0 or int(r.resolve_turn) <= t_cap:
+            continue
+        r.is_attack = False
+        rec_idx = _launch_record_idx(r, camp, log)
+        t_local = int(getattr(r, "t_local", -1))
+        if rec_idx < 0 or t_local < 0:
+            continue
+        st = float(camp.stock_by_turn.get(
+            int(r.launch_turn), max(float(camp.S_end), 1.0)))
+        ledger.note_defense(
+            player=int(r.player), tgt_id=int(r.tgt_id),
+            t_decision=int(r.launch_turn), record_idx=rec_idx,
+            t_local=t_local, ships=int(r.ships), stock=st,
+        )
+
+
+def _distribute_capture(
+    camp: PlanetCampaign,
+    R: float,
+    log: EpisodeLog,
+    slot_credits: dict[tuple[int, int], float],
+) -> None:
+    """Split capture credit only across launches that arrived by ``t_resolve``."""
+    eligible = _capture_eligible_launches(camp, log)
+    if not eligible:
+        _distribute(camp, R, slot_credits)
+        return
+    by_slot: dict[tuple[int, int], float] = {}
+    for r in eligible:
+        rec_idx = _launch_record_idx(r, camp, log)
+        t_local = int(getattr(r, "t_local", -1))
+        if rec_idx < 0 or t_local < 0:
+            continue
+        key = (rec_idx, t_local)
+        by_slot[key] = by_slot.get(key, 0.0) + float(r.ships)
+    total = sum(by_slot.values())
+    if total <= 1e-9:
+        _distribute(camp, R, slot_credits)
         return
     for key, ships in by_slot.items():
         slot_credits[key] = slot_credits.get(key, 0.0) + R * (ships / total)
@@ -674,13 +801,21 @@ def attribute_remastered_rewards(
             stats.n_fail += 1
             stats.fail_reward += R
         if abs(R) > 1e-9:
-            _distribute(camp, R, slot_credits)
+            if camp.role == ROLE_ATTACK and camp.outcome == "capture":
+                _distribute_capture(camp, R, log, slot_credits)
+            else:
+                _distribute(camp, R, slot_credits)
 
     for pl in ledger.passive_losses:
         R_rem = max(0, log.max_turns - pl.t_resolve)
         V = dpp_value(pl.prod, R_rem, cfg)
         delta = 0
         S_end = 1.0
+        for snap in reversed(log.snapshots):
+            if int(snap.turn) <= int(pl.t_resolve):
+                S_end = _player_garrison_stock(
+                    snap, pl.player, count_inflight=cfg.count_inflight)
+                break
         R = defense_loss_reward(V, pl.K, S_end, delta, log.max_turns, cfg)
         stats.total += R
         stats.n_defense_loss += 1
@@ -765,6 +900,12 @@ def summarize_remastered_episode(
     for pl in ledger.passive_losses:
         R_rem = max(0, log.max_turns - pl.t_resolve)
         V = dpp_value(pl.prod, R_rem, cfg)
+        S_end = 1.0
+        for snap in reversed(log.snapshots):
+            if int(snap.turn) <= int(pl.t_resolve):
+                S_end = _player_garrison_stock(
+                    snap, pl.player, count_inflight=cfg.count_inflight)
+                break
         campaigns.append({
             "campaign_id": -1,
             "role": ROLE_DEFENSE,
@@ -775,7 +916,7 @@ def summarize_remastered_episode(
             "t_resolve": int(pl.t_resolve),
             "K": float(pl.K),
             "enemy_kills": 0.0,
-            "reward": float(defense_loss_reward(V, pl.K, 1.0, 0, log.max_turns, cfg)),
+            "reward": float(defense_loss_reward(V, pl.K, S_end, 0, log.max_turns, cfg)),
         })
     return {
         "planet_captures": captures,
@@ -807,3 +948,7 @@ def apply_remastered_credits(buffer, slot_credits: dict[tuple[int, int], float])
         tr.reward += v
         if getattr(tr, "credit_target", None) is not None and 0 <= t_local < len(tr.credit_target):
             tr.credit_target[t_local] += v
+            # Passive defense / kill fallback / source-strip credits land on turns
+            # where the agent did not gate that target; still train on them.
+            if abs(v) > 1e-9 and getattr(tr, "target_valid", None) is not None:
+                tr.target_valid[t_local] = True

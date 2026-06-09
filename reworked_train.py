@@ -132,6 +132,7 @@ def _policy_arch(policy) -> dict:
         "global_dim": REWORKED_GLOBAL_FEATURE_DIM,
         "d_model": int(policy.d_model),
         "n_layers": int(len(policy.encoder.layers)),
+        "n_heads": int(getattr(policy.encoder, "n_heads", 4)),
         "aux_owner": bool(policy.aux_owner_head is not None),
         # ETA-aware capture-value channel adds exactly one node feature.
         "eta_value_feature": node_dim > REWORKED_NODE_FEATURE_DIM,
@@ -185,6 +186,7 @@ def load_checkpoint(path: str | Path, device: torch.device | None = None) -> tup
         node_dim=arch["node_dim"], edge_dim=arch["edge_dim"],
         global_dim=arch["global_dim"], d_model=arch["d_model"],
         n_layers=arch["n_layers"], aux_owner=arch["aux_owner"],
+        n_heads=arch.get("n_heads", 4),
     ).to(device)
     policy.load_state_dict(ckpt["policy_state_dict"])
     return policy, ckpt
@@ -262,11 +264,22 @@ def train(
         policy = policy_cls(
             node_dim=node_dim,
             d_model=train_cfg.d_model, n_layers=train_cfg.n_layers,
+            n_heads=4,
             aux_owner=train_cfg.aux_owner,
         ).to(device)
         start_iter = 0
+        ckpt = None
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=train_cfg.learning_rate)
+    if resume_from is not None and ckpt is not None:
+        opt_state = ckpt.get("optimizer_state_dict")
+        if opt_state is not None:
+            try:
+                optimizer.load_state_dict(opt_state)
+                print("Restored optimizer state from checkpoint")
+            except (ValueError, RuntimeError) as exc:
+                print(f"Warning: could not restore optimizer state ({exc}); "
+                      f"starting with a fresh optimizer")
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"{type(policy).__name__} [{train_cfg.policy_kind}]: {n_params:,} params, "
           f"d_model={train_cfg.d_model}, n_layers={train_cfg.n_layers}, device={device}")
@@ -423,6 +436,7 @@ def train(
             "ppo_epochs_run": ppo_stats.epochs_run,
             "bc_loss": round(ppo_stats.bc_loss, 4),
             "bc_samples": ppo_stats.bc_samples,
+            "aux_loss": round(ppo_stats.aux_loss, 4),
             "learning_rate": optimizer.param_groups[0]["lr"],
             "credit_total": round(avg_credit, 4),
             "n_capture": round(avg_capture, 1),
@@ -503,6 +517,11 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "adds a supervised loss so the policy imitates the teacher's "
                         "executed launches (learns to concentrate/capture). e.g. 0.5. "
                         "Default 0 (off).")
+    p.add_argument("--aux-coef", type=float, default=0.1,
+                   help="Weight of the auxiliary owner-prediction loss on the "
+                        "first 5 node channels. 0 = off. Default 0.1.")
+    p.add_argument("--no-aux-coef", action="store_const", const=0.0, dest="aux_coef",
+                   help="Disable the auxiliary owner-prediction loss.")
     p.add_argument("--scripted-strategy", default="production",
                    help="Scripted bot strategy when --opponent=scripted "
                         "(see reworked_scripted.SCRIPTED_STRATEGIES).")
@@ -616,6 +635,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         max_grad_norm=args.max_grad_norm,
         target_kl=(args.target_kl if args.target_kl and args.target_kl > 0 else None),
         bc_coef=args.bc_coef,
+        aux_coef=args.aux_coef,
     )
     reward_cfg = RewardConfig(
         gamma=args.gamma,

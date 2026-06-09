@@ -41,7 +41,10 @@ try:  # package layout
     from .navigation import compute_launch
     from .reworked_pipeline import pack_reworked_batch, build_allocator_inputs
     from .reworked_allocator import allocate_launches, Launch
-    from .reworked_model import ReworkedHierarchicalPolicy, ReworkedLaunchPolicy, ReworkedEdgePolicy
+    from .reworked_model import (
+        ReworkedHierarchicalPolicy, ReworkedLaunchPolicy, ReworkedEdgePolicy,
+        aux_owner_cross_entropy,
+    )
     from .reworked_features import (
         discounted_production_potential, DEFAULT_GAMMA, DEFAULT_NORM,
         EDGE_IDX_ENEMY_FLUX,
@@ -64,7 +67,10 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
     from navigation import compute_launch  # type: ignore
     from reworked_pipeline import pack_reworked_batch, build_allocator_inputs  # type: ignore
     from reworked_allocator import allocate_launches, Launch  # type: ignore
-    from reworked_model import ReworkedHierarchicalPolicy, ReworkedLaunchPolicy, ReworkedEdgePolicy  # type: ignore
+    from reworked_model import (  # type: ignore
+        ReworkedHierarchicalPolicy, ReworkedLaunchPolicy, ReworkedEdgePolicy,
+        aux_owner_cross_entropy,
+    )
     from reworked_features import (  # type: ignore
         discounted_production_potential, DEFAULT_GAMMA, DEFAULT_NORM,
         EDGE_IDX_ENEMY_FLUX,
@@ -663,12 +669,17 @@ def _build_snapshot(env_obs, turn: int) -> "TurnSnapshot":
     """
     planets = parse_planets(env_obs)
     fleets = parse_fleets(env_obs)
+    fleet_stock: dict = {}
+    for f in fleets:
+        if int(f.owner) != -1:
+            fleet_stock[int(f.owner)] = fleet_stock.get(int(f.owner), 0.0) + float(f.ships)
     return TurnSnapshot(
         turn=int(turn),
         owner={int(p.id): int(p.owner) for p in planets},
         ships={int(p.id): float(p.ships) for p in planets},
         production={int(p.id): float(p.production) for p in planets},
         fleet_ids={int(f.id) for f in fleets},
+        fleet_stock=fleet_stock,
     )
 
 
@@ -797,14 +808,18 @@ class EdgeTransition:
     frac: np.ndarray             # (P, P) per-edge garrison fraction
     # per-target bookkeeping
     old_target_logp: np.ndarray  # (P,) per-target log-prob at sampling time
+    old_target_value: np.ndarray  # (P,) per-target value at sampling time
     target_valid: np.ndarray     # (P,) bool: gate open or launch toward target t
-    value: float = 0.0
-    reward: float = 0.0          # turn-level total reward (GAE backbone)
+    value: float = 0.0           # diagnostics: mean old_target_value on valid slots
+    reward: float = 0.0          # turn-level total reward (diagnostics)
+    terminal_reward: float = 0.0  # episodic win/loss reward (done turn only); spread
+                                  # across the player's turns into the per-target MC return
     done: bool = False
     advantage: float = 0.0       # turn-level GAE advantage (diagnostics)
     ret: float = 0.0
     credit_target: Optional[np.ndarray] = None  # (P,) per-target battle credit
     adv_target: Optional[np.ndarray] = None     # (P,) per-target advantage
+    ret_target: Optional[np.ndarray] = None     # (P,) per-target return (value target)
 
 
 @dataclass
@@ -884,6 +899,24 @@ class ReworkedBuffer:
         players = sorted({tr.player for tr in self.data})
         for player in players:
             idx = [i for i, tr in enumerate(self.data) if tr.player == player]
+            # Episodic terminal reward (win/loss) for this player.  It is realised
+            # only on the done turn but reflects every decision in the game, so we
+            # spread it across the player's turns with normalised discounted
+            # weights (later turns weigh more, ``sum == terminal``).  Keeping the
+            # total equal to the raw terminal puts it on the same scale as the
+            # one-shot per-campaign credits instead of the 1/(1-gamma) blow-up a
+            # raw return-to-go would produce.
+            term_total = 0.0
+            for i in idx:
+                term_total += float(getattr(self.data[i], "terminal_reward", 0.0) or 0.0)
+            term_share = {i: 0.0 for i in idx}
+            n = len(idx)
+            if n > 0 and abs(term_total) > 1e-12:
+                raw = np.array([gamma ** (n - 1 - k) for k in range(n)], dtype=np.float64)
+                w = raw / raw.sum()
+                for k, i in enumerate(idx):
+                    term_share[i] = float(term_total * w[k])
+
             last_gae = 0.0
             next_value = 0.0
             for i in reversed(idx):
@@ -894,17 +927,24 @@ class ReworkedBuffer:
                 tr.advantage = last_gae
                 tr.ret = last_gae + tr.value
                 next_value = tr.value
-                # Edge policy: per-target policy advantage = campaign credit only.
-                # Turn-level ``tr.advantage`` still feeds the value head (GAE on
-                # ``ret``); policy updates use ``adv_target[k] = credit_k`` on
-                # valid targets so temporal/bootstrap signal is not diluted
-                # across every geometrically reachable slot.
+                # Edge policy: per-target Monte-Carlo objective.  The per-target
+                # value head is the baseline, so advantage = (campaign credit +
+                # this turn's terminal share) - V_t(sampling time), and the value
+                # target is the same return (no bootstrap).
                 if isinstance(tr, EdgeTransition):
                     tv = np.asarray(tr.target_valid, dtype=bool)
                     ct = (np.zeros_like(tv, dtype=np.float32)
                           if tr.credit_target is None
                           else np.asarray(tr.credit_target, dtype=np.float32))
-                    tr.adv_target = np.where(tv, ct, 0.0).astype(np.float32)
+                    otv = (np.zeros_like(tv, dtype=np.float32)
+                           if getattr(tr, "old_target_value", None) is None
+                           else np.asarray(tr.old_target_value, dtype=np.float32))
+                    # Active = gated/launched this turn OR carries attributed credit
+                    # (passive defense loss, kill fallback, …).
+                    active = tv | (np.abs(ct) > 1e-9)
+                    ret = ct + np.float32(term_share[i])
+                    tr.ret_target = np.where(active, ret, 0.0).astype(np.float32)
+                    tr.adv_target = np.where(active, ret - otv, 0.0).astype(np.float32)
 
     @property
     def is_launch(self) -> bool:
@@ -935,8 +975,10 @@ class ReworkedBuffer:
                 "gate": st("gate", torch.float32),
                 "frac": st("frac", torch.float32),
                 "old_target_logp": st("old_target_logp", torch.float32),
+                "old_target_value": st("old_target_value", torch.float32),
                 "target_valid": st("target_valid", torch.bool),
                 "adv_target": st("adv_target", torch.float32),
+                "ret_target": st("ret_target", torch.float32),
             })
             if device is not None:
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -1182,6 +1224,8 @@ def collect_episode(
                     tr.reward += val
                     if tr.credit_target is not None and 0 <= t_local < len(tr.credit_target):
                         tr.credit_target[t_local] += val
+                        if abs(val) > 1e-9:
+                            tr.target_valid[t_local] = True
         else:
             for decision_id, c in credits.items():
                 if 0 <= decision_id < len(buffer):
@@ -1347,19 +1391,22 @@ def collect_episode(
 
             if policy_kind == "edge":
                 edge_np = _edge_valid_mask(st0, P_MAX, p, min_send=min_send)
-                action, target_logp, value = policy.act(
+                action, target_logp, target_value = policy.act(
                     node_feats=batch["node_feats"], edge_feats=batch["edge_feats"],
                     global_feats=batch["global_feats"], planet_mask=batch["planet_mask"],
                     edge_mask=torch.from_numpy(edge_np)[None].to(device),
                 )
                 gate_np = action["gate"][0].cpu().numpy()
                 frac_np = action["frac"][0].cpu().numpy()
+                tv_np = target_value[0].cpu().numpy()
                 env_action, launches = edge_action_to_env(
                     st0, obs, p, {"gate": gate_np, "frac": frac_np},
                     parsed, av, min_send=min_send)
                 env_actions[p] = env_action
                 n_launches += len(env_action)
                 launched_ships[p] = int(sum(L.ships for L in launches))
+                tvalid_np = _edge_target_valid_mask(
+                    gate_np, edge_np, launches=launches)
 
                 tr = EdgeTransition(
                     player=p,
@@ -1371,9 +1418,9 @@ def collect_episode(
                     gate=gate_np,
                     frac=frac_np,
                     old_target_logp=target_logp[0].cpu().numpy(),
-                    target_valid=_edge_target_valid_mask(
-                        gate_np, edge_np, launches=launches),
-                    value=float(value[0]),
+                    old_target_value=tv_np,
+                    target_valid=tvalid_np,
+                    value=float(tv_np[tvalid_np].mean()) if tvalid_np.any() else 0.0,
                     credit_target=np.zeros(P_MAX, dtype=np.float32),
                 )
                 pending[p] = buffer.add(tr)
@@ -1570,11 +1617,16 @@ def collect_episode(
         for p in pending:  # only policy players have stored transitions
             r = 0.0
             if use_remastered:
-                # Campaign rewards are applied at episode end; only terminal here.
+                # Campaign rewards are applied at episode end.  The episodic
+                # terminal (win/loss) is stored on its own field so ``compute_gae``
+                # can spread it into the per-target MC return (the edge policy
+                # ignores ``tr.reward``); keep it out of ``r`` to avoid double use.
                 if done and remastered_cfg is not None:
                     rp = getattr(state[p], "reward", None)
                     term = float(rp) if rp is not None else 0.0
-                    r += remastered_cfg.terminal_weight * term
+                    tw = remastered_cfg.terminal_weight * term
+                    buffer.data[pending[p]].terminal_reward += tw
+                    ep_rewards[p] += tw
             else:
                 if reward_cfg.enable_shaping:
                     # Phi(terminal) := 0 (no future) -> shaping stays telescoping.
@@ -1642,6 +1694,8 @@ class PPOConfig:
     # Behavior-cloning coefficient (v8 launch only): weight of the supervised
     # ``-log pi(a_teacher | s)`` loss on teacher-forced demonstrations.  0 = off.
     bc_coef: float = 0.0
+    # Auxiliary owner-prediction loss (all policy families).  0 = off.
+    aux_coef: float = 0.1
 
 
 @dataclass
@@ -1653,6 +1707,19 @@ class PPOStats:
     epochs_run: int = 0
     bc_loss: float = 0.0
     bc_samples: int = 0
+    aux_loss: float = 0.0
+
+
+def _ppo_aux_loss(
+    ev: dict,
+    node_feats: torch.Tensor,
+    planet_mask: torch.Tensor,
+    cfg: PPOConfig,
+) -> torch.Tensor:
+    """Optional supervised owner head; returns a zero scalar when disabled."""
+    if cfg.aux_coef <= 0.0 or "aux_owner_logits" not in ev:
+        return node_feats.new_zeros(())
+    return aux_owner_cross_entropy(ev["aux_owner_logits"], node_feats, planet_mask)
 
 
 def ppo_update(
@@ -1689,6 +1756,8 @@ def ppo_update(
 
     stats = PPOStats()
     n_batches = 0
+    aux_loss_acc = 0.0
+    aux_batches = 0
     for _ in range(cfg.epochs):
         epoch_kl = 0.0
         epoch_batches = 0
@@ -1702,7 +1771,9 @@ def ppo_update(
                     edge_mask=data["edge_mask"][mb],
                     action={"gate": data["gate"][mb], "frac": data["frac"][mb]},
                 )
-                tvm = data["target_valid"][mb].to(ev["target_logp"].dtype)  # (b, P)
+                # Bool mask first (bitwise | on float breaks on CUDA).
+                tvm = data["target_valid"][mb] | (data["adv_target"][mb].abs() > 1e-9)
+                tvm = tvm.to(ev["target_logp"].dtype)  # (b, P)
                 denom = tvm.sum().clamp_min(1.0)
                 new_tlp = ev["target_logp"]
                 old_tlp = data["old_target_logp"][mb]
@@ -1712,9 +1783,14 @@ def ppo_update(
                 surr1 = ratio * a
                 surr2 = torch.clamp(ratio, 1.0 - cfg.clip, 1.0 + cfg.clip) * a
                 policy_loss = -(torch.min(surr1, surr2) * tvm).sum() / denom
-                value_loss = F.mse_loss(ev["value"], data["ret"][mb])
+                ret_t = data["ret_target"][mb]
+                tv = ev["target_value"]
+                value_loss = ((tv - ret_t) ** 2 * tvm).sum() / denom
                 entropy = (ev["entropy_target"] * tvm).sum() / denom
-                loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+                aux_loss = _ppo_aux_loss(
+                    ev, data["node_feats"][mb], data["planet_mask"][mb], cfg)
+                loss = (policy_loss + cfg.value_coef * value_loss
+                        - cfg.entropy_coef * entropy + cfg.aux_coef * aux_loss)
                 if not torch.isfinite(loss):
                     continue
                 optimizer.zero_grad()
@@ -1731,6 +1807,9 @@ def ppo_update(
                     stats.value_loss += float(value_loss)
                     stats.entropy += float(entropy)
                     stats.approx_kl += batch_kl
+                if cfg.aux_coef > 0.0 and "aux_owner_logits" in ev:
+                    aux_loss_acc += float(aux_loss.detach())
+                    aux_batches += 1
                 epoch_kl += batch_kl
                 epoch_batches += 1
                 n_batches += 1
@@ -1768,7 +1847,10 @@ def ppo_update(
             policy_loss = -torch.min(surr1, surr2).mean()
             value_loss = F.mse_loss(ev["value"], data["ret"][mb])
             entropy = ev["entropy"].mean()
-            loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
+            aux_loss = _ppo_aux_loss(
+                ev, data["node_feats"][mb], data["planet_mask"][mb], cfg)
+            loss = (policy_loss + cfg.value_coef * value_loss
+                    - cfg.entropy_coef * entropy + cfg.aux_coef * aux_loss)
 
             if not torch.isfinite(loss):
                 continue  # skip poisoned minibatch (e.g. weights already NaN)
@@ -1788,6 +1870,9 @@ def ppo_update(
                 stats.value_loss += float(value_loss)
                 stats.entropy += float(entropy)
                 stats.approx_kl += batch_kl
+            if cfg.aux_coef > 0.0 and "aux_owner_logits" in ev:
+                aux_loss_acc += float(aux_loss.detach())
+                aux_batches += 1
             epoch_kl += batch_kl
             epoch_batches += 1
             n_batches += 1
@@ -1840,6 +1925,8 @@ def ppo_update(
                 bc_batches += 1
         stats.bc_loss = bc_loss_acc / max(1, bc_batches)
         stats.bc_samples = bc_n
+    if aux_batches:
+        stats.aux_loss = aux_loss_acc / aux_batches
     return stats
 
 

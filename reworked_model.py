@@ -8,20 +8,20 @@ action / value heads (designed separately) will sit on top of.
 Design choices (see ``docs/reworked_features_reference.md`` and the chat
 design notes):
 
-* **Compact inputs.** Node features are ``REWORKED_NODE_FEATURE_DIM = 15``
-  (10 raw ``standard_node_features`` + 5 derived metrics), edge features are
+* **Compact inputs.** Node features are ``REWORKED_NODE_FEATURE_DIM = 16``
+  (10 raw ``standard_node_features`` + 6 derived metrics), edge features are
   ``REWORKED_EDGE_FEATURE_DIM = 4`` (distance, crosses_sun, friendly_flux,
   enemy_flux).  Global features keep the existing 14-D layout.
 * **Input embedding.** Node / edge / global blocks are each projected with a
   ``LayerNorm -> Linear -> GELU -> LayerNorm`` stem to ``d_model``.
-* **Message passing.** ``n_layers`` of a **dense, GINE-equivalent** layer with
-  a residual + LayerNorm.  The graph is fully connected and tiny (<=25
-  planets), so a masked dense formulation is clearer and dependency-free
-  (no PyTorch-Geometric / ``edge_index`` plumbing) while being mathematically
-  identical to ``GINEConv``.
-* **Edge conditioning, not edge update.** Edge tokens condition every layer's
-  messages but are *not* updated by message passing (standard GINE behaviour);
-  the same embedded edge tensor is returned for reuse by the action heads.
+* **Message passing.** ``n_layers`` of a **dense edge-attention GNN** layer:
+  edge-conditioned multi-head attention aggregates incoming messages per target
+  node, followed by an **edge update** that refreshes ``edge_tokens`` from the
+  new node states.  The graph is fully connected and tiny (<=25 planets), so a
+  masked dense formulation stays dependency-free (no PyG / ``edge_index``).
+* **Permutation equivariance.** Node tokens ``(B,P,d)`` and edge tokens
+  ``(B,P,P,d)`` transform consistently under planet relabelling; graph-level
+  summaries pool to permutation-invariant scalars.
 
 Action heads are intentionally **not** implemented here — the encoder exposes
 ``node_tokens``, ``edge_tokens`` and ``graph_summary`` so the heads can be
@@ -70,43 +70,56 @@ def _input_stem(in_dim: int, d_model: int) -> nn.Sequential:
     )
 
 
-class DenseGINELayer(nn.Module):
-    r"""One GINE-equivalent message-passing layer on a dense FC graph.
+class DenseEdgeAttnGINELayer(nn.Module):
+    r"""Edge-conditioned attention + edge update on a dense directed graph.
 
-    Implements the standard GINE update for every target node ``i``:
+    **Node update** (per target ``i``, attend over sources ``j``):
 
     .. math::
 
-        x_i' = \mathrm{MLP}\!\Big( (1 + \epsilon)\, x_i +
-                 \sum_{j \neq i} \mathrm{mask}_j \cdot
-                 \mathrm{ReLU}\big( x_j + W_e\, e_{j \to i} \big) \Big)
+        m_{j\to i} = \mathrm{ReLU}(x_j + W_e e_{j\to i}),\quad
+        \alpha_{j\to i} = \mathrm{softmax}_j\!\big(
+            \langle W_q x_i,\, W_k m_{j\to i}\rangle / \sqrt{d_h}\big),\quad
+        x_i' = \mathrm{MLP}\!\big((1+\epsilon)\,x_i + \sum_j \alpha_{j\to i}\, W_v m_{j\to i}\big)
 
-    followed by a residual connection and LayerNorm
-    (``x_i ← LayerNorm(x_i + Dropout(x_i'))``).
+    **Edge update** (per directed pair ``j\to i``):
 
-    Notes
-    -----
-    * ``e_{j\to i}`` is the embedded edge feature for the directed edge
-      ``j -> i`` (``edge_tokens[:, j, i]``); messages flow *into* ``i`` along
-      incoming edges, which keeps the directed flux channels semantically
-      correct (flow toward the target).
-    * Padded / invalid source nodes are removed from the neighbour sum, and the
-      diagonal (``j == i``) is excluded — the self term is carried by the
-      learnable ``(1 + eps)`` skip, exactly as in GINE.
-    * Edge tokens are *not* modified here; the same tensor conditions every
-      layer.
+    .. math::
+
+        e_{j\to i}' = \mathrm{LayerNorm}\!\big(
+            e_{j\to i} + \mathrm{MLP}([x_j', x_i', e_{j\to i}])\big)
+
+    All operations are content-only (no index parameters), so node tokens
+    permute as ``h[:, \pi]`` and edge tokens as ``e[:, \pi, \pi]`` under a
+    planet relabelling ``\pi``.
     """
 
-    def __init__(self, d_model: int, *, dropout: float = 0.0):
+    def __init__(self, d_model: int, *, n_heads: int = 4, dropout: float = 0.0):
         super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by n_heads={n_heads}")
+        self.d_model = d_model
+        self.n_heads = int(n_heads)
+        self.head_dim = d_model // n_heads
+
         self.eps = nn.Parameter(torch.zeros(()))
         self.edge_lin = nn.Linear(d_model, d_model)
-        self.mlp = nn.Sequential(
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.node_mlp = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
-        self.norm = nn.LayerNorm(d_model)
+        self.node_norm = nn.LayerNorm(d_model)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(3 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.edge_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(
@@ -114,14 +127,39 @@ class DenseGINELayer(nn.Module):
         h: torch.Tensor,            # (B, P, d)
         edge_tokens: torch.Tensor,  # (B, P, P, d)  indexed [b, src, dst]
         pair_mask: torch.Tensor,    # (B, P, P)     valid source j -> target i, no diagonal
-    ) -> torch.Tensor:
-        we = self.edge_lin(edge_tokens)                 # (B, j, i, d)
-        # message[b, j, i] = ReLU( h_j + W_e e_{j->i} ); h_j broadcast over target i
-        msg = F.relu(h.unsqueeze(2) + we)               # (B, j, i, d)
-        msg = msg * pair_mask.unsqueeze(-1)             # zero invalid / diagonal sources
-        agg = msg.sum(dim=1)                            # sum over sources j -> (B, i, d)
-        updated = self.mlp((1.0 + self.eps) * h + agg)
-        return self.norm(h + self.dropout(updated))
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, P, d = h.shape
+        H, hd = self.n_heads, self.head_dim
+        neg = torch.finfo(h.dtype).min
+
+        we = self.edge_lin(edge_tokens)                              # (B, j, i, d)
+        msg = F.relu(h.unsqueeze(2) + we)                            # (B, j, i, d)
+
+        q = self.q_proj(h).view(B, 1, P, H, hd)                      # (B, 1, i, H, hd)
+        k = self.k_proj(msg).view(B, P, P, H, hd)                    # (B, j, i, H, hd)
+        v = self.v_proj(msg).view(B, P, P, H, hd)
+
+        scores = (q * k).sum(dim=-1) / (hd ** 0.5)                   # (B, j, i, H)
+        m = pair_mask.unsqueeze(-1).to(torch.bool)                   # (B, j, i, 1)
+        scores = scores.masked_fill(~m, neg)
+        attn = F.softmax(scores, dim=1)                              # softmax over sources j
+        attn = attn * pair_mask.unsqueeze(-1).to(attn.dtype)
+        attn = self.dropout(attn)
+
+        agg = (attn.unsqueeze(-1) * v).sum(dim=1)                    # (B, i, H, hd)
+        agg = self.out_proj(agg.reshape(B, P, d))
+        updated = self.node_mlp((1.0 + self.eps) * h + agg)
+        h_new = self.node_norm(h + self.dropout(updated))
+
+        # Edge update from endpoint node states + previous edge embedding.
+        hi = h_new.unsqueeze(1).expand(-1, P, -1, -1)               # (B, j, i, d) target
+        hj = h_new.unsqueeze(2).expand(-1, -1, P, -1)               # (B, j, i, d) source
+        edge_in = torch.cat([hj, hi, edge_tokens], dim=-1)           # (B, j, i, 3d)
+        edge_delta = self.edge_mlp(edge_in)
+        edge_new = self.edge_norm(edge_tokens + self.dropout(edge_delta))
+        edge_new = edge_new * pair_mask.unsqueeze(-1).to(edge_new.dtype)
+
+        return h_new, edge_new
 
 
 class ReworkedPlanetGraphEncoder(nn.Module):
@@ -130,13 +168,15 @@ class ReworkedPlanetGraphEncoder(nn.Module):
     Parameters
     ----------
     node_dim, edge_dim, global_dim:
-        Input feature widths (default to the reworked layout 15 / 4 / 14).
+        Input feature widths (default to the reworked layout 16 / 4 / 14).
     d_model:
         Hidden width.
     n_layers:
-        Number of dense GINE message-passing layers.
+        Number of dense edge-attention message-passing layers.
+    n_heads:
+        Attention heads inside each layer (``d_model`` must be divisible).
     dropout:
-        Dropout on the residual message branch.
+        Dropout on attention weights and residual branches.
     """
 
     def __init__(
@@ -147,6 +187,7 @@ class ReworkedPlanetGraphEncoder(nn.Module):
         global_dim: int = REWORKED_GLOBAL_FEATURE_DIM,
         d_model: int = 128,
         n_layers: int = 3,
+        n_heads: int = 4,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -155,13 +196,15 @@ class ReworkedPlanetGraphEncoder(nn.Module):
         self.global_dim = global_dim
         self.d_model = d_model
         self.n_layers = n_layers
+        self.n_heads = int(n_heads)
 
         self.node_embed = _input_stem(node_dim, d_model)
         self.edge_embed = _input_stem(edge_dim, d_model)
         self.global_embed = _input_stem(global_dim, d_model)
 
         self.layers = nn.ModuleList(
-            DenseGINELayer(d_model, dropout=dropout) for _ in range(n_layers)
+            DenseEdgeAttnGINELayer(d_model, n_heads=n_heads, dropout=dropout)
+            for _ in range(n_layers)
         )
         # mean-pool ++ max-pool ++ global token  ->  d_model
         self.summary = nn.Sequential(
@@ -193,7 +236,7 @@ class ReworkedPlanetGraphEncoder(nn.Module):
         pair_mask = (planet_mask[:, :, None] & ~eye).to(dtype=h.dtype)          # (B, j, i)
 
         for layer in self.layers:
-            h = layer(h, edge_tokens, pair_mask)
+            h, edge_tokens = layer(h, edge_tokens, pair_mask)
 
         # Zero out padded node tokens so they cannot leak into pooling.
         node_valid = planet_mask.unsqueeze(-1).to(dtype=h.dtype)               # (B, P, 1)
@@ -286,6 +329,7 @@ class ReworkedHierarchicalPolicy(nn.Module):
         global_dim: int = REWORKED_GLOBAL_FEATURE_DIM,
         d_model: int = 128,
         n_layers: int = 3,
+        n_heads: int = 4,
         dropout: float = 0.0,
         aux_owner: bool = True,
     ):
@@ -296,6 +340,7 @@ class ReworkedHierarchicalPolicy(nn.Module):
             global_dim=global_dim,
             d_model=d_model,
             n_layers=n_layers,
+            n_heads=n_heads,
             dropout=dropout,
         )
         self.node_dim = int(node_dim)
@@ -510,13 +555,18 @@ class ReworkedHierarchicalPolicy(nn.Module):
             torch.distributions.Beta(out["posture_pw_alpha"], out["posture_pw_beta"]).entropy()
             + torch.distributions.Beta(out["posture_h_alpha"], out["posture_h_beta"]).entropy()
         )
+        candidate_bool = attack_mask.to(torch.bool) | defend_mask.to(torch.bool)
         entropy = (
             bernoulli_entropy(out["attack_logits"], attack_mask)
             + bernoulli_entropy(out["defend_logits"], defend_mask)
+            + _plackett_luce_entropy_bonus(out["priority_logits"], candidate_bool)
             + _beta_entropy(out["commit_alpha"], out["commit_beta"], defend_mask)
             + posture_ent
         )
-        return {"log_prob": log_prob, "value": out["value"], "entropy": entropy}
+        result = {"log_prob": log_prob, "value": out["value"], "entropy": entropy}
+        if self.aux_owner_head is not None:
+            result["aux_owner_logits"] = out["aux_owner_logits"]
+        return result
 
 
 def bernoulli_sample_log_prob(
@@ -690,6 +740,43 @@ def plackett_luce_log_prob(
         available = available & ~(picked & active[:, None])
 
     return log_prob
+
+
+def _plackett_luce_entropy_bonus(
+    scores: torch.Tensor,            # (B, P)
+    valid_mask: torch.Tensor,      # (B, P) bool
+) -> torch.Tensor:
+    r"""Mean categorical entropy over valid priority candidates ``(B,)``.
+
+    Tractable exploration bonus for the Plackett-Luce head: one softmax over
+    the candidate set (mirrors the rank-1 draw).  Averaged over candidates so
+    the scale matches the Bernoulli / Beta entropy terms.
+    """
+    neg = torch.finfo(scores.dtype).min
+    m = valid_mask.to(torch.bool)
+    masked = torch.where(m, scores, torch.full_like(scores, neg))
+    has = m.any(dim=1)
+    safe = torch.where(has[:, None], masked, torch.zeros_like(masked))
+    logp = F.log_softmax(safe, dim=1)
+    probs = logp.exp()
+    ent = -(probs * logp).sum(dim=1)
+    return ent / m.sum(dim=1).to(scores.dtype).clamp_min(1.0)
+
+
+def aux_owner_cross_entropy(
+    logits: torch.Tensor,          # (B, P, 5)
+    node_feats: torch.Tensor,        # (B, P, node_dim)
+    planet_mask: torch.Tensor,       # (B, P) bool
+) -> torch.Tensor:
+    """Supervised owner prediction from the first 5 standard one-hot channels."""
+    labels = node_feats[..., :5].argmax(dim=-1)                       # (B, P)
+    valid = planet_mask.to(torch.bool).reshape(-1)
+    if not bool(valid.any()):
+        return logits.new_zeros(())
+    return F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1])[valid],
+        labels.reshape(-1)[valid],
+    )
 
 
 _COMMIT_EPS = 1e-4
@@ -982,6 +1069,7 @@ class ReworkedLaunchPolicy(nn.Module):
         global_dim: int = REWORKED_GLOBAL_FEATURE_DIM,
         d_model: int = 128,
         n_layers: int = 3,
+        n_heads: int = 4,
         dropout: float = 0.0,
         aux_owner: bool = True,
         interaction_rank: int = 16,
@@ -989,7 +1077,7 @@ class ReworkedLaunchPolicy(nn.Module):
         super().__init__()
         self.encoder = ReworkedPlanetGraphEncoder(
             node_dim=node_dim, edge_dim=edge_dim, global_dim=global_dim,
-            d_model=d_model, n_layers=n_layers, dropout=dropout,
+            d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout,
         )
         self.node_dim = int(node_dim)
         self.d_model = d_model
@@ -1119,7 +1207,24 @@ class ReworkedLaunchPolicy(nn.Module):
             _beta_entropy(out["commit_alpha"], out["commit_beta"], source_mask)
             + masked_dirichlet_entropy(out["dir_conc"], valid)
         )
-        return {"log_prob": log_prob, "value": out["value"], "entropy": entropy}
+        result = {"log_prob": log_prob, "value": out["value"], "entropy": entropy}
+        if self.aux_owner_head is not None:
+            result["aux_owner_logits"] = out["aux_owner_logits"]
+        return result
+
+
+def _edge_per_target_mean(
+    edge_terms: torch.Tensor,   # (B, P, P) indexed [source h, target t]
+    edge_mask: torch.Tensor,    # (B, P, P) bool
+) -> torch.Tensor:
+    """Mean per-edge quantity over valid sources for each target ``(B, P)``.
+
+    Keeps log-prob / entropy board-size invariant when several sources fire at
+    the same target (raw sums would grow with in-degree).
+    """
+    m = edge_mask.to(edge_terms.dtype)
+    n_src = m.sum(dim=1).clamp_min(1.0)
+    return (edge_terms * m).sum(dim=1) / n_src
 
 
 class ReworkedEdgePolicy(nn.Module):
@@ -1145,6 +1250,9 @@ class ReworkedEdgePolicy(nn.Module):
     (same purpose); different targets are independent.  ``act`` / ``evaluate``
     therefore return log-prob and entropy **per target** ``(B, P)`` -- not
     summed -- which the per-campaign PPO objective consumes directly.
+    The critic mirrors this with an equivariant **per-target value head**
+    ``V_t = f(node_t, summary)`` — one scalar per planet slot that permutes
+    with the board (not a single invariant graph value).
 
     The gate uses an additive low-rank edge score (source bias + target bias +
     low-rank interaction + edge term) so target selection is expressive; the
@@ -1161,6 +1269,7 @@ class ReworkedEdgePolicy(nn.Module):
         global_dim: int = REWORKED_GLOBAL_FEATURE_DIM,
         d_model: int = 128,
         n_layers: int = 3,
+        n_heads: int = 4,
         dropout: float = 0.0,
         aux_owner: bool = True,
         interaction_rank: int = 16,
@@ -1168,7 +1277,7 @@ class ReworkedEdgePolicy(nn.Module):
         super().__init__()
         self.encoder = ReworkedPlanetGraphEncoder(
             node_dim=node_dim, edge_dim=edge_dim, global_dim=global_dim,
-            d_model=d_model, n_layers=n_layers, dropout=dropout,
+            d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout,
         )
         self.node_dim = int(node_dim)
         self.d_model = d_model
@@ -1191,8 +1300,13 @@ class ReworkedEdgePolicy(nn.Module):
         self.mag_b_tgt = nn.Linear(2 * d_model, 1)
         self.mag_b_edge = nn.Linear(d_model, 1)
 
-        self.value_head = nn.Sequential(
-            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1),
+        # Per-target value head (equivariant): one scalar V_t per planet slot.
+        # Reads ``[node_token_t, broadcast graph_summary]`` — no index params, so
+        # relabelling planets permutes the output vector the same way as
+        # ``gate_logit`` / ``target_logp``.  Aligns the critic with per-target
+        # campaign advantages in PPO.
+        self.target_value_head = nn.Sequential(
+            nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1),
         )
         self.aux_owner_head = nn.Linear(d_model, 5) if aux_owner else None
 
@@ -1208,6 +1322,7 @@ class ReworkedEdgePolicy(nn.Module):
         summary = torch.nan_to_num(enc["graph_summary"], nan=0.0, posinf=0.0, neginf=0.0)
         edge_tok = torch.nan_to_num(enc["edge_tokens"], nan=0.0, posinf=0.0, neginf=0.0)
         B, P, _ = tok.shape
+        pm = planet_mask.to(torch.bool)
 
         s_bc = summary[:, None, :].expand(-1, P, -1)
         node_in = torch.cat([tok, s_bc], dim=-1)  # (B, P, 2d)
@@ -1230,12 +1345,13 @@ class ReworkedEdgePolicy(nn.Module):
         mag_beta = F.softplus(mb) + 1.0
         mag_alpha, mag_beta = _sanitize_beta_params(mag_alpha, mag_beta)
 
-        value = self.value_head(summary).squeeze(-1)     # (B,)
+        target_value = self.target_value_head(node_in).squeeze(-1)       # (B, P)
+        target_value = target_value.masked_fill(~pm, 0.0)
         out = {
             "gate_logit": gate_logit,
             "mag_alpha": mag_alpha,
             "mag_beta": mag_beta,
-            "value": value,
+            "target_value": target_value,
             "node_tokens": tok,
         }
         if self.aux_owner_head is not None:
@@ -1254,11 +1370,12 @@ class ReworkedEdgePolicy(nn.Module):
         deterministic: bool = False,
         generator: Optional[torch.Generator] = None,
     ) -> tuple[dict, torch.Tensor, torch.Tensor]:
-        """Sample per-edge gate + magnitude; return per-TARGET log-prob.
+        """Sample per-edge gate + magnitude; return per-TARGET log-prob + values.
 
-        Returns ``(action, target_logp (B, P), value (B,))`` with
+        Returns ``(action, target_logp (B, P), target_value (B, P))`` with
         ``action = {"gate" (B, P, P), "frac" (B, P, P)}``.  ``target_logp[b, t]``
-        is the summed log-prob of all edges landing on target ``t``.
+        is the **mean** per-edge log-prob over sources landing on target ``t``.
+        ``target_value[b, t]`` is the equivariant critic for campaigning on ``t``.
         """
         out = self.forward(node_feats, edge_feats, global_feats, planet_mask)
         gl = out["gate_logit"]
@@ -1286,9 +1403,10 @@ class ReworkedEdgePolicy(nn.Module):
         gate_logp = -F.binary_cross_entropy_with_logits(gl, gate, reduction="none") * m
         mag_logp = dist.log_prob(frac.clamp(_COMMIT_EPS, 1.0 - _COMMIT_EPS)) * gate
         edge_logp = gate_logp + mag_logp
-        target_logp = edge_logp.sum(dim=1).clamp(-_LOGP_CLAMP, _LOGP_CLAMP)  # sum over source
+        target_logp = _edge_per_target_mean(edge_logp, edge_mask).clamp(
+            -_LOGP_CLAMP, _LOGP_CLAMP)
         action = {"gate": gate, "frac": frac}
-        return action, target_logp, out["value"]
+        return action, target_logp, out["target_value"]
 
     def evaluate_actions(
         self,
@@ -1302,8 +1420,8 @@ class ReworkedEdgePolicy(nn.Module):
     ) -> dict:
         """Re-evaluate a stored edge ``action`` (PPO), per target.
 
-        Returns ``target_logp`` / ``entropy_target`` ``(B, P)``, the
-        ``target_valid`` mask ``(B, P)`` and the state ``value`` ``(B,)``.
+        Returns ``target_logp`` / ``entropy_target`` / ``target_value`` ``(B, P)``
+        and the ``target_valid`` mask ``(B, P)``.
         """
         out = self.forward(node_feats, edge_feats, global_feats, planet_mask)
         gl = out["gate_logit"]
@@ -1316,27 +1434,31 @@ class ReworkedEdgePolicy(nn.Module):
         gate_logp = -F.binary_cross_entropy_with_logits(gl, gate, reduction="none") * m
         mag_logp = dist.log_prob(frac) * gate
         edge_logp = gate_logp + mag_logp
-        target_logp = edge_logp.sum(dim=1).clamp(-_LOGP_CLAMP, _LOGP_CLAMP)
+        target_logp = _edge_per_target_mean(edge_logp, edge_mask).clamp(
+            -_LOGP_CLAMP, _LOGP_CLAMP)
 
         bern_ent = torch.distributions.Bernoulli(logits=gl.clamp(-30.0, 30.0)).entropy()
         beta_ent = dist.entropy()
         probs = torch.sigmoid(gl)
         edge_ent = (bern_ent + probs * beta_ent) * m
-        ent_target = edge_ent.sum(dim=1)
+        ent_target = _edge_per_target_mean(edge_ent, edge_mask)
         target_valid = m.sum(dim=1) > 0.5
-        return {
+        result = {
             "target_logp": target_logp,
-            "value": out["value"],
+            "target_value": out["target_value"],
             "entropy_target": ent_target,
             "target_valid": target_valid,
         }
+        if self.aux_owner_head is not None:
+            result["aux_owner_logits"] = out["aux_owner_logits"]
+        return result
 
 
 __all__ = [
     "NUM_DERIVED_NODE_METRICS",
     "REWORKED_NODE_FEATURE_DIM",
     "REWORKED_GLOBAL_FEATURE_DIM",
-    "DenseGINELayer",
+    "DenseEdgeAttnGINELayer",
     "ReworkedPlanetGraphEncoder",
     "ReworkedHierarchicalPolicy",
     "ReworkedLaunchPolicy",
@@ -1347,6 +1469,9 @@ __all__ = [
     "masked_dirichlet_entropy",
     "plackett_luce_sample",
     "plackett_luce_log_prob",
+    "_plackett_luce_entropy_bonus",
+    "aux_owner_cross_entropy",
+    "_edge_per_target_mean",
     "sample_commit_fractions",
     "commit_fraction_log_prob",
     "bernoulli_sample_log_prob",

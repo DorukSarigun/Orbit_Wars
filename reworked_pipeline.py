@@ -32,12 +32,13 @@ This module derives those by:
 3. **Slicing** the planet sub-block ``edge_bias[:n, :n, {0,5}]`` for the
    distance matrix and ``crosses_sun`` mask.
 
-The output node features follow the ``REWORKED_NODE_FEATURE_DIM = 15`` layout
+The output node features follow the ``REWORKED_NODE_FEATURE_DIM = 16`` layout
 expected by :class:`reworked_model.ReworkedPlanetGraphEncoder`:
 
     [ standard_node_features (10) ,
       discounted_production_potential , closeness_centrality ,
-      potential_threat , potential_support , friendly_compactness ]   (5)
+      potential_threat , potential_support , friendly_compactness ,
+      capture_affordability ]   (6)
 
 and edge features the ``REWORKED_EDGE_FEATURE_DIM = 4`` layout
 ``[distance, crosses_sun, friendly_flux, enemy_flux]``.
@@ -401,7 +402,7 @@ def pack_reworked_batch(
 
     Returns a dict with keys matching
     :meth:`reworked_model.ReworkedPlanetGraphEncoder.forward`:
-    ``node_feats (B,P,15)``, ``edge_feats (B,P,P,4)``, ``global_feats (B,14)``,
+    ``node_feats (B,P,16)``, ``edge_feats (B,P,P,4)``, ``global_feats (B,14)``,
     ``planet_mask (B,P)`` -- plus ``states`` (list of :class:`BoardState`).
     """
     import torch

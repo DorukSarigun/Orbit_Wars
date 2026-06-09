@@ -130,8 +130,8 @@ def test_source_strip_disabled_by_default():
     assert stats.n_source_strip == 0
 
 
-def test_episode_end_voids_open_attack_campaign():
-    """Unresolved attack at game end → void, no fail penalty, no slot credit."""
+def test_episode_end_fails_open_attack_with_wasted_ships():
+    """Unresolved attack with wasted ships at game end → fail penalty."""
     ledger = CampaignLedger()
     ledger.note_attack(
         player=0, tgt_id=10, t_decision=5, stock=100.0,
@@ -155,10 +155,12 @@ def test_episode_end_voids_open_attack_campaign():
 
     slot_credits, stats = attribute_remastered_rewards(log, ledger, CFG)
     assert len(ledger.closed) == 1
-    assert ledger.closed[0].outcome == OUTCOME_VOID
-    assert stats.n_capture == 0 and stats.n_fail == 0 and stats.n_lost == 0
-    assert stats.total == 0.0
-    assert slot_credits == {}
+    assert ledger.closed[0].outcome == "fail"
+    assert ledger.closed[0].K == pytest.approx(20.0)
+    assert stats.n_capture == 0 and stats.n_fail == 1 and stats.n_lost == 0
+    assert stats.total < 0.0
+    assert (2, 4) in slot_credits
+    assert slot_credits[(2, 4)] < 0.0
 
 
 def test_episode_end_voids_open_defense_campaign():
@@ -213,6 +215,41 @@ def test_multi_turn_attack_split():
     slot_credits, stats = attribute_remastered_rewards(log, ledger, CFG)
     assert stats.n_capture == 1
     assert abs(slot_credits[(0, 2)] / slot_credits[(3, 2)] - 20.0 / 30.0) < 0.05
+
+
+def test_post_capture_arrivals_are_defense_not_capture_credit():
+    """Fleets landing after capture must not share attack capture credit."""
+    ledger = CampaignLedger()
+    ledger.note_attack(player=0, tgt_id=10, t_decision=5, stock=100.0,
+                       record_idx=0, t_local=2, ships=20)
+    ledger.note_attack(player=0, tgt_id=10, t_decision=8, stock=120.0,
+                       record_idx=3, t_local=2, ships=30)
+
+    log = EpisodeLog(max_turns=300, policy_players={0})
+    for turn, owner10, ships10, fids in [
+        (5, -1, 50.0, {1}),
+        (9, -1, 50.0, {1, 2}),
+        (10, 0, 25.0, {2}),   # capture; fleet 1 arrived, fleet 2 still inbound
+        (12, 0, 55.0, set()),  # fleet 2 arrives after capture
+    ]:
+        log.snapshots.append(TurnSnapshot(
+            turn=turn, owner={10: owner10}, ships={10: ships10},
+            production={10: 3.0}, fleet_ids=set(fids)))
+    log.launches = [
+        LaunchRecord(decision_id=0, campaign_id=0, player=0, launch_turn=5,
+                     src_id=1, tgt_id=10, ships=20, is_attack=True, fleet_id=1,
+                     t_local=2),
+        LaunchRecord(decision_id=0, campaign_id=0, player=0, launch_turn=8,
+                     src_id=1, tgt_id=10, ships=30, is_attack=True, fleet_id=2,
+                     t_local=2),
+    ]
+    slot_credits, stats = attribute_remastered_rewards(log, ledger, CFG)
+    assert stats.n_capture == 1
+    assert (0, 2) in slot_credits and slot_credits[(0, 2)] > 0.0
+    assert (3, 2) not in slot_credits or abs(slot_credits.get((3, 2), 0.0)) < 1e-9
+    # Late wave reclassified as defense (held → void, no extra credit).
+    assert not any(
+        r.is_attack for r in log.launches if r.fleet_id == 2)
 
 
 def test_defense_campaign_tracks_reinforce_decisions():

@@ -105,6 +105,7 @@ class TurnSnapshot:
     ships: dict          # planet_id -> ships (float)
     production: dict      # planet_id -> production (float)
     fleet_ids: set        # set[int] of in-flight fleet ids present
+    fleet_stock: dict = field(default_factory=dict)  # owner -> total in-flight ships
 
 
 @dataclass

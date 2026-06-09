@@ -109,6 +109,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     ppo_cfg = PPOConfig(
         entropy_coef=args.entropy_coef,
         target_kl=(args.target_kl if args.target_kl > 0 else None),
+        aux_coef=0.1,
     )
     # Legacy reward path fully off for remastered runs.
     reward_cfg = RewardConfig(
