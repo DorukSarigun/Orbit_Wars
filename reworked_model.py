@@ -366,6 +366,11 @@ class ReworkedHierarchicalPolicy(nn.Module):
         # Multi-label (per-planet Bernoulli) target heads.
         self.attack_head = _node_head()
         self.defend_head = _node_head()
+        # Per-target value head (remastered per-target credit): one scalar per
+        # planet predicting that target's campaign return.  Mirrors the edge
+        # policy's ``target_value_head`` and serves as the baseline for the
+        # per-target Monte-Carlo advantage of the attack/defend selections.
+        self.target_value_head = _node_head()
         # Shared priority head: one scalar per planet on a *common* scale for
         # both attack and defend candidates, so the Plackett-Luce ranking can
         # trade off "capture this enemy planet" vs "save my planet" under one
@@ -455,11 +460,13 @@ class ReworkedHierarchicalPolicy(nn.Module):
         posture_h_beta = posture_params[:, 3]
 
         value = self.value_head(summary).squeeze(-1)                    # (B,)
+        target_value = self.target_value_head(node_in).squeeze(-1)      # (B, P)
 
         out = {
             "attack_logits": attack_logits,
             "defend_logits": defend_logits,
             "priority_logits": priority_logits,
+            "target_value": target_value,
             "commit_alpha": commit_alpha,
             "commit_beta": commit_beta,
             "posture_pw_alpha": posture_pw_alpha,
@@ -514,6 +521,13 @@ class ReworkedHierarchicalPolicy(nn.Module):
             out["posture_h_alpha"], out["posture_h_beta"])
 
         log_prob = a_logp + d_logp + pl_logp + c_logp + p_logp
+        # Per-target decomposition (remastered per-target credit): each
+        # planet's own Bernoulli selection log-prob (attack and defend masks
+        # are disjoint, so the element-wise sum is that target's decision).
+        target_logp = (
+            bernoulli_log_prob_per_node(out["attack_logits"], attack_sel, attack_mask)
+            + bernoulli_log_prob_per_node(out["defend_logits"], defend_sel, defend_mask)
+        )
         action = {
             "attack_sel": attack_sel,
             "defend_sel": defend_sel,
@@ -522,6 +536,8 @@ class ReworkedHierarchicalPolicy(nn.Module):
             "posture_u": u,
             "potential_weight": pw,
             "horizon": hz,
+            "target_logp": target_logp,
+            "target_value": out["target_value"],
         }
         return action, log_prob, out["value"]
 
@@ -572,7 +588,24 @@ class ReworkedHierarchicalPolicy(nn.Module):
             + _beta_entropy(out["commit_alpha"], out["commit_beta"], defend_mask)
             + posture_ent
         )
-        result = {"log_prob": log_prob, "value": out["value"], "entropy": entropy}
+        # Per-target decomposition (remastered per-target credit): per-planet
+        # selection log-prob + value + entropy, consumed by the per-target PPO
+        # path (the turn-level ``log_prob`` above still contains these terms;
+        # ``ppo_update`` subtracts them when the per-target path is active).
+        target_logp = (
+            bernoulli_log_prob_per_node(out["attack_logits"], action["attack_sel"], attack_mask)
+            + bernoulli_log_prob_per_node(out["defend_logits"], action["defend_sel"], defend_mask)
+        )
+        entropy_target = (
+            bernoulli_entropy_per_node(out["attack_logits"], attack_mask)
+            + bernoulli_entropy_per_node(out["defend_logits"], defend_mask)
+        )
+        result = {
+            "log_prob": log_prob, "value": out["value"], "entropy": entropy,
+            "target_logp": target_logp,
+            "target_value": out["target_value"],
+            "entropy_target": entropy_target,
+        }
         if self.aux_owner_head is not None:
             result["aux_owner_logits"] = out["aux_owner_logits"]
         return result
@@ -619,6 +652,25 @@ def bernoulli_log_prob(
     mask_f = mask.to(logits.dtype)
     logp = -F.binary_cross_entropy_with_logits(logits, sample, reduction="none")
     return (logp * mask_f).sum(dim=1)
+
+
+def bernoulli_log_prob_per_node(
+    logits: torch.Tensor,            # (B, P)
+    sample: torch.Tensor,            # (B, P) float 0/1
+    mask: torch.Tensor,              # (B, P) bool
+) -> torch.Tensor:
+    """Element-wise masked Bernoulli log-prob ``(B, P)`` (per-target credit)."""
+    mask_f = mask.to(logits.dtype)
+    logp = -F.binary_cross_entropy_with_logits(
+        logits.clamp(-30.0, 30.0), sample, reduction="none")
+    return logp * mask_f
+
+
+def bernoulli_entropy_per_node(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Element-wise masked Bernoulli entropy ``(B, P)`` (per-target credit)."""
+    mask_f = mask.to(logits.dtype)
+    ent = torch.distributions.Bernoulli(logits=logits.clamp(-30.0, 30.0)).entropy()
+    return ent * mask_f
 
 
 def bernoulli_entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

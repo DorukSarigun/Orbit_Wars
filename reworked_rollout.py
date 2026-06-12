@@ -842,9 +842,22 @@ class HierTransition:
     log_prob: float = 0.0
     value: float = 0.0
     reward: float = 0.0
+    terminal_reward: float = 0.0  # episodic win/loss (remastered): spread across
+                                  # the player's turns into the GAE backbone
     done: bool = False
     advantage: float = 0.0
     ret: float = 0.0
+    # Per-target credit (remastered + hier): mirrors EdgeTransition's
+    # machinery for the attack/defend selection heads.  ``old_target_logp``
+    # holds each planet's own Bernoulli selection log-prob (the PL / commit /
+    # posture terms stay turn-level); populated only when the remastered
+    # reward is active, otherwise None and the legacy turn-level PPO runs.
+    old_target_logp: Optional[np.ndarray] = None   # (P,)
+    old_target_value: Optional[np.ndarray] = None  # (P,)
+    target_valid: Optional[np.ndarray] = None      # (P,) bool: selected targets
+    credit_target: Optional[np.ndarray] = None     # (P,) per-target campaign credit
+    adv_target: Optional[np.ndarray] = None        # (P,) per-target advantage
+    ret_target: Optional[np.ndarray] = None        # (P,) per-target return
 
 
 @dataclass
@@ -1045,16 +1058,25 @@ class ReworkedBuffer:
             for i in reversed(idx):
                 tr = self.data[i]
                 mask = 0.0 if tr.done else 1.0
-                delta = tr.reward + gamma * next_value * mask - tr.value
+                r = tr.reward
+                if not isinstance(tr, EdgeTransition):
+                    # Hier/launch transitions have no per-target return, so the
+                    # spread episodic terminal (remastered) feeds the turn-level
+                    # GAE backbone directly.  term_share is all-zero unless
+                    # ``terminal_reward`` was populated, so legacy paths (which
+                    # add the terminal straight into ``reward``) are unchanged.
+                    r += term_share[i]
+                delta = r + gamma * next_value * mask - tr.value
                 last_gae = delta + gamma * lam * mask * last_gae
                 tr.advantage = last_gae
                 tr.ret = last_gae + tr.value
                 next_value = tr.value
-                # Edge policy: per-target Monte-Carlo objective.  The per-target
-                # value head is the baseline, so advantage = (campaign credit +
-                # this turn's terminal share) - V_t(sampling time), and the value
-                # target is the same return (no bootstrap).
-                if isinstance(tr, EdgeTransition):
+                # Per-target Monte-Carlo objective (edge always; hier when the
+                # remastered reward populated the per-target fields).  The
+                # per-target value head is the baseline, so advantage =
+                # (campaign credit + this turn's terminal share) - V_t(sampling
+                # time), and the value target is the same return (no bootstrap).
+                if getattr(tr, "target_valid", None) is not None:
                     tv = np.asarray(tr.target_valid, dtype=bool)
                     ct = (np.zeros_like(tv, dtype=np.float32)
                           if tr.credit_target is None
@@ -1070,11 +1092,16 @@ class ReworkedBuffer:
                     # nothing and lose" carries exactly zero learning signal and
                     # the policy can collapse into permanent passivity.  Route
                     # the terminal share onto the targets that were actionable
-                    # (any valid inbound edge) at decision time.
+                    # at decision time (edge: any valid inbound edge; hier: any
+                    # attack/defend candidate).
                     if not active.any() and abs(term_share[i]) > 1e-12:
-                        em = np.asarray(tr.edge_mask, dtype=bool)
-                        if em.ndim == 2:
-                            active = em.any(axis=0)
+                        if isinstance(tr, EdgeTransition):
+                            em = np.asarray(tr.edge_mask, dtype=bool)
+                            if em.ndim == 2:
+                                active = em.any(axis=0)
+                        else:
+                            active = (np.asarray(tr.attack_mask, dtype=bool)
+                                      | np.asarray(tr.defend_mask, dtype=bool))
                     ret = ct + np.float32(term_share[i])
                     tr.ret_target = np.where(active, ret, 0.0).astype(np.float32)
                     tr.adv_target = np.where(active, ret - otv, 0.0).astype(np.float32)
@@ -1088,6 +1115,14 @@ class ReworkedBuffer:
     def is_edge(self) -> bool:
         """True when the buffer holds v9 directed-edge transitions."""
         return bool(self.data) and isinstance(self.data[0], EdgeTransition)
+
+    @property
+    def has_hier_target_credit(self) -> bool:
+        """True when hier transitions carry per-target credit fields
+        (remastered reward): the PPO update then trains the attack/defend
+        selection heads per-target like the edge policy."""
+        return (bool(self.data) and isinstance(self.data[0], HierTransition)
+                and self.data[0].target_valid is not None)
 
     def stack(self, device=None) -> dict:
         def st(attr, dtype):
@@ -1139,6 +1174,14 @@ class ReworkedBuffer:
                 "commit_frac": st("commit_frac", torch.float32),
                 "posture_u": st("posture_u", torch.float32),
             })
+            if self.has_hier_target_credit:
+                batch.update({
+                    "old_target_logp": st("old_target_logp", torch.float32),
+                    "old_target_value": st("old_target_value", torch.float32),
+                    "target_valid": st("target_valid", torch.bool),
+                    "adv_target": st("adv_target", torch.float32),
+                    "ret_target": st("ret_target", torch.float32),
+                })
         if device is not None:
             batch = {k: v.to(device) for k, v in batch.items()}
         return batch
@@ -1345,8 +1388,11 @@ def collect_episode(
     ep_rewards = {p: 0.0 for p in players}
     n_launches = 0
 
-    # Remastered (edge v10): multi-turn attack campaigns + episode-end net reward.
-    use_remastered = remastered_cfg is not None and policy_kind == "edge"
+    # Remastered (v10+): multi-turn attack campaigns + episode-end net reward.
+    # Supported by the edge policy (per-target credit slots) and the hier
+    # policy + MCF allocator (turn-level credit: campaign rewards land on the
+    # launching turn's transition reward).
+    use_remastered = remastered_cfg is not None and policy_kind in ("edge", "hier")
 
     # Legacy decision-indexed delayed credit (disabled when remastered is on).
     use_credit = bool(reward_cfg.enable_battle_credit) and not use_remastered
@@ -1718,14 +1764,30 @@ def collect_episode(
                     log_prob=float(log_prob[0]),
                     value=float(value[0]),
                 )
+                if use_remastered and "target_logp" in action:
+                    # Per-target credit path: campaign credits route onto the
+                    # selected target's slot (apply_remastered_credits) and the
+                    # attack/defend selection heads train per-target in PPO.
+                    tr.old_target_logp = action["target_logp"][0].cpu().numpy()
+                    tr.old_target_value = action["target_value"][0].cpu().numpy()
+                    tr.target_valid = (
+                        (action_row["attack_sel"] > 0.5)
+                        | (action_row["defend_sel"] > 0.5)).astype(bool)
+                    tr.credit_target = np.zeros(P_MAX, dtype=np.float32)
                 pending[p] = buffer.add(tr)
+                if need_ep_log:
+                    # Remastered credit lookups (enemy kills, source strips,
+                    # passive defense losses) resolve record_idx_at(player, turn).
+                    ep_log.add_decision(p, t, pending[p])
 
-            # Build per-fleet launch records.  For hier/launch the decision unit
-            # is the whole turn (decision_id == buffer index).  For the edge
-            # policy the decision unit is the TARGET campaign: every launch
-            # landing on the same target ``t`` shares one decision_id (mapped to
-            # that target's slot inside this turn's transition), so capture /
-            # defence / fail / source-loss credit attaches per campaign.
+            # Build per-fleet launch records.  For hier/launch (legacy credit)
+            # the decision unit is the whole turn (decision_id == buffer index).
+            # Under the remastered reward (edge OR hier) the decision unit is
+            # the TARGET campaign: every launch landing on the same target ``t``
+            # shares one campaign, so capture / defence / fail / source-loss
+            # credit attaches per campaign.  Edge transitions additionally
+            # receive the credit on their per-target slot; hier transitions
+            # take it on the turn-level reward.
             if need_ep_log and launches:
                 ids = np.asarray(obs.planet_ids).reshape(-1)
                 owner_by_id = {int(pl.id): int(pl.owner) for pl in parsed}
@@ -1736,7 +1798,7 @@ def collect_episode(
                 # currently heading *into* each source slot.  Used to stamp
                 # whether a launch stripped a planet that was already under attack.
                 enemy_in_col = None
-                if edge_kind and use_remastered:
+                if use_remastered:
                     ef = batch["edge_feats"][0].detach().cpu().numpy()
                     enemy_in_col = ef[:, :, EDGE_IDX_ENEMY_FLUX].sum(axis=0)
                 recs = []
@@ -1745,13 +1807,15 @@ def collect_episode(
                         continue
                     src_id = int(ids[L.src]); tgt_id = int(ids[L.tgt])
                     is_attack = owner_by_id.get(tgt_id, -1) != p
-                    t_local_rec = int(L.tgt) if edge_kind else -1
+                    # Remastered keys slot credits by (record_idx, t_local), so
+                    # hier launches need a real target slot too (edge: idem).
+                    t_local_rec = int(L.tgt) if (edge_kind or use_remastered) else -1
                     src_under_threat = bool(
                         enemy_in_col is not None
                         and 0 <= int(L.src) < enemy_in_col.shape[0]
                         and float(enemy_in_col[int(L.src)]) > 1e-6)
                     campaign_id = -1
-                    if edge_kind and use_remastered and campaign_ledger is not None:
+                    if use_remastered and campaign_ledger is not None:
                         t_local = int(L.tgt)
                         st = stock_before.get(p, _own_ship_stock(
                             env_obs, p, count_inflight=reward_cfg.count_inflight))
@@ -1848,8 +1912,9 @@ def collect_episode(
             if use_remastered:
                 # Campaign rewards are applied at episode end.  The episodic
                 # terminal (win/loss) is stored on its own field so ``compute_gae``
-                # can spread it into the per-target MC return (the edge policy
-                # ignores ``tr.reward``); keep it out of ``r`` to avoid double use.
+                # can spread it across the player's turns (edge: into the
+                # per-target MC return; hier: into the turn-level GAE backbone);
+                # keep it out of ``r`` to avoid double use.
                 if done and remastered_cfg is not None:
                     rp = getattr(state[p], "reward", None)
                     term = float(rp) if rp is not None else 0.0
@@ -1983,7 +2048,11 @@ def ppo_update(
     N = data["node_feats"].shape[0]
     is_launch = buffer.is_launch
     is_edge = buffer.is_edge
-    if is_edge:
+    # Hier + remastered: selection heads train per-target (like edge), the
+    # PL / commit / posture heads keep the turn-level GAE backbone.
+    hier_tgt = buffer.has_hier_target_credit
+    adv_t = None
+    if is_edge or hier_tgt:
         # Per-target advantages normalised over the valid (campaign) entries.
         adv_t = data["adv_target"]
         tv_all = data["target_valid"]
@@ -1991,8 +2060,8 @@ def ppo_update(
             v = adv_t[tv_all]
             if v.numel() > 1:
                 adv_t = (adv_t - v.mean()) / (v.std() + 1e-8)
-        adv = None
-    else:
+    adv = None
+    if not is_edge:
         adv = data["advantage"]
         if cfg.normalize_adv and N > 1:
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -2080,6 +2149,13 @@ def ppo_update(
                 )
             new_logp = ev["log_prob"]
             old_logp = data["old_log_prob"][mb]
+            if hier_tgt:
+                # The attack/defend selection log-probs train per-target below;
+                # subtract their summed contribution from the turn-level ratio
+                # so the selection heads do not receive a second, turn-level
+                # gradient (PL / commit / posture remain turn-level).
+                new_logp = new_logp - ev["target_logp"].sum(dim=1)
+                old_logp = old_logp - data["old_target_logp"][mb].sum(dim=1)
             # Clamp log-prob drift so exp(delta) cannot overflow (launch Dirichlet
             # can spike on rare minibatches after a large policy shift).
             logp_diff = torch.clamp(new_logp - old_logp, -20.0, 20.0)
@@ -2090,6 +2166,24 @@ def ppo_update(
             policy_loss = -torch.min(surr1, surr2).mean()
             value_loss = F.mse_loss(ev["value"], data["ret"][mb])
             entropy = ev["entropy"].mean()
+            if hier_tgt:
+                # Per-target PPO for the selection heads (mirrors the edge
+                # branch): clipped ratio on each planet's own selection
+                # log-prob against its campaign-credit advantage, plus the
+                # per-target value head trained on the per-target return.
+                tvm = data["target_valid"][mb] | (data["adv_target"][mb].abs() > 1e-9)
+                tvm = tvm.to(ev["target_logp"].dtype)
+                denom = tvm.sum().clamp_min(1.0)
+                new_tlp = ev["target_logp"]
+                old_tlp = data["old_target_logp"][mb]
+                ratio_t = torch.exp(torch.clamp(new_tlp - old_tlp, -20.0, 20.0))
+                at = adv_t[mb]
+                s1 = ratio_t * at
+                s2 = torch.clamp(ratio_t, 1.0 - cfg.clip, 1.0 + cfg.clip) * at
+                policy_loss = policy_loss - (torch.min(s1, s2) * tvm).sum() / denom
+                value_loss = value_loss + (
+                    (ev["target_value"] - data["ret_target"][mb]) ** 2 * tvm
+                ).sum() / denom
             aux_loss = _ppo_aux_loss(
                 ev, data["node_feats"][mb], data["planet_mask"][mb], cfg)
             loss = (policy_loss + cfg.value_coef * value_loss
@@ -2108,7 +2202,7 @@ def ppo_update(
             optimizer.step()
 
             with torch.no_grad():
-                batch_kl = float((data["old_log_prob"][mb] - new_logp).mean())
+                batch_kl = float((data["old_log_prob"][mb] - ev["log_prob"]).mean())
                 stats.policy_loss += float(policy_loss)
                 stats.value_loss += float(value_loss)
                 stats.entropy += float(entropy)

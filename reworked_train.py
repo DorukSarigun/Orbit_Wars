@@ -188,7 +188,21 @@ def load_checkpoint(path: str | Path, device: torch.device | None = None) -> tup
         n_layers=arch["n_layers"], aux_owner=arch["aux_owner"],
         n_heads=arch.get("n_heads", 4),
     ).to(device)
-    policy.load_state_dict(ckpt["policy_state_dict"])
+    state = ckpt["policy_state_dict"]
+    try:
+        policy.load_state_dict(state)
+    except RuntimeError:
+        # Newer code may add heads absent from older checkpoints (e.g. the
+        # hier ``target_value_head`` for remastered per-target credit).  Load
+        # what matches and leave the new heads at their fresh initialisation —
+        # but never tolerate unexpected/shape-mismatched keys.
+        missing, unexpected = policy.load_state_dict(state, strict=False)
+        if unexpected:
+            raise RuntimeError(
+                f"Checkpoint {path} has unexpected keys: {unexpected}")
+        print(f"Note: checkpoint predates {len(missing)} newly added "
+              f"parameter(s) ({sorted({k.split('.')[0] for k in missing})}); "
+              f"they start freshly initialised.")
     return policy, ckpt
 
 
@@ -331,9 +345,12 @@ def train(
     if train_cfg.policy_kind in ("launch", "edge") and train_cfg.min_send != 1:
         print(f"min_send={train_cfg.min_send} (launches below this are dropped)")
     if remastered_cfg is not None:
-        if train_cfg.policy_kind != "edge":
-            raise ValueError("remastered reward requires --policy edge")
-        print("Remastered attack-campaign reward (edge v10): "
+        if train_cfg.policy_kind not in ("edge", "hier"):
+            raise ValueError("remastered reward requires --policy edge or hier")
+        credit_note = ("per-target credit slots" if train_cfg.policy_kind == "edge"
+                       else "turn-level credit (hier + MCF allocator)")
+        print(f"Remastered attack-campaign reward [{train_cfg.policy_kind}, "
+              f"{credit_note}]: "
               f"w_casualty={remastered_cfg.w_casualty}, "
               f"w_delay={remastered_cfg.w_delay}, w_fail={remastered_cfg.w_fail}")
     elif train_cfg.policy_kind == "edge":

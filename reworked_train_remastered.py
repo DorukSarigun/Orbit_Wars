@@ -1,7 +1,12 @@
-"""Train the edge policy with the remastered attack-campaign reward (v10).
+"""Train the edge or hier policy with the remastered attack-campaign reward.
 
 Clean entry point — no legacy ``--battle-credit`` / ``--loss-weight`` knobs.
-The agent (``ReworkedEdgePolicy``) is unchanged; only the reward pass is new.
+The agents (``ReworkedEdgePolicy`` / ``ReworkedHierarchicalPolicy``) are
+unchanged; only the reward pass is new.
+
+* ``--policy edge`` (default): per-target credit slots (v10+).
+* ``--policy hier``: hierarchical strategy heads + min-cost-flow allocator;
+  campaign credits land on the launching turn's transition (turn-level).
 
 Usage::
 
@@ -10,6 +15,11 @@ Usage::
         --opponent frozen --opponent-ckpt checkpoints_reworked_v7_campaign/latest.pt \\
         --checkpoint-dir checkpoints_remastered_v10 \\
         --iterations 400
+
+    # hier + LP allocator with the same reward:
+    python -m reworked_train_remastered --policy hier \\
+        --opponent scripted --scripted-strategy production \\
+        --checkpoint-dir checkpoints_hier_remastered --iterations 400
 """
 
 from __future__ import annotations
@@ -26,7 +36,11 @@ except ImportError:  # pragma: no cover
 
 
 def _build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Edge policy + remastered campaign reward")
+    p = argparse.ArgumentParser(description="Edge/hier policy + remastered campaign reward")
+    p.add_argument("--policy", choices=["edge", "hier"], default="edge",
+                   dest="policy_kind",
+                   help="edge = per-target credit (v10+); hier = hierarchical "
+                        "strategy heads + min-cost-flow allocator, turn-level credit")
     p.add_argument("--iterations", type=int, default=400)
     p.add_argument("--episodes-per-iter", type=int, default=4)
     p.add_argument("--max-episode-steps", type=int, default=300)
@@ -127,7 +141,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         bc_coef=args.bc_coef,
         d_model=args.d_model,
         n_layers=args.n_layers,
-        policy_kind="edge",
+        policy_kind=args.policy_kind,
         eta_value_feature=args.eta_value_feature,
         entropy_coef=args.entropy_coef,
         entropy_coef_final=args.entropy_coef_final,
