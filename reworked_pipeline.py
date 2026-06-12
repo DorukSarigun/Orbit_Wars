@@ -82,6 +82,15 @@ try:  # package layout
         PF_IDX_RADIUS,
         PF_IDX_IS_ROTATING,
         PF_IDX_IS_COMET,
+        PF_IDX_R_SUN,
+        PF_IDX_COS_THETA,
+        PF_IDX_SIN_THETA,
+        PF_IDX_OMEGA,
+        PF_IDX_INCOMING_SELF_TOTAL,
+        PF_IDX_INCOMING_ENEMY_TOTAL,
+        PF_IDX_INCOMING_ENEMY_MIN_ETA,
+        PF_IDX_DEFENSE_DEFICIT,
+        PF_IDX_COMET_LIFE,
     )
 except ImportError:  # pragma: no cover - flat layout / direct execution
     from reworked_features import (  # type: ignore
@@ -114,6 +123,15 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
         PF_IDX_RADIUS,
         PF_IDX_IS_ROTATING,
         PF_IDX_IS_COMET,
+        PF_IDX_R_SUN,
+        PF_IDX_COS_THETA,
+        PF_IDX_SIN_THETA,
+        PF_IDX_OMEGA,
+        PF_IDX_INCOMING_SELF_TOTAL,
+        PF_IDX_INCOMING_ENEMY_TOTAL,
+        PF_IDX_INCOMING_ENEMY_MIN_ETA,
+        PF_IDX_DEFENSE_DEFICIT,
+        PF_IDX_COMET_LIFE,
     )
 
 # De-normalisation factors that mirror obs_builder._planet_features.
@@ -123,6 +141,8 @@ RADIUS_SCALE = 5.0
 
 # edge_bias channel layout (obs_builder.EDGE_FEATURE_DIM == 6).
 EDGE_BIAS_DISTANCE_IDX = 0
+EDGE_BIAS_DPHI_SIN_IDX = 3
+EDGE_BIAS_DPHI_COS_IDX = 4
 EDGE_BIAS_CROSSES_SUN_IDX = 5
 
 # Scale-parity divisor for the two speed-weighted gravity metrics so they land
@@ -152,6 +172,17 @@ class BoardState:
     distance_matrix: np.ndarray  # (n, n) float32, normalised (× BOARD_SIZE -> raw)
     crosses_sun: np.ndarray      # (n, n) float32 0/1
     remaining_turns: int
+    # ---- v12 kinematics / inbound summaries (None on legacy constructions) --
+    r_sun: Optional[np.ndarray] = None            # (n,) raw sun-centred radius
+    theta: Optional[np.ndarray] = None            # (n,) sun-centred angle [rad]
+    omega_dt: Optional[np.ndarray] = None         # (n,) per-turn angular step
+    incoming_self_total: Optional[np.ndarray] = None   # (n,) /100 normalised
+    incoming_enemy_total: Optional[np.ndarray] = None  # (n,) /100 normalised
+    enemy_min_eta: Optional[np.ndarray] = None    # (n,) raw turns; 0 = none inbound
+    defense_deficit: Optional[np.ndarray] = None  # (n,) /100 normalised
+    comet_life: Optional[np.ndarray] = None       # (n,) /50 normalised
+    dphi_sin: Optional[np.ndarray] = None         # (n, n) sin(theta_j - theta_i)
+    dphi_cos: Optional[np.ndarray] = None         # (n, n) cos(theta_j - theta_i)
 
 
 def effective_owner_from_obs(planet_feats_n: np.ndarray, player: int) -> np.ndarray:
@@ -208,6 +239,9 @@ def board_state_from_obs(
         meta = getattr(obs, "meta", {}) or {}
         remaining_turns = int(meta.get("remaining_turns", 0))
 
+    # v12 extras; tolerate legacy 34-channel planet_feats (no comet-life slot).
+    comet_life = (pf[:, PF_IDX_COMET_LIFE] if pf.shape[1] > PF_IDX_COMET_LIFE
+                  else np.zeros(n, dtype=np.float32))
     return BoardState(
         n=n,
         player=int(player),
@@ -220,6 +254,18 @@ def board_state_from_obs(
         distance_matrix=eb[:n, :n, EDGE_BIAS_DISTANCE_IDX].astype(np.float32),
         crosses_sun=eb[:n, :n, EDGE_BIAS_CROSSES_SUN_IDX].astype(np.float32),
         remaining_turns=int(remaining_turns),
+        r_sun=(pf[:, PF_IDX_R_SUN] * 50.0).astype(np.float32),
+        theta=np.arctan2(pf[:, PF_IDX_SIN_THETA],
+                         pf[:, PF_IDX_COS_THETA]).astype(np.float32),
+        omega_dt=pf[:, PF_IDX_OMEGA].astype(np.float32),
+        incoming_self_total=pf[:, PF_IDX_INCOMING_SELF_TOTAL].astype(np.float32),
+        incoming_enemy_total=pf[:, PF_IDX_INCOMING_ENEMY_TOTAL].astype(np.float32),
+        # De-normalise back to raw turns (channel stores min(eta, 50)/50; 0 = none).
+        enemy_min_eta=(pf[:, PF_IDX_INCOMING_ENEMY_MIN_ETA] * 50.0).astype(np.float32),
+        defense_deficit=pf[:, PF_IDX_DEFENSE_DEFICIT].astype(np.float32),
+        comet_life=comet_life.astype(np.float32),
+        dphi_sin=eb[:n, :n, EDGE_BIAS_DPHI_SIN_IDX].astype(np.float32),
+        dphi_cos=eb[:n, :n, EDGE_BIAS_DPHI_COS_IDX].astype(np.float32),
     )
 
 
@@ -231,21 +277,24 @@ def build_reworked_node_features(
     max_speed: float = DEFAULT_MAX_SHIP_SPEED,
     threat_support_norm: float = THREAT_SUPPORT_NORM,
     include_value_rate: bool = False,
+    recapture_counts: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Assemble the ``(n, node_dim)`` node feature matrix.
 
-    Layout: 10 ``standard_node_features`` channels followed by the 6 derived
-    metrics ``[discounted_prod, closeness, potential_threat, potential_support,
-    friendly_compactness, capture_affordability]``.  ``incoming_enemy`` (raw
-    ship units) sizes the defend side of the affordability margin; if ``None``
-    it is treated as zero (attack-side margins are unaffected).
+    Layout: 10 ``standard_node_features`` channels, the 6 derived metrics
+    ``[discounted_prod, closeness, potential_threat, potential_support,
+    friendly_compactness, capture_affordability]``, the optional
+    ``eta_aware_capture_value`` channel (when ``include_value_rate``; kept at
+    this position so legacy 17-dim checkpoints stay slice-compatible), then
+    the 7 v12 extras ``[friendly_inbound_total, enemy_inbound_total,
+    enemy_min_eta, defense_deficit, recapture_count, comet_remaining_life,
+    frontier_distance]``.
 
-    When ``include_value_rate`` is True an extra channel
-    ``eta_aware_capture_value`` is appended (``node_dim =
-    REWORKED_NODE_FEATURE_DIM + 1``): an ETA- and cost-normalised "bang for
-    buck" target value that lets the priority head rank nearby high-production
-    captures directly.  Default off keeps the legacy
-    ``REWORKED_NODE_FEATURE_DIM`` layout byte-for-byte unchanged.
+    ``incoming_enemy`` (raw ship units) sizes the defend side of the
+    affordability margin; ``None`` is treated as zero.  ``recapture_counts``
+    is an ``(n,)`` array of how many times the viewing player has already
+    captured each planet this episode (drives the reward's recapture decay,
+    so the policy must observe it); ``None`` -> zeros.
     """
     n = state.n
     player = state.player
@@ -300,6 +349,29 @@ def build_reworked_node_features(
         ).reshape(n, 1)
         channels.append(vrate)
 
+    # ---- v12 extras (zeros when the BoardState lacks the new fields) -------
+    def _col(arr, default=0.0):
+        if arr is None:
+            return np.full((n, 1), float(default), dtype=np.float32)
+        return np.asarray(arr, dtype=np.float32).reshape(n, 1)
+
+    fin = _col(state.incoming_self_total)
+    ein = _col(state.incoming_enemy_total)
+    # Raw turns -> [0, 1]; the 0 "none inbound" sentinel stays 0.
+    emeta = np.clip(_col(state.enemy_min_eta), 0.0, 50.0) / 50.0
+    dd = _col(state.defense_deficit)
+    recap = np.clip(_col(recapture_counts), 0.0, 4.0) / 4.0
+    clife = _col(state.comet_life)
+    # Frontier exposure: normalised distance to the nearest enemy planet
+    # (1.5 ~ "no enemy on the board" so interior reads as far-from-front).
+    enemy_mask = (state.owner != player) & (state.owner != -1)
+    if bool(enemy_mask.any()):
+        frontier = dist[:, enemy_mask].min(axis=1).reshape(n, 1)
+        frontier = np.clip(frontier, 0.0, 1.5).astype(np.float32)
+    else:
+        frontier = np.full((n, 1), 1.5, dtype=np.float32)
+    channels.extend([fin, ein, emeta, dd, recap, clife, frontier])
+
     node = np.concatenate(channels, axis=1)
     return node.astype(np.float32)
 
@@ -311,8 +383,10 @@ def build_reworked_edge_features(
 ) -> np.ndarray:
     """Assemble the ``(n, n, REWORKED_EDGE_FEATURE_DIM)`` edge feature tensor.
 
-    Channels: ``[distance, crosses_sun, friendly_flux, enemy_flux]``.  Fleet
-    routing arrays come straight off the observation (planet-slot pointers).
+    Channels: ``[distance, crosses_sun, friendly_flux, enemy_flux, eta,
+    dphi_sin, dphi_cos, ships_at_arrival, race_margin]``.  Fleet routing
+    arrays come straight off the observation (planet-slot pointers); the v12
+    kinematic inputs come off the :class:`BoardState`.
     """
     return edge_features(
         state.distance_matrix,
@@ -324,6 +398,15 @@ def build_reworked_edge_features(
         fleet_is_enemy=obs.fleet_is_enemy,
         fleet_mask=obs.fleet_mask,
         crosses_sun=state.crosses_sun,
+        r_sun=state.r_sun,
+        theta=state.theta,
+        omega_dt=state.omega_dt,
+        ships=state.ships,
+        production=state.production,
+        owner=state.owner,
+        enemy_min_eta=state.enemy_min_eta,
+        dphi_sin=state.dphi_sin,
+        dphi_cos=state.dphi_cos,
         **flux_kwargs,
     )
 
@@ -338,18 +421,23 @@ def build_reworked_features(
     threat_support_norm: float = THREAT_SUPPORT_NORM,
     flux_kwargs: Optional[dict] = None,
     include_value_rate: bool = False,
+    recapture_counts: Optional[np.ndarray] = None,
 ) -> dict:
     """Full single-observation feature bundle for the reworked encoder.
 
     Returns a dict with NumPy arrays:
 
-    * ``node_feats``   ``(n, 16)``
-    * ``edge_feats``   ``(n, n, 4)``
+    * ``node_feats``   ``(n, 23)`` (+1 with ``include_value_rate``)
+    * ``edge_feats``   ``(n, n, 9)``
     * ``global_feats`` ``(14,)``  (re-uses the existing global block)
     * ``planet_mask``  ``(n,)`` bool (all True; real planets only)
     * ``state``        the :class:`BoardState` (handy for the allocator)
     """
     state = board_state_from_obs(obs, player, remaining_turns=remaining_turns)
+    if recapture_counts is not None:
+        # Callers may pass a padded (P_MAX,) array; slice to real planets.
+        recapture_counts = np.asarray(
+            recapture_counts, dtype=np.float32).reshape(-1)[:state.n]
     # incoming_enemy (raw ship units) sizes the defend side of the affordability
     # margin; computed from the live fleet arrays, same as the allocator sees.
     incoming = incoming_enemy_estimate(
@@ -369,6 +457,7 @@ def build_reworked_features(
         board_size=board_size, max_speed=max_speed,
         threat_support_norm=threat_support_norm,
         include_value_rate=include_value_rate,
+        recapture_counts=recapture_counts,
     )
     edge = build_reworked_edge_features(obs, state, **(flux_kwargs or {}))
     glob = np.asarray(obs.global_feats, dtype=np.float32).reshape(-1)
@@ -392,8 +481,12 @@ def pack_reworked_batch(
     threat_support_norm: float = THREAT_SUPPORT_NORM,
     flux_kwargs: Optional[dict] = None,
     include_value_rate: bool = False,
+    recapture_counts: Optional[Sequence[Optional[np.ndarray]]] = None,
 ) -> dict:
     """Pack ``(obs, player)`` pairs into batched torch tensors for the encoder.
+
+    ``recapture_counts`` (optional) is a per-pair sequence of ``(n,)`` arrays
+    counting the viewing player's prior captures of each planet slot.
 
     Each observation may hold a different number of real planets ``n_b``; all
     are right-padded to a common ``P`` (``max_b n_b`` unless ``p_max`` given),
@@ -402,7 +495,7 @@ def pack_reworked_batch(
 
     Returns a dict with keys matching
     :meth:`reworked_model.ReworkedPlanetGraphEncoder.forward`:
-    ``node_feats (B,P,16)``, ``edge_feats (B,P,P,4)``, ``global_feats (B,14)``,
+    ``node_feats (B,P,23)``, ``edge_feats (B,P,P,9)``, ``global_feats (B,14)``,
     ``planet_mask (B,P)`` -- plus ``states`` (list of :class:`BoardState`).
     """
     import torch
@@ -415,8 +508,10 @@ def pack_reworked_batch(
             threat_support_norm=threat_support_norm,
             flux_kwargs=flux_kwargs,
             include_value_rate=include_value_rate,
+            recapture_counts=(recapture_counts[i]
+                              if recapture_counts is not None else None),
         )
-        for (obs, player) in obs_player_pairs
+        for i, (obs, player) in enumerate(obs_player_pairs)
     ]
 
     B = len(bundles)

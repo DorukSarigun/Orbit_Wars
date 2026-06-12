@@ -41,6 +41,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--entropy-coef-final", type=float, default=0.002)
     p.add_argument("--entropy-anneal-iters", type=int, default=80)
     p.add_argument("--target-kl", type=float, default=0.05)
+    p.add_argument("--minibatch-size", type=int, default=64,
+                   help="PPO/BC minibatch (edge policy is memory-heavy; lower if CUDA OOM)")
     p.add_argument("--checkpoint-every", type=int, default=20)
     p.add_argument("--checkpoint-dir", default="checkpoints_remastered")
     p.add_argument("--log-path", default=None)
@@ -52,6 +54,15 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--scripted-strategy", default="production")
     p.add_argument("--min-send", type=int, default=1)
     p.add_argument("--eta-value-feature", action="store_true")
+    # Teacher forcing + behavior cloning.
+    p.add_argument("--teacher-forcing", type=float, default=0.0,
+                   help="per-decision probability the learner plays the scripted "
+                        "bot's move (--scripted-strategy, e.g. 'orbit') instead "
+                        "of its own; those turns are not PPO transitions")
+    p.add_argument("--bc-coef", type=float, default=0.0,
+                   help="behavior-cloning weight: supervised -log pi(a_teacher|s) "
+                        "loss on teacher-forced turns (requires --teacher-forcing "
+                        "> 0); 0 = teacher only steers, no imitation")
     # Remastered reward (3 knobs + terminal).
     p.add_argument("--w-casualty", type=float, default=0.35,
                    help="max fraction of capture value removed when K=S0")
@@ -59,7 +70,7 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="max fraction of capture value removed when campaign spans full horizon")
     p.add_argument("--w-fail", type=float, default=0.25,
                    help="failed/lost-race attack penalty scale (value-relative)")
-    p.add_argument("--w-waste", type=float, default=0.0,
+    p.add_argument("--w-waste", type=float, default=0.25,
                    help="absolute wasted-ship penalty on failed attacks (prices tiny sprays)")
     p.add_argument("--waste-norm", type=float, default=50.0,
                    help="ships per 1.0 unit of waste for --w-waste")
@@ -71,7 +82,25 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="turns before a loss in which outgoing strips are blamed")
     p.add_argument("--w-enemy-kill", type=float, default=1.0,
                    help="+scale * (enemy_ships/norm) when defense destroys an attack fleet")
-    p.add_argument("--terminal-weight", type=float, default=1.0)
+    p.add_argument("--terminal-weight", type=float, default=5.0,
+                   help="episodic win/loss scale (campaign credit totals ~+10/ep, "
+                        "so winning must outweigh farming)")
+    p.add_argument("--enemy-capture-mult", type=float, default=1.5,
+                   help="capture R multiplier when the target was enemy-owned (zero-sum swing)")
+    p.add_argument("--recapture-decay", type=float, default=0.5,
+                   help="n-th capture of the same planet earns R*decay**(n-1) (anti ping-pong)")
+    p.add_argument("--timeout-terminal", type=float, default=1.0,
+                   help="scale on the production-share soft terminal when the game times out; 0 disables")
+    # v13 ship-equity units (default ON): every campaign reward in ships/norm.
+    p.add_argument("--legacy-units", action="store_true",
+                   help="use the legacy v10 mixed-unit formulas instead of the "
+                        "v13 ship-equity currency (ships/norm)")
+    p.add_argument("--eq-siege", type=float, default=1.0,
+                   help="[equity] tempo cost scale: prod_tgt * (t_capture - first_arrival) / norm "
+                        "-- prices dripped/split sieges by the defender's regrowth")
+    p.add_argument("--eq-fail", type=float, default=1.25,
+                   help="[equity] per-ship cost of failed/lost attack ships "
+                        "(1.0 = a ship is a ship; the excess is anti-spray friction)")
     return p
 
 
@@ -94,6 +123,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         opponent_ckpt=args.opponent_ckpt,
         scripted_strategy=args.scripted_strategy,
         min_send=args.min_send,
+        teacher_forcing=args.teacher_forcing,
+        bc_coef=args.bc_coef,
         d_model=args.d_model,
         n_layers=args.n_layers,
         policy_kind="edge",
@@ -107,9 +138,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         episode_log_path=args.episode_log_path,
     )
     ppo_cfg = PPOConfig(
+        clip=0.2,
+        epochs=4,
+        minibatch_size=args.minibatch_size,
         entropy_coef=args.entropy_coef,
         target_kl=(args.target_kl if args.target_kl > 0 else None),
         aux_coef=0.1,
+        bc_coef=args.bc_coef,
     )
     # Legacy reward path fully off for remastered runs.
     reward_cfg = RewardConfig(
@@ -131,7 +166,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         source_strip_window=args.source_strip_window,
         w_enemy_kill=args.w_enemy_kill,
         terminal_weight=args.terminal_weight,
+        enemy_capture_mult=args.enemy_capture_mult,
+        recapture_decay=args.recapture_decay,
+        timeout_terminal=args.timeout_terminal,
+        ship_equity=not args.legacy_units,
+        eq_siege=args.eq_siege,
+        eq_fail=args.eq_fail,
     )
+    if remastered_cfg.ship_equity:
+        print(f"Reward units: v13 ship-equity (eq_siege={remastered_cfg.eq_siege}, "
+              f"eq_fail={remastered_cfg.eq_fail}, norm={remastered_cfg.norm})")
+    else:
+        print("Reward units: legacy v10 mixed-unit formulas")
     train(train_cfg, ppo_cfg, reward_cfg,
           resume_from=args.resume_from, remastered_cfg=remastered_cfg)
 

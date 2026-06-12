@@ -87,3 +87,103 @@ def test_act_sends_backline_support_when_frontline_threatened():
     assert actions
     reinforcements = [a for a in actions if int(a[0]) == 0 and int(a[2]) > 0]
     assert reinforcements, "expected backline planet 0 to reinforce frontline"
+
+
+def _mk_env(planets, fleets=None):
+    return {
+        "planets": planets,
+        "fleets": fleets or [],
+        "initial_planets": planets,
+        "angular_velocity": 0.0,
+        "comet_planet_ids": [],
+        "comets": [],
+    }
+
+
+def test_no_partial_wave_on_unaffordable_neutral():
+    """All-or-nothing: budget 10 vs neutral garrison 50 → zero launches."""
+    env = _mk_env([
+        [0, 0, 20.0, 20.0, 1.0, 10, 1],
+        [1, -1, 20.0, 70.0, 1.0, 50, 3],
+    ])
+    agent = OrbitScriptedAgent()
+    actions = agent.act(env, player=0, current_turn=10, max_turns=250)
+    assert actions == [], f"expected no wasted partial wave, got {actions}"
+
+
+def test_unsavable_planet_abandoned_and_evacuated():
+    """Help arrives after the threat lands → no reinforcement; doomed garrison
+    is evacuated to the backline instead."""
+    import math as _math
+    fleets = [[9, 2, 20.0, 45.0, _math.pi / 2, 2, 50]]  # 50 ships, ~1.5 turns out
+    env = _mk_env(
+        [
+            [0, 0, 20.0, 50.0, 1.0, 3, 1],    # doomed frontline
+            [1, 0, 20.0, 95.0, 1.0, 40, 2],   # backline, ~13 turns away
+            [2, 1, 20.0, 5.0, 1.0, 30, 2],    # enemy source
+        ],
+        fleets=fleets,
+    )
+    cfg = OrbitScriptedConfig(include_neutrals=False, include_enemies=False)
+    agent = OrbitScriptedAgent(cfg=cfg)
+    actions = agent.act(env, player=0, current_turn=10, max_turns=250)
+    # No reinforcement from backline (would land after the planet falls).
+    assert not any(int(a[0]) == 1 for a in actions), actions
+    # Garrison evacuated off the doomed planet.
+    evac = [a for a in actions if int(a[0]) == 0]
+    assert evac and int(evac[0][2]) == 3, actions
+
+
+def test_consolidation_pushes_idle_backline_to_front():
+    """No attack, no support need → idle backline surplus rallies forward."""
+    env = _mk_env([
+        [0, 0, 20.0, 20.0, 1.0, 50, 2],   # backline (enemy unreachable: blocked)
+        [1, 0, 20.0, 50.0, 1.0, 30, 2],   # frontline (sees enemy)
+        [2, 1, 20.0, 80.0, 1.0, 10, 2],   # enemy
+    ])
+    cfg = OrbitScriptedConfig(
+        include_neutrals=False,
+        include_enemies=False,
+        support_threat_threshold=999.0,
+        consolidation_min_surplus=10.0,
+        consolidation_min_send=5,
+    )
+    agent = OrbitScriptedAgent(cfg=cfg)
+    actions = agent.act(env, player=0, current_turn=5, max_turns=250)
+    pushes = [a for a in actions if int(a[0]) == 0 and int(a[2]) >= 5]
+    assert pushes, f"expected consolidation launch from backline, got {actions}"
+
+
+def test_comet_garrison_evacuated_before_expiry():
+    """Owned comet with 1 turn of life left → garrison flees to nearest planet."""
+    path = [[20.0, 52.0 + 2.0 * i] for i in range(10)]
+    planets = [
+        [0, 0, 20.0, 20.0, 1.0, 40, 2],
+        [3, 0, 20.0, 68.0, 1.0, 12, 0],
+    ]
+    env = {
+        "planets": planets,
+        "fleets": [],
+        "initial_planets": planets,
+        "angular_velocity": 0.0,
+        "comet_planet_ids": [3],
+        "comets": [{"planet_ids": [3], "paths": [path], "path_index": 8}],
+    }
+    agent = OrbitScriptedAgent()
+    actions = agent.act(env, player=0, current_turn=20, max_turns=250)
+    evac = [a for a in actions if int(a[0]) == 3]
+    assert evac and int(evac[0][2]) == 12, actions
+
+
+def test_one_source_can_fund_two_waves():
+    """Per-source single-launch restriction removed: one rich planet captures
+    two cheap neutrals in the same turn."""
+    env = _mk_env([
+        [0, 0, 20.0, 20.0, 1.0, 60, 2],
+        [1, -1, 20.0, 50.0, 1.0, 5, 3],
+        [2, -1, 50.0, 20.0, 1.0, 5, 3],
+    ])
+    agent = OrbitScriptedAgent()
+    actions = agent.act(env, player=0, current_turn=10, max_turns=250)
+    attack_launches = [a for a in actions if int(a[0]) == 0]
+    assert len(attack_launches) >= 2, actions

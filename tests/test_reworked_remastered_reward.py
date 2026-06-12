@@ -409,6 +409,214 @@ def test_attack_enemy_kill_on_capture_turn(monkeypatch):
     assert (1, 3) in slot_credits
 
 
+def _capture_camp(**overrides) -> PlanetCampaign:
+    camp = PlanetCampaign(
+        campaign_id=0, role="attack", player=0, tgt_id=10, t_decision=5,
+        K=0.0, S_end=100.0, outcome="capture", t_resolve=10, prod_at_close=4.0)
+    for k, v in overrides.items():
+        setattr(camp, k, v)
+    return camp
+
+
+def test_enemy_capture_mult_scales_enemy_owned_capture():
+    from reworked_remastered_reward import _campaign_net_reward
+    cfg = RemasteredRewardConfig(enemy_capture_mult=1.5)
+    r_neutral = _campaign_net_reward(_capture_camp(), 300, cfg)
+    r_enemy = _campaign_net_reward(_capture_camp(tgt_was_enemy=True), 300, cfg)
+    assert r_neutral > 0.0
+    assert r_enemy == pytest.approx(1.5 * r_neutral)
+
+
+def test_recapture_decay_suppresses_pingpong_farm():
+    from reworked_remastered_reward import _campaign_net_reward
+    cfg = RemasteredRewardConfig(recapture_decay=0.5)
+    r0 = _campaign_net_reward(_capture_camp(), 300, cfg)
+    r1 = _campaign_net_reward(_capture_camp(recapture_idx=1), 300, cfg)
+    r2 = _campaign_net_reward(_capture_camp(recapture_idx=2), 300, cfg)
+    assert r1 == pytest.approx(0.5 * r0)
+    assert r2 == pytest.approx(0.25 * r0)
+
+
+def test_ledger_tracks_recapture_count_per_player_planet():
+    ledger = CampaignLedger()
+    ledger.note_attack(player=0, tgt_id=10, t_decision=1, stock=50.0,
+                       record_idx=0, t_local=2, ships=10)
+    c1 = ledger.close(0, 10, "attack", outcome="capture", t_resolve=3, prod=3.0)
+    ledger.note_attack(player=0, tgt_id=10, t_decision=8, stock=50.0,
+                       record_idx=4, t_local=2, ships=10)
+    c2 = ledger.close(0, 10, "attack", outcome="capture", t_resolve=12, prod=3.0)
+    # Different planet / non-capture outcomes do not advance the counter.
+    ledger.note_attack(player=0, tgt_id=11, t_decision=14, stock=50.0,
+                       record_idx=6, t_local=3, ships=10)
+    c3 = ledger.close(0, 11, "attack", outcome="capture", t_resolve=16, prod=3.0)
+    assert c1.recapture_idx == 0
+    assert c2.recapture_idx == 1
+    assert c3.recapture_idx == 0
+
+
+def test_lost_race_counts_inflight_ships_as_casualties():
+    """Fleets still flying toward a lost target are wasted — they enter K."""
+    ledger = CampaignLedger()
+    ledger.note_attack(player=0, tgt_id=10, t_decision=5, stock=100.0,
+                       record_idx=0, t_local=2, ships=20)
+    ledger.note_attack(player=0, tgt_id=10, t_decision=5, stock=100.0,
+                       record_idx=0, t_local=2, ships=30)
+
+    log = EpisodeLog(max_turns=300, policy_players={0})
+    for turn, owner10, fids in [
+        (5, -1, {1, 2}),
+        (10, 1, {2}),      # enemy wins the race; fleet 1 arrived & died
+        (12, 1, set()),    # fleet 2 lands on the enemy-held planet later
+    ]:
+        log.snapshots.append(TurnSnapshot(
+            turn=turn, owner={10: owner10}, ships={10: 50.0},
+            production={10: 3.0}, fleet_ids=set(fids)))
+    log.launches = [
+        LaunchRecord(decision_id=0, campaign_id=0, player=0, launch_turn=5,
+                     src_id=1, tgt_id=10, ships=20, is_attack=True, fleet_id=1,
+                     t_local=2),
+        LaunchRecord(decision_id=0, campaign_id=0, player=0, launch_turn=5,
+                     src_id=1, tgt_id=10, ships=30, is_attack=True, fleet_id=2,
+                     t_local=2),
+    ]
+    slot_credits, stats = attribute_remastered_rewards(log, ledger, CFG)
+    assert stats.n_lost == 1
+    lost = [c for c in ledger.closed if c.outcome == "lost"][0]
+    assert lost.K == pytest.approx(50.0)   # 20 arrived + 30 in flight
+    assert slot_credits[(0, 2)] < 0.0
+
+
+def test_timeout_terminal_score_sign_and_symmetry():
+    from reworked_rollout import _timeout_terminal_score
+    obs = {
+        "planets": [
+            [1, 0, 0.0, 0.0, 5.0, 30, 5],   # P0, prod 5
+            [2, 1, 0.0, 0.0, 5.0, 30, 2],   # P1, prod 2
+            [3, -1, 0.0, 0.0, 5.0, 30, 4],  # neutral ignored
+        ],
+        "fleets": [],
+    }
+    s0 = _timeout_terminal_score(obs, 0)
+    s1 = _timeout_terminal_score(obs, 1)
+    assert s0 > 0.0 > s1
+    assert s0 == pytest.approx(-s1)
+    # Dead even -> ~0
+    even = {"planets": [[1, 0, 0.0, 0.0, 5.0, 30, 3],
+                        [2, 1, 0.0, 0.0, 5.0, 30, 3]], "fleets": []}
+    assert _timeout_terminal_score(even, 0) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# v13 ship-equity mode
+# ---------------------------------------------------------------------------
+EQ = RemasteredRewardConfig(ship_equity=True)
+
+
+def test_equity_enemy_capture_is_double_neutral():
+    from reworked_remastered_reward import capture_reward_equity
+    V = dpp_value(prod=4.0, remaining_turns=200, cfg=EQ)
+    r_neutral = capture_reward_equity(V, K=0.0, siege_turns=0, prod=4.0,
+                                      tgt_was_enemy=False, recapture_idx=0, cfg=EQ)
+    r_enemy = capture_reward_equity(V, K=0.0, siege_turns=0, prod=4.0,
+                                    tgt_was_enemy=True, recapture_idx=0, cfg=EQ)
+    assert r_neutral == pytest.approx(V)
+    assert r_enemy == pytest.approx(2.0 * V)   # zero-sum swing is intrinsic
+
+
+def test_equity_pyrrhic_capture_goes_negative():
+    """Spending far more ships than the planet is worth nets a loss — by design."""
+    from reworked_remastered_reward import capture_reward_equity
+    V = dpp_value(prod=1.0, remaining_turns=50, cfg=EQ)   # tiny rock
+    R = capture_reward_equity(V, K=200.0, siege_turns=0, prod=1.0,
+                              tgt_was_enemy=False, recapture_idx=0, cfg=EQ)
+    assert R < 0.0
+    assert R == pytest.approx(V - 200.0 / EQ.norm)
+
+
+def test_equity_siege_costs_defender_regrowth():
+    """A dripped 20-turn siege of a prod-5 planet costs 100 regrown ships."""
+    from reworked_remastered_reward import capture_reward_equity
+    V = dpp_value(prod=5.0, remaining_turns=200, cfg=EQ)
+    r_blitz = capture_reward_equity(V, K=30.0, siege_turns=0, prod=5.0,
+                                    tgt_was_enemy=False, recapture_idx=0, cfg=EQ)
+    r_drip = capture_reward_equity(V, K=30.0, siege_turns=20, prod=5.0,
+                                   tgt_was_enemy=False, recapture_idx=0, cfg=EQ)
+    assert r_drip == pytest.approx(r_blitz - EQ.eq_siege * 5.0 * 20 / EQ.norm)
+    assert r_blitz > r_drip
+
+
+def test_equity_recapture_decay_discounts_gain_not_cost():
+    from reworked_remastered_reward import capture_reward_equity
+    V = dpp_value(prod=4.0, remaining_turns=200, cfg=EQ)
+    K = 40.0
+    r0 = capture_reward_equity(V, K=K, siege_turns=0, prod=4.0,
+                               tgt_was_enemy=False, recapture_idx=0, cfg=EQ)
+    r1 = capture_reward_equity(V, K=K, siege_turns=0, prod=4.0,
+                               tgt_was_enemy=False, recapture_idx=1, cfg=EQ)
+    # Gain halves; the casualty cost is identical in both.
+    assert r0 == pytest.approx(V - K / EQ.norm)
+    assert r1 == pytest.approx(EQ.recapture_decay * V - K / EQ.norm)
+
+
+def test_equity_fail_prices_ships_absolutely():
+    """No K/S_end: 20 wasted ships cost the same for rich and poor empires."""
+    from reworked_remastered_reward import fail_reward_equity
+    R = fail_reward_equity(K=20.0, siege_turns=0, prod=3.0, cfg=EQ)
+    assert R == pytest.approx(-EQ.eq_fail * 20.0 / EQ.norm)
+    # Spray that kept the defender producing for 10 turns pays the regrowth too.
+    R_spray = fail_reward_equity(K=20.0, siege_turns=10, prod=3.0, cfg=EQ)
+    assert R_spray == pytest.approx(R - EQ.eq_siege * 3.0 * 10 / EQ.norm)
+
+
+def test_equity_defense_loss_is_double_swing_plus_dead_garrison():
+    from reworked_remastered_reward import defense_loss_reward_equity
+    V = dpp_value(prod=5.0, remaining_turns=200, cfg=EQ)
+    R = defense_loss_reward_equity(V, K=25.0, cfg=EQ)
+    assert R == pytest.approx(-(2.0 * V + 25.0 / EQ.norm))
+
+
+def test_equity_enemy_kill_is_absolute_ships():
+    """Same kills, same credit — enemy empire size no longer dilutes it."""
+    r_small = enemy_kill_reward(kills=30.0, enemy_stock=50.0, cfg=EQ)
+    r_big = enemy_kill_reward(kills=30.0, enemy_stock=5000.0, cfg=EQ)
+    assert r_small == pytest.approx(r_big) == pytest.approx(30.0 / EQ.norm)
+    # Legacy mode keeps the stock-share scaling.
+    assert enemy_kill_reward(30.0, 50.0, CFG) > enemy_kill_reward(30.0, 5000.0, CFG)
+
+
+def test_equity_pingpong_trade_nets_negative():
+    """Capture enemy planet (+2V') then lose it back (-2V): with any casualties
+    the round trip is net negative, so farming flips cannot pay."""
+    from reworked_remastered_reward import (
+        capture_reward_equity, defense_loss_reward_equity)
+    V = dpp_value(prod=4.0, remaining_turns=200, cfg=EQ)
+    gain = capture_reward_equity(V, K=10.0, siege_turns=0, prod=4.0,
+                                 tgt_was_enemy=True, recapture_idx=0, cfg=EQ)
+    # A few turns later it flips back (V barely changed, garrison died too).
+    loss = defense_loss_reward_equity(V, K=5.0, cfg=EQ)
+    assert gain + loss < 0.0
+
+
+def test_equity_first_contact_siege_duration_from_log():
+    """_campaign_net_reward derives siege turns from the first arrival."""
+    from reworked_remastered_reward import _campaign_net_reward
+    log = EpisodeLog(max_turns=300, policy_players=[0])
+    camp = PlanetCampaign(campaign_id=1, role="attack", player=0, tgt_id=7,
+                          t_decision=10, K=20.0, S_end=100.0)
+    camp.outcome = "capture"
+    camp.t_resolve = 40
+    camp.prod_at_close = 5.0
+    # Two waves: first lands t=25, capture lands t=40 -> 15 siege turns.
+    for fid, (lt, rt) in enumerate([(10, 25), (28, 40)]):
+        log.launches.append(LaunchRecord(
+            decision_id=0, player=0, launch_turn=lt, src_id=1, tgt_id=7,
+            ships=30, fleet_id=fid, is_attack=True, campaign_id=1, t_local=7,
+            resolve_turn=rt))
+    R_with_log = _campaign_net_reward(camp, 300, EQ, log)
+    R_no_log = _campaign_net_reward(camp, 300, EQ, None)
+    assert R_no_log - R_with_log == pytest.approx(EQ.eq_siege * 5.0 * 15 / EQ.norm)
+
+
 def test_attack_enemy_kill_skips_neutral_target(monkeypatch):
     """Assaulting a neutral planet does not earn enemy-kill credit."""
     monkeypatch.setattr(

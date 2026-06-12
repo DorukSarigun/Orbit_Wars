@@ -45,7 +45,7 @@ def test_unreachable_edge_excluded_from_potential():
 def test_realized_threat_from_incoming_fleet():
     fleets = [[9, 1, 48.0, 22.0, math.atan2(50 - 20, 20 - 80), 2, 20]]
     og = build_orbit_graph(_env_vertical(fleets=fleets), player=0)
-    state = compute_planet_defense(og, 0, horizon=30.0)
+    state = compute_planet_defense(og, 0, horizon_cap=30.0)
     assert state is not None
     threats = og.incoming_threats(planet_id=0)
     if threats:

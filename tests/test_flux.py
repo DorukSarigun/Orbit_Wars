@@ -278,8 +278,9 @@ def test_encoder_input_dim_grows_with_flux_flag():
     # what the encoder actually expects on input.
     proj_in_off = enc_off.node_proj[1].in_features
     proj_in_on = enc_on.node_proj[1].in_features
-    assert proj_in_off == 44
-    assert proj_in_on == 48
+    assert proj_in_off == PYG_PLANET_FEATURE_DIM
+    assert proj_in_on == PYG_PLANET_FEATURE_DIM_FLUX
+    assert proj_in_on == proj_in_off + 4
 
 
 def test_observation_to_pyg_data_respects_flux_features():
@@ -287,15 +288,18 @@ def test_observation_to_pyg_data_respects_flux_features():
     pytest.importorskip("torch")
     pytest.importorskip("torch_geometric")
     import torch
-    from model_graph_pyg import GRAPH_NODE_FLUX_DIM, observation_to_pyg_data
+    from model_graph_pyg import (
+        GRAPH_NODE_FLUX_DIM, observation_to_pyg_data,
+        PYG_PLANET_FEATURE_DIM, PYG_PLANET_FEATURE_DIM_FLUX,
+    )
 
     obs, _ = _build_real_obs_from_env()
     n = int(obs.planet_mask.sum())
     flux = torch.zeros(obs.planet_feats.shape[0], GRAPH_NODE_FLUX_DIM)
     data_off = observation_to_pyg_data(obs)
     data_on = observation_to_pyg_data(obs, flux_features=flux)
-    assert data_off.x.shape == (n, 44)
-    assert data_on.x.shape == (n, 48)
+    assert data_off.x.shape == (n, PYG_PLANET_FEATURE_DIM)
+    assert data_on.x.shape == (n, PYG_PLANET_FEATURE_DIM_FLUX)
 
 
 def test_packed_observations_to_pyg_batch_with_flux_shape_error():

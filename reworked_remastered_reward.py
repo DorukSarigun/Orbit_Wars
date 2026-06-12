@@ -16,8 +16,34 @@ Defense loss (planet flips away from us)::
 stock at ``t_resolve``.  Rewards split across participating turns by launch share.
 Attack launches whose fleets **arrive after** capture (``resolve_turn > t_capture``)
 are reclassified as **defense** reinforcements — they do not share capture credit.
+Enemy-owned captures are scaled by ``enemy_capture_mult`` (zero-sum swing) and the
+n-th recapture of the same planet decays by ``recapture_decay**(n-1)``.  When a
+campaign closes as ``lost`` / ``defense_loss``, fleets still in flight toward the
+flipped target count as casualties (``K``) — losing the race is not free.
 If a planet is lost without any reinforcement launch, the production penalty still
 applies to the **decision turn** that last owned the planet (``TurnDecision`` ref).
+
+**Ship-equity mode (v13, ``cfg.ship_equity=True``)** re-denominates every formula
+in a single currency: *ships* (divided by ``norm``).  ``V = dpp`` is already
+"discounted future ships from production / norm", so V and ``K/norm`` become
+directly commensurable::
+
+    capture       R = V·(2 if enemy else 1)·decay^n  -  K/norm  -  eq_siege·prod·Δt_siege/norm
+    fail / lost   R = -(eq_fail·K + eq_siege·prod·Δt_siege) / norm
+    defense loss  R = -(w_defense_loss·2V + K/norm)
+    enemy kill    R = +w_enemy_kill·kills/norm          (absolute ships, not stock share)
+
+* The enemy-capture 2x swing is **intrinsic** (zero-sum: they lose V, we gain V)
+  — ``enemy_capture_mult`` is ignored in this mode.
+* ``Δt_siege = t_capture - first_arrival``: the defender regrows
+  ``prod·Δt_siege`` ships while a split/dripped assault is in progress, so
+  spraying small fleets is priced exactly by the production it lets the
+  defender bank.  A single decisive fleet has ``Δt_siege = 0``.
+* A casualty always costs ``1 ship`` regardless of empire size (no ``K/S_end``
+  vanishing), and pyrrhic captures can be **net negative** — by design.
+* Unused in this mode: ``w_casualty, w_delay, w_fail, w_waste, waste_norm,
+  min_mult, enemy_capture_mult``.  ``recapture_decay`` applies to the capture
+  *gain* only (costs are never discounted).
 """
 
 from __future__ import annotations
@@ -55,11 +81,22 @@ class RemasteredRewardConfig:
     count_inflight: bool = True   # enemy stock = garrisons + in-flight (mirrors own S_end)
     min_mult: float = 0.05
     terminal_weight: float = 1.0
+    # Capturing an *enemy-owned* planet is a zero-sum swing (we gain V, they
+    # lose V) — worth more than grabbing a neutral.  Multiplies capture R when
+    # ``tgt_was_enemy``.  1.0 disables.
+    enemy_capture_mult: float = 1.5
+    # n-th capture of the same planet by the same player earns
+    # ``R * recapture_decay**(n-1)`` — kills the ping-pong capture-farm loop
+    # where both self-play seats trade a planet back and forth for credit.
+    recapture_decay: float = 0.5
+    # Timeout (no winner at max_steps) soft terminal: scale on the
+    # production-share score added to the last decision turn.  0 disables.
+    timeout_terminal: float = 1.0
     # Absolute wasted-ship penalty on failed/lost attacks.  Unlike ``w_fail``
     # (which divides K by the player's *total* stock and so vanishes when the
     # agent hoards), this charges a fixed cost per ship thrown away, pricing the
     # tiny-spray behaviour regardless of empire size.
-    w_waste: float = 0.0
+    w_waste: float = 0.25
     waste_norm: float = 50.0      # ships per "1.0" unit of waste
     # Source over-extension: when an owned planet that was *under threat* at
     # launch time is stripped by outgoing fleets and then falls within
@@ -67,6 +104,18 @@ class RemasteredRewardConfig:
     # by the stripped share) back onto the launching edges.  0 disables.
     w_source_strip: float = 0.0
     source_strip_window: int = 10
+    # ---- v13 ship-equity mode (see module docstring) ----------------------
+    # All campaign rewards in one currency: ships / norm.  dpp is already
+    # "future ships / norm", so capture value and casualties become directly
+    # comparable; most legacy knobs are unused (and the enemy 2x is intrinsic).
+    ship_equity: bool = False
+    # Tempo cost: the defender regrows ``prod * (t_capture - first_arrival)``
+    # ships during a dripped siege.  Scales that term; 0 disables.
+    eq_siege: float = 1.0
+    # Per-ship cost of failed/lost attack ships.  1.0 = "a ship is a ship";
+    # the extra 0.25 is deliberate anti-spray friction (a 1:1 garrison trade
+    # is never free because the transit time is dead capital).
+    eq_fail: float = 1.25
 
 
 @dataclass
@@ -93,6 +142,7 @@ class PlanetCampaign:
     t_resolve: int = -1
     prod_at_close: float = 0.0
     tgt_was_enemy: bool = False   # attack: target was enemy-owned at campaign open (not neutral)
+    recapture_idx: int = 0        # 0 = first capture of this planet by this player
 
 
 @dataclass
@@ -131,6 +181,9 @@ class CampaignLedger:
         self._active: dict[tuple[int, int, str], PlanetCampaign] = {}
         self.closed: list[PlanetCampaign] = []
         self.passive_losses: list[PassiveDefenseLoss] = []
+        # (player, tgt_id) -> how many times this player already captured it
+        # (drives the recapture_decay multiplier).
+        self.capture_count: dict[tuple[int, int], int] = {}
         # Over-extension penalties: (record_idx, t_local, reward<0) charged to the
         # launching edge that stripped a threatened source which then fell.
         self.source_strips: list[tuple[int, int, float]] = []
@@ -195,6 +248,10 @@ class CampaignLedger:
         camp.t_resolve = int(t_resolve)
         camp.prod_at_close = float(prod)
         camp.S_end = _stock_at_resolve(camp)
+        if camp.outcome == "capture":
+            ck = (int(player), int(tgt_id))
+            camp.recapture_idx = int(self.capture_count.get(ck, 0))
+            self.capture_count[ck] = camp.recapture_idx + 1
         self.closed.append(camp)
         return camp
 
@@ -283,6 +340,63 @@ def fail_reward(V: float, K: float, S_end: float, cfg: RemasteredRewardConfig) -
     return -cfg.w_fail * V * f_loss - cfg.w_waste * waste
 
 
+# ---------------------------------------------------------------------------
+# v13 ship-equity formulas (cfg.ship_equity=True) — single currency: ships/norm
+# ---------------------------------------------------------------------------
+def capture_reward_equity(V: float, K: float, siege_turns: int, prod: float,
+                          *, tgt_was_enemy: bool, recapture_idx: int,
+                          cfg: RemasteredRewardConfig) -> float:
+    """Equity swing of a capture, minus dead ships, minus siege regrowth.
+
+    ``V`` (dpp) is the planet's discounted future production in ships/norm.
+    Taking it from the *enemy* swings both ledgers -> intrinsic 2x.  Decay
+    discounts only the gain (re-flipping a planet never discounts your losses),
+    so ping-pong farming nets <= 0 once casualties are counted.
+    """
+    norm = max(float(cfg.norm), 1e-6)
+    gain = max(float(V), 0.0) * (2.0 if tgt_was_enemy else 1.0)
+    if recapture_idx > 0:
+        gain *= cfg.recapture_decay ** int(recapture_idx)
+    siege = cfg.eq_siege * max(float(prod), 0.0) * max(int(siege_turns), 0) / norm
+    return gain - max(float(K), 0.0) / norm - siege
+
+
+def fail_reward_equity(K: float, siege_turns: int, prod: float,
+                       cfg: RemasteredRewardConfig) -> float:
+    """Failed / lost-race attack: every thrown-away ship costs ``eq_fail``
+    ships (>1.0 adds anti-spray friction), plus the production the defender
+    banked while the dripped assault was in progress."""
+    norm = max(float(cfg.norm), 1e-6)
+    siege = cfg.eq_siege * max(float(prod), 0.0) * max(int(siege_turns), 0)
+    return -(cfg.eq_fail * max(float(K), 0.0) + siege) / norm
+
+
+def defense_loss_reward_equity(V: float, K: float,
+                               cfg: RemasteredRewardConfig) -> float:
+    """Losing an owned planet: the planet's future production swings to the
+    enemy (zero-sum 2x) and the garrison / doomed reinforcements are dead."""
+    norm = max(float(cfg.norm), 1e-6)
+    return -(cfg.w_defense_loss * 2.0 * max(float(V), 0.0)
+             + max(float(K), 0.0) / norm)
+
+
+def _campaign_first_contact(log: EpisodeLog, camp: PlanetCampaign) -> int:
+    """Turn the campaign's first attack wave arrived (``t_resolve`` if none).
+
+    ``t_capture - first_contact`` is the siege duration: how long the defender
+    kept producing while the (split) assault was underway.
+    """
+    ts = [
+        int(r.resolve_turn) for r in log.launches
+        if int(r.campaign_id) == int(camp.campaign_id)
+        and r.is_attack
+        and int(r.player) == int(camp.player)
+        and int(r.tgt_id) == int(camp.tgt_id)
+        and int(r.resolve_turn) >= 0
+    ]
+    return min(ts) if ts else int(camp.t_resolve)
+
+
 def _ship_stock_by_owner(planets, fleets, *, count_inflight: bool) -> dict[int, float]:
     """Total ships per owner = garrisons (+ in-flight fleets when enabled)."""
     stock: dict[int, float] = {}
@@ -307,7 +421,13 @@ def enemy_kill_reward(kills: float, enemy_stock: float,
 
     Mirrors own casualty scaling ``K / S_end``: the reward is proportional to
     the fraction of the enemy's total fleet eliminated (clipped to [0, 1]).
+
+    In ship-equity mode the credit is **absolute** (``kills / norm``): a
+    destroyed ship is a destroyed ship, regardless of how big the enemy
+    empire happens to be.
     """
+    if cfg.ship_equity:
+        return cfg.w_enemy_kill * max(float(kills), 0.0) / max(float(cfg.norm), 1e-6)
     frac = float(np.clip(
         max(float(kills), 0.0) / max(float(enemy_stock), 1.0), 0.0, 1.0))
     return cfg.w_enemy_kill * frac
@@ -522,6 +642,30 @@ def _source_strip_loss(
     return out
 
 
+def _inflight_campaign_ships(log: EpisodeLog, camp: PlanetCampaign,
+                             t_step: int) -> float:
+    """Ships of ``camp``'s launches still in flight at ``t_step``.
+
+    When an attack loses the race (or a defended planet falls) those fleets are
+    doomed — they arrive at a planet that already flipped — so they count as
+    campaign casualties instead of disappearing for free.  Matched by
+    ``(player, tgt_id, role)`` since the active campaign per key is unique.
+    """
+    is_attack_role = camp.role == ROLE_ATTACK
+    total = 0.0
+    for r in log.launches:
+        if int(r.player) != int(camp.player) or int(r.tgt_id) != int(camp.tgt_id):
+            continue
+        if bool(r.is_attack) != is_attack_role:
+            continue
+        if int(r.launch_turn) < int(camp.t_decision):
+            continue
+        rt = int(r.resolve_turn)
+        if rt < 0 or rt > int(t_step):
+            total += float(r.ships)
+    return total
+
+
 def _accumulate_and_close(log: EpisodeLog, ledger: CampaignLedger,
                           cfg: RemasteredRewardConfig) -> None:
     snaps = log.snapshots
@@ -591,6 +735,8 @@ def _accumulate_and_close(log: EpisodeLog, ledger: CampaignLedger,
                     for r in arrivals_by_tgt.get(pid, []):
                         if not r.is_attack and r.player == player:
                             dcamp.K += float(r.ships)
+                    # Reinforcements still in flight land on a lost planet.
+                    dcamp.K += _inflight_campaign_ships(log, dcamp, t_step)
                     ledger.close(player, pid, ROLE_DEFENSE, outcome="defense_loss",
                                  t_resolve=t_step, prod=prod)
                 else:
@@ -618,6 +764,8 @@ def _accumulate_and_close(log: EpisodeLog, ledger: CampaignLedger,
                 for r in arrivals_by_tgt.get(pid, []):
                     if r.is_attack and r.player == int(player):
                         acamp.K += float(r.ships)
+                # Fleets still flying toward the lost target are wasted too.
+                acamp.K += _inflight_campaign_ships(log, acamp, t_step)
                 ledger.close(int(player), pid, ROLE_ATTACK, outcome="lost",
                              t_resolve=t_step, prod=prod)
 
@@ -647,13 +795,37 @@ def _accumulate_and_close(log: EpisodeLog, ledger: CampaignLedger,
 
 
 def _campaign_net_reward(camp: PlanetCampaign, max_turns: int,
-                         cfg: RemasteredRewardConfig) -> float:
+                         cfg: RemasteredRewardConfig,
+                         log: Optional[EpisodeLog] = None) -> float:
     R_rem = max(0, max_turns - camp.t_resolve)
     V = dpp_value(camp.prod_at_close, R_rem, cfg)
     delta = max(0, camp.t_resolve - camp.t_decision)
+
+    if cfg.ship_equity:
+        siege = 0
+        if log is not None and camp.role == ROLE_ATTACK:
+            siege = max(0, int(camp.t_resolve) - _campaign_first_contact(log, camp))
+        if camp.role == ROLE_ATTACK:
+            if camp.outcome == "capture":
+                return capture_reward_equity(
+                    V, camp.K, siege, camp.prod_at_close,
+                    tgt_was_enemy=camp.tgt_was_enemy,
+                    recapture_idx=camp.recapture_idx, cfg=cfg)
+            if camp.outcome in ("lost", "fail"):
+                return fail_reward_equity(camp.K, siege, camp.prod_at_close, cfg)
+        elif camp.role == ROLE_DEFENSE:
+            if camp.outcome == "defense_loss":
+                return defense_loss_reward_equity(V, camp.K, cfg)
+        return 0.0
+
     if camp.role == ROLE_ATTACK:
         if camp.outcome == "capture":
-            return capture_reward(V, camp.K, camp.S_end, delta, max_turns, cfg)
+            R = capture_reward(V, camp.K, camp.S_end, delta, max_turns, cfg)
+            if camp.tgt_was_enemy:
+                R *= cfg.enemy_capture_mult
+            if camp.recapture_idx > 0:
+                R *= cfg.recapture_decay ** camp.recapture_idx
+            return R
         if camp.outcome in ("lost", "fail"):
             # Price the waste by the value the agent was *pursuing* when it
             # committed (horizon from ``t_decision``), not the value left at
@@ -786,7 +958,7 @@ def attribute_remastered_rewards(
     stats = RemasteredStats()
 
     for camp in ledger.closed:
-        R = _campaign_net_reward(camp, log.max_turns, cfg)
+        R = _campaign_net_reward(camp, log.max_turns, cfg, log)
         stats.total += R
         if camp.role == ROLE_DEFENSE and camp.outcome == "defense_loss":
             stats.n_defense_loss += 1
@@ -816,7 +988,10 @@ def attribute_remastered_rewards(
                 S_end = _player_garrison_stock(
                     snap, pl.player, count_inflight=cfg.count_inflight)
                 break
-        R = defense_loss_reward(V, pl.K, S_end, delta, log.max_turns, cfg)
+        if cfg.ship_equity:
+            R = defense_loss_reward_equity(V, pl.K, cfg)
+        else:
+            R = defense_loss_reward(V, pl.K, S_end, delta, log.max_turns, cfg)
         stats.total += R
         stats.n_defense_loss += 1
         stats.defense_reward += R
@@ -895,7 +1070,7 @@ def summarize_remastered_episode(
             "t_resolve": int(camp.t_resolve),
             "K": float(camp.K),
             "enemy_kills": float(camp.E),
-            "reward": float(_campaign_net_reward(camp, log.max_turns, cfg)),
+            "reward": float(_campaign_net_reward(camp, log.max_turns, cfg, log)),
         })
     for pl in ledger.passive_losses:
         R_rem = max(0, log.max_turns - pl.t_resolve)
@@ -916,7 +1091,9 @@ def summarize_remastered_episode(
             "t_resolve": int(pl.t_resolve),
             "K": float(pl.K),
             "enemy_kills": 0.0,
-            "reward": float(defense_loss_reward(V, pl.K, S_end, 0, log.max_turns, cfg)),
+            "reward": float(
+                defense_loss_reward_equity(V, pl.K, cfg) if cfg.ship_equity
+                else defense_loss_reward(V, pl.K, S_end, 0, log.max_turns, cfg)),
         })
     return {
         "planet_captures": captures,

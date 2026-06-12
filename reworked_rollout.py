@@ -43,11 +43,11 @@ try:  # package layout
     from .reworked_allocator import allocate_launches, Launch
     from .reworked_model import (
         ReworkedHierarchicalPolicy, ReworkedLaunchPolicy, ReworkedEdgePolicy,
-        aux_owner_cross_entropy,
+        aux_owner_cross_entropy, REWORKED_NODE_FEATURE_DIM,
     )
     from .reworked_features import (
         discounted_production_potential, DEFAULT_GAMMA, DEFAULT_NORM,
-        EDGE_IDX_ENEMY_FLUX,
+        EDGE_IDX_ENEMY_FLUX, REWORKED_EDGE_FEATURE_DIM,
     )
     from .reworked_credit import (
         EpisodeLog, LaunchRecord, TurnSnapshot, CreditConfig, attribute_credits,
@@ -69,11 +69,11 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
     from reworked_allocator import allocate_launches, Launch  # type: ignore
     from reworked_model import (  # type: ignore
         ReworkedHierarchicalPolicy, ReworkedLaunchPolicy, ReworkedEdgePolicy,
-        aux_owner_cross_entropy,
+        aux_owner_cross_entropy, REWORKED_NODE_FEATURE_DIM,
     )
     from reworked_features import (  # type: ignore
         discounted_production_potential, DEFAULT_GAMMA, DEFAULT_NORM,
-        EDGE_IDX_ENEMY_FLUX,
+        EDGE_IDX_ENEMY_FLUX, REWORKED_EDGE_FEATURE_DIM,
     )
     from reworked_credit import (  # type: ignore
         EpisodeLog, LaunchRecord, TurnSnapshot, CreditConfig, attribute_credits,
@@ -422,6 +422,73 @@ def edge_action_to_env(
     return env_action, realized
 
 
+def teacher_env_action_to_edge_targets(
+    state,
+    obs,
+    player: int,
+    env_action: list,
+    parsed_planets: list,
+    angular_velocity: float,
+    edge_mask: np.ndarray,
+    *,
+    p_max: int = P_MAX,
+    max_speed: float = DEFAULT_MAX_SHIP_SPEED,
+    commit_eps: float = _BC_COMMIT_EPS,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Re-express raw teacher env launches as v9 edge BC targets.
+
+    Env launches carry only ``[src_id, angle, ships]`` (no target id), so the
+    target is recovered by recomputing the intercept heading toward every
+    candidate planet and picking the closest angle match.  Returns
+    ``(gate_target (p_max, p_max), frac_target (p_max, p_max))``: gate is 1 on
+    teacher edges (restricted to ``edge_mask``-valid edges) and frac is the
+    fraction of the source garrison committed, clipped away from {0, 1} so the
+    Beta log-likelihood stays finite.
+    """
+    n = int(state.n)
+    ships_arr = np.asarray(state.ships, dtype=np.float64).reshape(n)
+    ids = np.asarray(obs.planet_ids).reshape(-1)
+    id_to_slot = {int(pid): i for i, pid in enumerate(ids) if int(pid) >= 0}
+    planet_by_id = {int(p.id): p for p in parsed_planets}
+
+    sent = np.zeros((p_max, p_max), dtype=np.float64)  # ships per (src, tgt)
+    for entry in env_action:
+        if len(entry) < 3:
+            continue
+        src_id, angle, n_ships = int(entry[0]), float(entry[1]), int(entry[2])
+        h = id_to_slot.get(src_id, -1)
+        src = planet_by_id.get(src_id)
+        if h < 0 or src is None or n_ships <= 0:
+            continue
+        best_t, best_da = -1, None
+        for t in range(n):
+            if t == h or not edge_mask[h, t]:
+                continue
+            tgt = planet_by_id.get(int(ids[t]))
+            if tgt is None:
+                continue
+            res = compute_launch(src, tgt, n_ships, parsed_planets,
+                                 angular_velocity, max_speed=max_speed)
+            if res is None:
+                continue
+            da = _angle_diff(float(res["angle"]), angle)
+            if best_da is None or da < best_da:
+                best_da, best_t = da, t
+        if best_t >= 0:
+            sent[h, best_t] += float(n_ships)
+
+    gate_target = (sent > 0.0).astype(np.float32)
+    frac_target = np.full((p_max, p_max), 0.5, dtype=np.float32)  # benign Beta mid
+    for h, t in zip(*np.nonzero(sent)):
+        g = float(ships_arr[h]) if h < n else 0.0
+        if g <= 0.0:
+            gate_target[h, t] = 0.0
+            continue
+        frac_target[h, t] = float(np.clip(sent[h, t] / g,
+                                          commit_eps, 1.0 - commit_eps))
+    return gate_target, frac_target
+
+
 # ---------------------------------------------------------------------------
 # Action -> concrete env launches
 # ---------------------------------------------------------------------------
@@ -656,6 +723,24 @@ def _own_ship_stock(env_obs, player: int, *, count_inflight: bool = True) -> flo
     return float(stock.get(player, 0.0))
 
 
+def _timeout_terminal_score(env_obs, player: int) -> float:
+    """Soft win/loss score in ``(-1, 1)`` for episodes that hit ``max_steps``.
+
+    Production-share differential on the final board: leading on production
+    when the clock runs out is rewarded, trailing penalised, dead-even ~0.
+    Keeps a timeout draw from being free (the env terminal is 0 there), so the
+    policy still prefers closing games out (true terminal > any soft score).
+    """
+    planets = parse_planets(env_obs)
+    own = sum(float(p.production) for p in planets if int(p.owner) == int(player))
+    enemy = sum(float(p.production) for p in planets
+                if int(p.owner) not in (-1, int(player)))
+    total = own + enemy
+    if total <= 1e-9:
+        return 0.0
+    return float(np.tanh(2.0 * (own - enemy) / total))
+
+
 def _own_production(env_obs, player: int) -> float:
     """Per-turn ship growth from the player's currently-owned planets."""
     return float(sum(p.production for p in parse_planets(env_obs) if p.owner == player))
@@ -844,6 +929,26 @@ class BCSample:
     split_target: np.ndarray     # (P, P) teacher target split (simplex / row)
 
 
+@dataclass
+class EdgeBCSample:
+    """A teacher-forced demonstration in the v9 directed-edge action space.
+
+    The teacher's executed launches are re-expressed as a per-edge gate matrix
+    (1 = teacher sent ships on this src->tgt edge) plus the fraction of the
+    source garrison committed per gated edge.  Consumed by a supervised
+    ``-log pi(a_teacher | s)`` loss (gate Bernoulli NLL on all valid edges +
+    magnitude Beta NLL on gated edges) -- kept OUT of the PPO/GAE path exactly
+    like :class:`BCSample`.
+    """
+    node_feats: np.ndarray       # (P, node_dim)
+    edge_feats: np.ndarray       # (P, P, edge_dim)
+    global_feats: np.ndarray     # (G,)
+    planet_mask: np.ndarray      # (P,) bool
+    edge_mask: np.ndarray        # (P, P) bool valid directed edges
+    gate_target: np.ndarray      # (P, P) float 0/1 teacher gate
+    frac_target: np.ndarray      # (P, P) float teacher garrison fraction
+
+
 class ReworkedBuffer:
     """Flat transition store with per-player GAE (+ a side store for BC demos)."""
 
@@ -869,9 +974,27 @@ class ReworkedBuffer:
         self.edge_decisions.append((int(record_idx), int(t_local)))
         return len(self.edge_decisions) - 1
 
-    def add_bc(self, sample: BCSample) -> int:
+    def add_bc(self, sample) -> int:
         self.bc_data.append(sample)
         return len(self.bc_data) - 1
+
+    def stack_bc_edge(self, device=None) -> dict:
+        """Stack edge-space BC demonstrations (:class:`EdgeBCSample`)."""
+        def st(attr, dtype):
+            return torch.as_tensor(
+                np.stack([getattr(s, attr) for s in self.bc_data]), dtype=dtype)
+        batch = {
+            "node_feats": st("node_feats", torch.float32),
+            "edge_feats": st("edge_feats", torch.float32),
+            "global_feats": st("global_feats", torch.float32),
+            "planet_mask": st("planet_mask", torch.bool),
+            "edge_mask": st("edge_mask", torch.bool),
+            "gate": st("gate_target", torch.float32),
+            "frac": st("frac_target", torch.float32),
+        }
+        if device is not None:
+            batch = {k: v.to(device) for k, v in batch.items()}
+        return batch
 
     def stack_bc(self, device=None) -> dict:
         """Stack BC demonstrations into evaluate_actions-ready tensors."""
@@ -942,6 +1065,16 @@ class ReworkedBuffer:
                     # Active = gated/launched this turn OR carries attributed credit
                     # (passive defense loss, kill fallback, …).
                     active = tv | (np.abs(ct) > 1e-9)
+                    # A fully passive turn (nothing gated, no credit) must still
+                    # see its share of the episodic terminal — otherwise "do
+                    # nothing and lose" carries exactly zero learning signal and
+                    # the policy can collapse into permanent passivity.  Route
+                    # the terminal share onto the targets that were actionable
+                    # (any valid inbound edge) at decision time.
+                    if not active.any() and abs(term_share[i]) > 1e-12:
+                        em = np.asarray(tr.edge_mask, dtype=bool)
+                        if em.ndim == 2:
+                            active = em.any(axis=0)
                     ret = ct + np.float32(term_share[i])
                     tr.ret_target = np.where(active, ret, 0.0).astype(np.float32)
                     tr.adv_target = np.where(active, ret - otv, 0.0).astype(np.float32)
@@ -1037,6 +1170,40 @@ def _validate_num_agents(num_agents: int) -> int:
     return n
 
 
+def _policy_feature_views(policy, batch) -> tuple:
+    """Slice batched node/edge features down to ``policy``'s input widths.
+
+    v12 grew the feature layout (node 16 -> 23, edge 4 -> 9) with every new
+    channel appended at the end, so a checkpoint trained on an older layout
+    keeps playing/training unchanged: it sees exactly its original channel
+    prefix.  New policies consume the full tensors untouched.
+    """
+    nf, ef = batch["node_feats"], batch["edge_feats"]
+    nd = int(getattr(policy, "node_dim", nf.shape[-1]) or nf.shape[-1])
+    enc = getattr(policy, "encoder", None)
+    ed = int(getattr(enc, "edge_dim", ef.shape[-1]) or ef.shape[-1])
+    if nd < nf.shape[-1]:
+        nf = nf[..., :nd]
+    if ed < ef.shape[-1]:
+        ef = ef[..., :ed]
+    return nf, ef
+
+
+def _recapture_array(cap_counts: dict, obs, p_max: int) -> "np.ndarray | None":
+    """(P_MAX,) per-slot capture counts for the viewing player (None if all 0)."""
+    if not cap_counts:
+        return None
+    ids = np.asarray(obs.planet_ids).reshape(-1)
+    out = np.zeros(min(len(ids), p_max), dtype=np.float32)
+    hit = False
+    for slot_i, pid in enumerate(ids[:out.shape[0]]):
+        c = cap_counts.get(int(pid), 0)
+        if c > 0:
+            out[slot_i] = float(c)
+            hit = True
+    return out if hit else None
+
+
 def _opponent_controller(player: int, opponent: str, num_agents: int) -> Optional[str]:
     """How player ``player`` is controlled when not using the live training policy.
 
@@ -1130,11 +1297,20 @@ def collect_episode(
 
     if not (0.0 <= float(teacher_forcing) <= 1.0):
         raise ValueError(f"teacher_forcing must be in [0, 1], got {teacher_forcing!r}")
+    orbit_agent = None
     if opponent in ("scripted", "frozen") or teacher_forcing > 0.0:
         try:
             from .reworked_scripted import scripted_action_row
         except ImportError:  # pragma: no cover - flat layout
             from reworked_scripted import scripted_action_row  # type: ignore
+        if scripted_strategy == "orbit":
+            # Graph-based scripted bot: emits raw env launches directly
+            # (its own allocator + comet evacuation), bypassing action_row.
+            try:
+                from .orbit_scripted_agent import OrbitScriptedAgent
+            except ImportError:  # pragma: no cover - flat layout
+                from orbit_scripted_agent import OrbitScriptedAgent  # type: ignore
+            orbit_agent = OrbitScriptedAgent()
 
     reward_cfg = reward_cfg or RewardConfig()
     potential_fn = potential_fn or economic_potential
@@ -1178,6 +1354,12 @@ def collect_episode(
     need_ep_log = use_credit or use_remastered
     ep_log = EpisodeLog(max_turns=max_steps, policy_players=policy_players) if need_ep_log else None
     campaign_ledger = CampaignLedger() if use_remastered else None
+
+    # Per-player planet capture counters (feeds the recapture_count node
+    # channel so the reward's recapture decay is observable by the policy).
+    cap_counts: dict[int, dict[int, int]] = {p: {} for p in policy_players}
+    last_owner: dict[int, int] = {
+        int(pl.id): int(pl.owner) for pl in parse_planets(obs_of(0))}
 
     def _finalize_remastered(final_turn: int) -> tuple:
         if not use_remastered or ep_log is None or campaign_ledger is None:
@@ -1240,9 +1422,10 @@ def collect_episode(
         }
         return cstats.total, cstats.n_capture, cstats.n_defense_hold + cstats.n_defense_loss, detail
 
+    pending: dict[int, int] = {}       # player -> buffer index (survives the loop)
     for t in range(max_steps):
         env_actions = [[] for _ in players]
-        pending: dict[int, int] = {}   # player -> buffer index
+        pending = {}
         phi_before: dict[int, float] = {}
         stock_before: dict[int, float] = {}   # own ship stock before the step
         prod_before: dict[int, float] = {}    # own production this turn
@@ -1258,10 +1441,11 @@ def collect_episode(
             ep_log.add_snapshot(_build_snapshot(obs_of(0), t))
             nfid_before = int(obs_of(0).get("next_fleet_id", 0) or 0)
             # planet_id -> padded slot (for passive defense-loss routing).
-            ids0 = np.asarray(obs_of(0).get("planet_ids", [])).reshape(-1)
-            for slot_i, pid in enumerate(ids0):
-                if int(pid) >= 0:
-                    ep_log.planet_slot[int(pid)] = int(slot_i)
+            # The raw env obs has no "planet_ids" key; slots follow the
+            # parse_planets order, which is exactly how build_observation
+            # assigns padded planet slots.
+            for slot_i, pl in enumerate(parse_planets(obs_of(0))):
+                ep_log.planet_slot[int(pl.id)] = int(slot_i)
 
         for p in players:
             env_obs = obs_of(p)
@@ -1272,6 +1456,13 @@ def collect_episode(
 
             ctrl = _opponent_controller(p, opponent, num_agents)
             if ctrl is not None:
+                if ctrl == "scripted" and orbit_agent is not None:
+                    # Orbit bot consumes the raw env obs; no batch pack needed.
+                    env_action = orbit_agent.act(
+                        env_obs, p, current_turn=t, max_turns=max_steps)
+                    env_actions[p] = env_action
+                    n_launches += len(env_action)
+                    continue
                 batch = pack_reworked_batch(
                     [(obs, p)], device=device, p_max=P_MAX,
                     include_value_rate=include_value_rate)
@@ -1282,12 +1473,13 @@ def collect_episode(
                         obs, p, action_row, parsed, av, routing_cost=routing_cost)
                 elif frozen_is_launch:
                     st0 = batch["states"][0]
+                    nf_frz, ef_frz = _policy_feature_views(frozen_policy, batch)
                     source_np, dest_np = _source_dest_masks(st0, P_MAX, p, min_send=min_send)
                     with torch.no_grad():
                         frozen_policy.eval()
                         act, _, _ = frozen_policy.act(
-                            node_feats=batch["node_feats"],
-                            edge_feats=batch["edge_feats"],
+                            node_feats=nf_frz,
+                            edge_feats=ef_frz,
                             global_feats=batch["global_feats"],
                             planet_mask=batch["planet_mask"],
                             source_mask=torch.from_numpy(source_np)[None].to(device),
@@ -1302,12 +1494,13 @@ def collect_episode(
                         st0, obs, p, action_row, parsed, av, min_send=min_send)
                 elif frozen_is_edge:
                     st0 = batch["states"][0]
+                    nf_frz, ef_frz = _policy_feature_views(frozen_policy, batch)
                     edge_np = _edge_valid_mask(st0, P_MAX, p, min_send=min_send)
                     with torch.no_grad():
                         frozen_policy.eval()
                         act, _, _ = frozen_policy.act(
-                            node_feats=batch["node_feats"],
-                            edge_feats=batch["edge_feats"],
+                            node_feats=nf_frz,
+                            edge_feats=ef_frz,
                             global_feats=batch["global_feats"],
                             planet_mask=batch["planet_mask"],
                             edge_mask=torch.from_numpy(edge_np)[None].to(device),
@@ -1321,11 +1514,12 @@ def collect_episode(
                         st0, obs, p, action_row, parsed, av, min_send=min_send)
                 else:
                     attack_np, defend_np = _target_masks(batch["states"][0], P_MAX, p)
+                    nf_frz, ef_frz = _policy_feature_views(frozen_policy, batch)
                     with torch.no_grad():
                         frozen_policy.eval()
                         act, _, _ = frozen_policy.act(
-                            node_feats=batch["node_feats"],
-                            edge_feats=batch["edge_feats"],
+                            node_feats=nf_frz,
+                            edge_feats=ef_frz,
                             global_feats=batch["global_feats"],
                             planet_mask=batch["planet_mask"],
                             attack_mask=torch.from_numpy(attack_np)[None].to(device),
@@ -1352,10 +1546,13 @@ def collect_episode(
             if use_remastered and campaign_ledger is not None:
                 campaign_ledger.record_stock(p, t, stock_before[p])
 
+            recap_np = _recapture_array(cap_counts.get(p, {}), obs, P_MAX)
             batch = pack_reworked_batch(
                 [(obs, p)], device=device, p_max=P_MAX,
-                include_value_rate=include_value_rate)
+                include_value_rate=include_value_rate,
+                recapture_counts=[recap_np])
             st0 = batch["states"][0]
+            nf_pol, ef_pol = _policy_feature_views(policy, batch)
 
             # Teacher forcing: with prob `teacher_forcing`, this learning player
             # plays the scripted bot's move instead of its own.  The turn is NOT
@@ -1363,23 +1560,31 @@ def collect_episode(
             # the expert action -- it only benefits indirectly via the stronger
             # states the expert move steers the trajectory into.
             if tf_rng is not None and float(tf_rng.random()) < teacher_forcing:
-                action_row = scripted_action_row(
-                    scripted_strategy, st0, p, p_max=P_MAX)
-                env_action, t_launches = action_to_env_launches(
-                    obs, p, action_row, parsed, av, routing_cost=routing_cost)
+                if orbit_agent is not None:
+                    # Orbit bot emits raw env launches directly (no Launch
+                    # records); targets are recovered from the headings when an
+                    # edge BC demo is recorded below.
+                    env_action = orbit_agent.act(
+                        env_obs, p, current_turn=t, max_turns=max_steps)
+                    t_launches = []
+                else:
+                    action_row = scripted_action_row(
+                        scripted_strategy, st0, p, p_max=P_MAX)
+                    env_action, t_launches = action_to_env_launches(
+                        obs, p, action_row, parsed, av, routing_cost=routing_cost)
                 env_actions[p] = env_action
                 n_launches += len(env_action)
                 # Behavior-cloning demo: record the teacher's executed move in
-                # the v8 action space (launch learner only) for the supervised
-                # BC loss in ppo_update.  Not a PPO transition.
-                if record_bc and policy_kind == "launch":
+                # the learner's action space for the supervised BC loss in
+                # ppo_update.  Not a PPO transition.
+                if record_bc and policy_kind == "launch" and t_launches:
                     source_np, dest_np = _source_dest_masks(
                         st0, P_MAX, p, min_send=min_send)
                     commit_t, split_t = teacher_launches_to_v8_targets(
                         st0, t_launches, dest_np, p_max=P_MAX)
                     buffer.add_bc(BCSample(
-                        node_feats=batch["node_feats"][0].cpu().numpy(),
-                        edge_feats=batch["edge_feats"][0].cpu().numpy(),
+                        node_feats=nf_pol[0].cpu().numpy(),
+                        edge_feats=ef_pol[0].cpu().numpy(),
                         global_feats=batch["global_feats"][0].cpu().numpy(),
                         planet_mask=batch["planet_mask"][0].cpu().numpy(),
                         source_mask=source_np,
@@ -1387,12 +1592,27 @@ def collect_episode(
                         commit_target=commit_t,
                         split_target=split_t,
                     ))
+                elif record_bc and policy_kind == "edge" and env_action:
+                    edge_np = _edge_valid_mask(st0, P_MAX, p, min_send=min_send)
+                    gate_t, frac_t = teacher_env_action_to_edge_targets(
+                        st0, obs, p, env_action, parsed, av, edge_np,
+                        p_max=P_MAX)
+                    if gate_t.any():
+                        buffer.add_bc(EdgeBCSample(
+                            node_feats=nf_pol[0].cpu().numpy(),
+                            edge_feats=ef_pol[0].cpu().numpy(),
+                            global_feats=batch["global_feats"][0].cpu().numpy(),
+                            planet_mask=batch["planet_mask"][0].cpu().numpy(),
+                            edge_mask=edge_np,
+                            gate_target=gate_t,
+                            frac_target=frac_t,
+                        ))
                 continue
 
             if policy_kind == "edge":
                 edge_np = _edge_valid_mask(st0, P_MAX, p, min_send=min_send)
                 action, target_logp, target_value = policy.act(
-                    node_feats=batch["node_feats"], edge_feats=batch["edge_feats"],
+                    node_feats=nf_pol, edge_feats=ef_pol,
                     global_feats=batch["global_feats"], planet_mask=batch["planet_mask"],
                     edge_mask=torch.from_numpy(edge_np)[None].to(device),
                 )
@@ -1410,8 +1630,8 @@ def collect_episode(
 
                 tr = EdgeTransition(
                     player=p,
-                    node_feats=batch["node_feats"][0].cpu().numpy(),
-                    edge_feats=batch["edge_feats"][0].cpu().numpy(),
+                    node_feats=nf_pol[0].cpu().numpy(),
+                    edge_feats=ef_pol[0].cpu().numpy(),
                     global_feats=batch["global_feats"][0].cpu().numpy(),
                     planet_mask=batch["planet_mask"][0].cpu().numpy(),
                     edge_mask=edge_np,
@@ -1429,7 +1649,7 @@ def collect_episode(
             elif policy_kind == "launch":
                 source_np, dest_np = _source_dest_masks(st0, P_MAX, p, min_send=min_send)
                 action, log_prob, value = policy.act(
-                    node_feats=batch["node_feats"], edge_feats=batch["edge_feats"],
+                    node_feats=nf_pol, edge_feats=ef_pol,
                     global_feats=batch["global_feats"], planet_mask=batch["planet_mask"],
                     source_mask=torch.from_numpy(source_np)[None].to(device),
                     dest_mask=torch.from_numpy(dest_np)[None].to(device),
@@ -1446,8 +1666,8 @@ def collect_episode(
 
                 tr = LaunchTransition(
                     player=p,
-                    node_feats=batch["node_feats"][0].cpu().numpy(),
-                    edge_feats=batch["edge_feats"][0].cpu().numpy(),
+                    node_feats=nf_pol[0].cpu().numpy(),
+                    edge_feats=ef_pol[0].cpu().numpy(),
                     global_feats=batch["global_feats"][0].cpu().numpy(),
                     planet_mask=batch["planet_mask"][0].cpu().numpy(),
                     source_mask=source_np,
@@ -1464,7 +1684,7 @@ def collect_episode(
                 defend_mask = torch.from_numpy(defend_np)[None].to(device)
 
                 action, log_prob, value = policy.act(
-                    node_feats=batch["node_feats"], edge_feats=batch["edge_feats"],
+                    node_feats=nf_pol, edge_feats=ef_pol,
                     global_feats=batch["global_feats"], planet_mask=batch["planet_mask"],
                     attack_mask=attack_mask, defend_mask=defend_mask,
                 )
@@ -1484,8 +1704,8 @@ def collect_episode(
 
                 tr = HierTransition(
                     player=p,
-                    node_feats=batch["node_feats"][0].cpu().numpy(),
-                    edge_feats=batch["edge_feats"][0].cpu().numpy(),
+                    node_feats=nf_pol[0].cpu().numpy(),
+                    edge_feats=ef_pol[0].cpu().numpy(),
                     global_feats=batch["global_feats"][0].cpu().numpy(),
                     planet_mask=batch["planet_mask"][0].cpu().numpy(),
                     attack_mask=attack_np,
@@ -1572,6 +1792,15 @@ def collect_episode(
         state = env.step(list(env_actions))
         done = bool(getattr(env, "done", False)) or any(
             getattr(state[p], "status", "ACTIVE") == "DONE" for p in players)
+
+        # Advance the per-player capture counters (recapture_count channel).
+        for pl in parse_planets(obs_of(0)):
+            pid, own = int(pl.id), int(pl.owner)
+            prev = last_owner.get(pid, -1)
+            if own != prev:
+                if own in cap_counts:
+                    cap_counts[own][pid] = cap_counts[own].get(pid, 0) + 1
+                last_owner[pid] = own
 
         if use_remastered and prev_obs_credit is not None and campaign_ledger is not None:
             av_kill = float(obs_of(0).get("angular_velocity", 0) or 0.0)
@@ -1667,6 +1896,20 @@ def collect_episode(
                                 credit_total=ctot, n_capture=ncap, n_defense=ndef,
                                 episode_log=detail)
 
+    # Timeout (no winner): the env terminal is 0, which made a 300-turn draw as
+    # good as a win.  Add a soft terminal from the final production share so
+    # leading at the buzzer beats stalling and trailing costs — spread into the
+    # per-target returns by ``compute_gae`` exactly like a real terminal.
+    if (use_remastered and remastered_cfg is not None
+            and remastered_cfg.timeout_terminal > 0.0 and pending):
+        for p, idx in pending.items():
+            score = _timeout_terminal_score(obs_of(p), p)
+            tw = (remastered_cfg.terminal_weight
+                  * remastered_cfg.timeout_terminal * score)
+            buffer.data[idx].terminal_reward += tw
+            buffer.data[idx].done = True
+            ep_rewards[p] += tw
+
     finalize = _finalize_remastered if use_remastered else _finalize_credit
     ctot, ncap, ndef, detail = finalize(max_steps)
     return EpisodeStats(length=max_steps, rewards=ep_rewards, winner=None,
@@ -1691,8 +1934,8 @@ class PPOConfig:
     # remaining inner epochs are skipped (stabilises the Beta/Categorical heads).
     # Set to None to disable.
     target_kl: Optional[float] = 0.05
-    # Behavior-cloning coefficient (v8 launch only): weight of the supervised
-    # ``-log pi(a_teacher | s)`` loss on teacher-forced demonstrations.  0 = off.
+    # Behavior-cloning coefficient (v8 launch + v9 edge): weight of the
+    # supervised ``-log pi(a_teacher | s)`` loss on teacher-forced demos.  0 = off.
     bc_coef: float = 0.0
     # Auxiliary owner-prediction loss (all policy families).  0 = off.
     aux_coef: float = 0.1
@@ -1894,6 +2137,44 @@ def ppo_update(
     # concentrated, capturing allocation.  Kept separate from PPO so it never
     # biases the on-policy ratio / advantages.
     bc_n = len(getattr(buffer, "bc_data", []))
+    if device is not None and str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
+    if is_edge and cfg.bc_coef > 0.0 and bc_n > 0:
+        # Edge-space BC: maximise pi(a_teacher | s) via the same per-target
+        # log-prob used by PPO (gate Bernoulli NLL over valid edges + Beta NLL
+        # on the teacher's gated magnitudes).
+        bc = buffer.stack_bc_edge(device=device)
+        Nbc = bc["node_feats"].shape[0]
+        bc_loss_acc = 0.0
+        bc_batches = 0
+        for _ in range(cfg.epochs):
+            perm = torch.randperm(Nbc, device=device)
+            for start in range(0, Nbc, cfg.minibatch_size):
+                mb = perm[start:start + cfg.minibatch_size]
+                ev = policy.evaluate_actions(
+                    node_feats=bc["node_feats"][mb], edge_feats=bc["edge_feats"][mb],
+                    global_feats=bc["global_feats"][mb], planet_mask=bc["planet_mask"][mb],
+                    edge_mask=bc["edge_mask"][mb],
+                    action={"gate": bc["gate"][mb], "frac": bc["frac"][mb]},
+                )
+                tvm = ev["target_valid"].to(ev["target_logp"].dtype)
+                denom = tvm.sum().clamp_min(1.0)
+                bc_loss = -(ev["target_logp"] * tvm).sum() / denom
+                loss = cfg.bc_coef * bc_loss
+                if not torch.isfinite(loss):
+                    continue
+                optimizer.zero_grad()
+                loss.backward()
+                if not torch.isfinite(
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                ):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                optimizer.step()
+                bc_loss_acc += float(bc_loss.detach())
+                bc_batches += 1
+        stats.bc_loss = bc_loss_acc / max(1, bc_batches)
+        stats.bc_samples = bc_n
     if is_launch and cfg.bc_coef > 0.0 and bc_n > 0:
         bc = buffer.stack_bc(device=device)
         Nbc = bc["node_feats"].shape[0]

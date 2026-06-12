@@ -91,9 +91,9 @@ class TrainConfig:
     # the Dirichlet split to concentrate mass to get any launch through, directly
     # countering the "spray tiny fleets, capture nothing" failure mode.
     min_send: int = 1
-    # Behavior cloning (v8 launch only): weight of the supervised loss that makes
-    # the policy imitate the teacher's executed launches on teacher-forced turns.
-    # Requires teacher_forcing > 0.  0 = off (teacher only steers, no imitation).
+    # Behavior cloning (v8 launch + v9 edge): weight of the supervised loss that
+    # makes the policy imitate the teacher's executed launches on teacher-forced
+    # turns.  Requires teacher_forcing > 0.  0 = off (teacher only steers).
     bc_coef: float = 0.0
     # Model arch (rebuilt on load).
     d_model: int = 128
@@ -128,7 +128,7 @@ def _policy_arch(policy) -> dict:
     node_dim = int(getattr(policy, "node_dim", REWORKED_NODE_FEATURE_DIM))
     return {
         "node_dim": node_dim,
-        "edge_dim": REWORKED_EDGE_FEATURE_DIM,
+        "edge_dim": int(getattr(policy.encoder, "edge_dim", REWORKED_EDGE_FEATURE_DIM)),
         "global_dim": REWORKED_GLOBAL_FEATURE_DIM,
         "d_model": int(policy.d_model),
         "n_layers": int(len(policy.encoder.layers)),
@@ -241,12 +241,18 @@ def train(
         policy, ckpt = load_checkpoint(resume_from, device=device)
         start_iter = int(ckpt.get("iteration", 0)) + 1
         ckpt_node_dim = int(getattr(policy, "node_dim", REWORKED_NODE_FEATURE_DIM))
-        if ckpt_node_dim != node_dim:
+        if ckpt_node_dim > node_dim:
             raise ValueError(
-                f"--eta-value-feature mismatch: checkpoint has node_dim="
-                f"{ckpt_node_dim} but this run wants {node_dim}. The ETA-value "
-                f"channel changes the feature dim, so you cannot resume across "
-                f"it -- start a fresh run instead.")
+                f"Checkpoint node_dim={ckpt_node_dim} exceeds this run's feature "
+                f"layout ({node_dim}); resume with matching --eta-value-feature.")
+        if ckpt_node_dim < node_dim:
+            # Legacy feature layout (pre-v12 16/17-dim).  The rollout slices the
+            # packed features down to the policy's input width, so training
+            # continues unchanged -- but the new channels stay invisible until
+            # the checkpoint is migrated (see reworked_migrate_features.py).
+            print(f"Note: checkpoint uses a legacy node layout "
+                  f"({ckpt_node_dim} < {node_dim}); features will be sliced. "
+                  f"Run reworked_migrate_features.py to enable the v12 channels.")
         ckpt_kind = ckpt.get("arch", {}).get("policy_kind", "hier")
         if ckpt_kind != train_cfg.policy_kind:
             raise ValueError(
@@ -295,11 +301,14 @@ def train(
         # They only have to agree on the FEATURE layout, since both consume the
         # same packed observation batch.
         frozen_node_dim = int(getattr(frozen_policy, "node_dim", REWORKED_NODE_FEATURE_DIM))
-        if frozen_node_dim != node_dim:
+        if frozen_node_dim > node_dim:
             raise ValueError(
-                f"Frozen opponent node_dim {frozen_node_dim} != training node_dim "
-                f"{node_dim}.  Match --eta-value-feature between the frozen "
-                f"checkpoint and this run (both share the same observation batch).")
+                f"Frozen opponent node_dim {frozen_node_dim} > training feature "
+                f"layout {node_dim}; the opponent cannot see channels the packer "
+                f"does not produce.")
+        if frozen_node_dim < node_dim:
+            print(f"Note: frozen opponent uses a legacy node layout "
+                  f"({frozen_node_dim} < {node_dim}); its features are sliced.")
         if frozen_kind != train_cfg.policy_kind:
             print(f"Note: frozen opponent is '{frozen_kind}', learner is "
                   f"'{train_cfg.policy_kind}' (mixed-family match).")
@@ -524,7 +533,8 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Disable the auxiliary owner-prediction loss.")
     p.add_argument("--scripted-strategy", default="production",
                    help="Scripted bot strategy when --opponent=scripted "
-                        "(see reworked_scripted.SCRIPTED_STRATEGIES).")
+                        "(see reworked_scripted.SCRIPTED_STRATEGIES), or "
+                        "'orbit' for the graph-based orbit_scripted_agent bot.")
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--n-layers", type=int, default=3)
     p.add_argument("--policy", choices=["hier", "launch", "edge"], default="hier", dest="policy_kind",

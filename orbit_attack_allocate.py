@@ -1,9 +1,12 @@
 """Greedy multi-target capture allocation (nearest source first, no sync wait).
 
-For each ranked target we walk owned sources in ascending ETA order and
-commit surplus launch budget until the planet is capturable this wave (or
-sources for that target are exhausted), then move to the next target until
-launch cap or global budget runs out.
+For each ranked target an **all-or-nothing wave** is planned: owned sources in
+ascending ETA order commit surplus budget until the planet is capturable.  The
+required ship count is evaluated at the wave's **latest** arrival ETA (enemy
+garrisons keep producing until the slowest fleet lands) and padded by
+``capture_margin``.  If the wave cannot fully fund the capture, **no ships are
+sent** (partial waves on neutrals are pure loss).  A source may fund several
+waves in one turn — only the global launch cap and its budget bound it.
 
 Neutral targets use production efficiency; **enemy** targets use
 :mod:`orbit_enemy_weakness` (fragile local defense + thin empire support).
@@ -382,13 +385,141 @@ def _ships_needed_to_capture(
     tgt_id: int,
     *,
     eta: float,
+    margin: float = 0.0,
 ) -> int:
+    """Ships required to flip ``tgt_id`` when the slowest fleet lands at ``eta``.
+
+    ``margin`` pads the estimate against ETA / production rounding errors.
+    Own attack fleets already in flight are subtracted.
+    """
     tgt = og.planet_by_id.get(int(tgt_id))
     if tgt is None:
         return 0
     defense = estimated_defense_at_arrival(tgt, float(eta), og.player, og)
+    base = int(defense) + 1
+    padded = int(math.ceil(float(base) * (1.0 + max(0.0, float(margin)))))
     pending = _pending_own_attack_ships(og, tgt_id)
-    return max(0, int(defense) + 1 - int(pending))
+    return max(0, padded - int(pending))
+
+
+def _plan_capture_wave(
+    og: OrbitGraph,
+    tgt_id: int,
+    remaining: dict[int, int],
+    *,
+    omega: float,
+    eta_horizon: float,
+    margin: float,
+    max_launches: int,
+) -> Optional[list[list]]:
+    """All-or-nothing nearest-source wave for one target.
+
+    Iterates because adding a farther source raises the wave's latest arrival
+    ETA, which raises the required ship count (enemy production).  Returns
+    ``[[src_id, angle, ships], ...]`` or ``None`` when the capture cannot be
+    fully funded.
+    """
+    if max_launches <= 0:
+        return None
+    tid = int(tgt_id)
+    tgt = og.planet_by_id.get(tid)
+    if tgt is None:
+        return None
+    sources = _sources_by_eta(og, tid, remaining, omega)
+    if not sources:
+        return None
+    if float(sources[0].eta) > float(eta_horizon):
+        return None
+
+    target_eta = float(sources[0].eta)
+    for _ in range(3):
+        needed = _ships_needed_to_capture(og, tid, eta=target_eta, margin=margin)
+        if needed <= 0:
+            return None
+
+        wave: list[list] = []
+        committed = 0
+        latest = 0.0
+        for row in sources:
+            if len(wave) >= int(max_launches) or committed >= needed:
+                break
+            sid = int(row.src_id)
+            budget = int(remaining.get(sid, 0))
+            if budget <= 0:
+                continue
+            ships = min(budget, needed - committed)
+            launch = compute_launch(
+                og.planet_by_id[sid], tgt, ships, og.planets, omega,
+            )
+            if launch is None:
+                continue
+            eta = float(launch["eta"])
+            if eta > float(eta_horizon):
+                continue
+            wave.append([sid, float(launch["angle"]), int(launch["ships"])])
+            committed += int(launch["ships"])
+            latest = max(latest, eta)
+
+        if not wave or committed < needed:
+            return None
+
+        # Authoritative check at the wave's actual latest arrival.
+        final_needed = _ships_needed_to_capture(og, tid, eta=latest, margin=margin)
+        if committed >= final_needed:
+            return wave
+        target_eta = max(latest, target_eta)
+    return None
+
+
+def _partial_enemy_wave(
+    og: OrbitGraph,
+    tgt_id: int,
+    remaining: dict[int, int],
+    *,
+    omega: float,
+    eta_horizon: float,
+    margin: float,
+    max_launches: int,
+) -> Optional[list[list]]:
+    """Underfunded pressure wave on an enemy planet (erodes garrison).
+
+    Only used when ``allow_partial_enemy_waves`` is enabled; never applied to
+    neutrals (partial neutral attacks are pure ship loss).
+    """
+    if max_launches <= 0:
+        return None
+    tid = int(tgt_id)
+    tgt = og.planet_by_id.get(tid)
+    if tgt is None:
+        return None
+    sources = _sources_by_eta(og, tid, remaining, omega)
+    if not sources or float(sources[0].eta) > float(eta_horizon):
+        return None
+
+    needed = _ships_needed_to_capture(
+        og, tid, eta=float(sources[0].eta), margin=margin,
+    )
+    if needed <= 0:
+        return None
+
+    wave: list[list] = []
+    committed = 0
+    for row in sources:
+        if len(wave) >= int(max_launches) or committed >= needed:
+            break
+        sid = int(row.src_id)
+        budget = int(remaining.get(sid, 0))
+        if budget <= 0:
+            continue
+        ships = min(budget, needed - committed)
+        launch = compute_launch(og.planet_by_id[sid], tgt, ships, og.planets, omega)
+        if launch is None:
+            continue
+        if float(launch["eta"]) > float(eta_horizon):
+            continue
+        wave.append([sid, float(launch["angle"]), int(launch["ships"])])
+        committed += int(launch["ships"])
+    return wave or None
 
 
 def allocate_greedy_captures(
@@ -406,11 +537,16 @@ def allocate_greedy_captures(
     prioritize_enemy_weakspots: bool = True,
     eta_horizon: float = 60.0,
     max_launches: int = 8,
+    capture_margin: float = 0.0,
+    max_wave_launches: int = 4,
+    allow_partial_enemy_waves: bool = False,
 ) -> list[list]:
-    """Nearest-source greedy captures across ranked targets.
+    """All-or-nothing greedy captures across ranked targets.
 
-    No synchronized waiting: each source launches immediately this turn.
-    One launch per source per turn (``used_sources``).
+    No synchronized waiting: every launch happens this turn.  A source may
+    fund multiple waves (budget-bound); ``used_sources`` is updated for caller
+    bookkeeping but no longer blocks reuse.  Underfunded waves are skipped
+    entirely unless ``allow_partial_enemy_waves`` (enemy targets only).
     """
     if max_launches <= 0:
         return []
@@ -430,55 +566,35 @@ def allocate_greedy_captures(
     actions: list[list] = []
 
     for target in targets:
-        if len(actions) >= max_launches:
+        slots = int(max_launches) - len(actions)
+        if slots <= 0:
             break
         tid = int(target.planet_id)
         if _inflight_already_captures(og, tid):
             continue
 
-        sources = _sources_by_eta(og, tid, remaining, omega)
-        if not sources:
+        wave = _plan_capture_wave(
+            og, tid, remaining,
+            omega=omega,
+            eta_horizon=eta_horizon,
+            margin=capture_margin,
+            max_launches=min(int(max_wave_launches), slots),
+        )
+        if wave is None and allow_partial_enemy_waves and target.is_enemy:
+            wave = _partial_enemy_wave(
+                og, tid, remaining,
+                omega=omega,
+                eta_horizon=eta_horizon,
+                margin=capture_margin,
+                max_launches=min(int(max_wave_launches), slots),
+            )
+        if not wave:
             continue
 
-        min_eta = float(sources[0].eta)
-        if min_eta > float(eta_horizon):
-            continue
-
-        needed = _ships_needed_to_capture(og, tid, eta=min_eta)
-        if needed <= 0:
-            continue
-
-        committed = 0
-        tgt = og.planet_by_id[tid]
-        for row in sources:
-            if len(actions) >= max_launches:
-                break
-            if committed >= needed:
-                break
-            sid = int(row.src_id)
-            if sid in used_sources:
-                continue
-            budget = int(remaining.get(sid, 0))
-            if budget <= 0:
-                continue
-
-            still_need = int(needed) - int(committed)
-            ships = min(budget, still_need)
-            if ships <= 0:
-                continue
-
-            src = og.planet_by_id[sid]
-            launch = compute_launch(src, tgt, ships, og.planets, omega)
-            if launch is None:
-                continue
-            if float(launch["eta"]) > float(eta_horizon):
-                continue
-
-            sent = int(launch["ships"])
-            actions.append([sid, float(launch["angle"]), sent])
-            committed += sent
-            remaining[sid] = int(remaining.get(sid, 0)) - sent
-            used_sources.add(sid)
+        for sid, angle, ships in wave:
+            actions.append([int(sid), float(angle), int(ships)])
+            remaining[int(sid)] = int(remaining.get(int(sid), 0)) - int(ships)
+            used_sources.add(int(sid))
 
     return actions
 

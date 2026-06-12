@@ -111,15 +111,19 @@ def test_value_rate_channel_is_opt_in_and_appended():
     base = build_reworked_node_features(state)
     augmented = build_reworked_node_features(state, include_value_rate=True)
 
-    # Exactly one extra channel, appended at the end; legacy channels identical.
+    # Exactly one extra channel.  Since v12 the value-rate channel is inserted
+    # at index 16 (right after the legacy 10+6 block, before the v12 extras)
+    # so legacy 17-dim checkpoints stay slice-compatible.
+    vrate_idx = 16
     assert augmented.shape == (3, REWORKED_NODE_FEATURE_DIM + 1)
-    assert np.array_equal(augmented[:, :REWORKED_NODE_FEATURE_DIM], base)
+    assert np.array_equal(augmented[:, :vrate_idx], base[:, :vrate_idx])
+    assert np.array_equal(augmented[:, vrate_idx + 1:], base[:, vrate_idx:])
 
     # The new channel matches the standalone metric.
     expected = eta_aware_capture_value(
         state.distance_matrix, state.owner, state.ships, state.production,
         player=state.player, remaining_turns=state.remaining_turns)
-    assert np.allclose(augmented[:, -1], expected)
+    assert np.allclose(augmented[:, vrate_idx], expected)
 
 
 if __name__ == "__main__":

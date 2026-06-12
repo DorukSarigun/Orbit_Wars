@@ -54,7 +54,7 @@ F_MAX_DEFAULT = 64   # no env hard cap on in-flight fleets; 64 is a safe
                      # ceiling for both players' typical/peak load.
 
 MAX_ENEMY_OWNER_SLOTS = 3
-PLANET_FEATURE_DIM = 34
+PLANET_FEATURE_DIM = 35
 INCOMING_ETA_BUCKETS = (5.0, 15.0, 30.0, float("inf"))
 
 # Planet feature index constants (derived from _planet_features order).
@@ -94,6 +94,7 @@ PF_IDX_INCOMING_ENEMY_LARGEST_ETA = 30
 PF_IDX_INCOMING_NET_THREAT = 31
 PF_IDX_CAPTURE_VALUE = 32
 PF_IDX_DEFENSE_DEFICIT = 33
+PF_IDX_COMET_LIFE = 34    # comet: remaining path turns / 50; 0 for non-comets
 FLEET_FEATURE_DIM = 11
 GLOBAL_FEATURE_DIM = 14
 EDGE_FEATURE_DIM = 6  # + crosses_sun
@@ -185,6 +186,12 @@ def _planet_features(
     net_threat = enemy_total - ships - self_total if is_self else enemy_total - self_total
     capture_value = prod * max(0.0, (max_turns - turn) / max(1, max_turns)) if not is_self else 0.0
     defense_deficit = max(0.0, enemy_total - ships - prod * max(0.0, enemy_min_eta)) if is_self else 0.0
+    # Remaining comet lifetime (path steps left); 0 for non-comets.  A doomed
+    # comet's garrison and production vanish with it, so its value decays.
+    comet_life = 0.0
+    if p.is_comet and getattr(p, "comet_path", None):
+        comet_life = max(
+            0, (len(p.comet_path) - 1) - int(getattr(p, "comet_path_index", -1)))
 
     feats = np.asarray([
         is_self,
@@ -221,6 +228,7 @@ def _planet_features(
         net_threat / 100.0,
         capture_value / 50.0,
         defense_deficit / 100.0,
+        min(comet_life, 50.0) / 50.0,
     ], dtype=np.float32)
     return feats[:planet_feature_dim]
 

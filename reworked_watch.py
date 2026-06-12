@@ -31,6 +31,7 @@ try:  # package layout
     from .reworked_rollout import (
         action_to_env_launches, launch_action_to_env, edge_action_to_env,
         _target_masks, _source_dest_masks, _edge_valid_mask, P_MAX, F_MAX,
+        _policy_feature_views, _recapture_array,
     )
     from .reworked_scripted import scripted_action_row
     from .reworked_train import load_checkpoint
@@ -41,26 +42,31 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
     from reworked_rollout import (  # type: ignore
         action_to_env_launches, launch_action_to_env, edge_action_to_env,
         _target_masks, _source_dest_masks, _edge_valid_mask, P_MAX, F_MAX,
+        _policy_feature_views, _recapture_array,
     )
     from reworked_scripted import scripted_action_row  # type: ignore
     from reworked_train import load_checkpoint  # type: ignore
 
 
 def _policy_env_action(policy, env_obs, player, t, max_steps, device, deterministic,
-                       include_value_rate=False, policy_kind="hier", min_send=1):
+                       include_value_rate=False, policy_kind="hier", min_send=1,
+                       cap_counts=None):
     """One turn's env launches from the trained policy (greedy by default)."""
     av = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=av,
                             p_max=P_MAX, f_max=F_MAX, turn=t, max_turns=max_steps)
+    recap_np = _recapture_array(cap_counts or {}, obs, P_MAX)
     batch = pack_reworked_batch([(obs, player)], device=device, p_max=P_MAX,
-                                include_value_rate=include_value_rate)
+                                include_value_rate=include_value_rate,
+                                recapture_counts=[recap_np])
     st0 = batch["states"][0]
+    nf, ef = _policy_feature_views(policy, batch)
     parsed = parse_planets(env_obs)
 
     if policy_kind == "edge":
         edge_np = _edge_valid_mask(st0, P_MAX, player, min_send=min_send)
         action, _, _ = policy.act(
-            node_feats=batch["node_feats"], edge_feats=batch["edge_feats"],
+            node_feats=nf, edge_feats=ef,
             global_feats=batch["global_feats"], planet_mask=batch["planet_mask"],
             edge_mask=torch.from_numpy(edge_np)[None].to(device),
             deterministic=deterministic,
@@ -75,7 +81,7 @@ def _policy_env_action(policy, env_obs, player, t, max_steps, device, determinis
     if policy_kind == "launch":
         source_np, dest_np = _source_dest_masks(st0, P_MAX, player, min_send=min_send)
         action, _, _ = policy.act(
-            node_feats=batch["node_feats"], edge_feats=batch["edge_feats"],
+            node_feats=nf, edge_feats=ef,
             global_feats=batch["global_feats"], planet_mask=batch["planet_mask"],
             source_mask=torch.from_numpy(source_np)[None].to(device),
             dest_mask=torch.from_numpy(dest_np)[None].to(device),
@@ -90,7 +96,7 @@ def _policy_env_action(policy, env_obs, player, t, max_steps, device, determinis
 
     attack_np, defend_np = _target_masks(st0, P_MAX, player)
     action, _, _ = policy.act(
-        node_feats=batch["node_feats"], edge_feats=batch["edge_feats"],
+        node_feats=nf, edge_feats=ef,
         global_feats=batch["global_feats"], planet_mask=batch["planet_mask"],
         attack_mask=torch.from_numpy(attack_np)[None].to(device),
         defend_mask=torch.from_numpy(defend_np)[None].to(device),
@@ -108,7 +114,20 @@ def _policy_env_action(policy, env_obs, player, t, max_steps, device, determinis
     return ea
 
 
+_orbit_agent = None
+
+
 def _scripted_env_action(env_obs, player, t, max_steps, device, strategy):
+    if strategy == "orbit":
+        # Graph-based bot: consumes the raw env obs, emits env launches directly.
+        global _orbit_agent
+        if _orbit_agent is None:
+            try:
+                from .orbit_scripted_agent import OrbitScriptedAgent
+            except ImportError:  # pragma: no cover - flat layout
+                from orbit_scripted_agent import OrbitScriptedAgent  # type: ignore
+            _orbit_agent = OrbitScriptedAgent()
+        return _orbit_agent.act(env_obs, player, current_turn=t, max_turns=max_steps)
     av = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=av,
                             p_max=P_MAX, f_max=F_MAX, turn=t, max_turns=max_steps)
@@ -171,6 +190,13 @@ def record_game_html(
     env.reset(num_agents=num_agents)
     state = env.step([[] for _ in players])
 
+    # Per-player capture counters feed the recapture_count node channel
+    # (mirrors collect_episode so eval sees the same feature distribution).
+    cap_counts: dict[int, dict[int, int]] = {p: {} for p in players}
+    last_owner: dict[int, int] = {
+        int(pl.id): int(pl.owner)
+        for pl in parse_planets(state[0]["observation"])}
+
     t = 0
     with torch.no_grad():
         for t in range(max_steps):
@@ -181,15 +207,24 @@ def record_game_html(
                     ea = _scripted_env_action(env_obs, p, t, max_steps, device, scripted_strategy)
                 elif opponent in ("policy", "frozen") and p == 1:
                     ea = _policy_env_action(policy_p1, env_obs, p, t, max_steps, device,
-                                            deterministic, ivr_p1, kind_p1, ms_p1)
+                                            deterministic, ivr_p1, kind_p1, ms_p1,
+                                            cap_counts=cap_counts[p])
                 elif opponent == "self_play":
                     ea = _policy_env_action(policy, env_obs, p, t, max_steps, device,
-                                            deterministic, include_value_rate, policy_kind, min_send)
+                                            deterministic, include_value_rate, policy_kind, min_send,
+                                            cap_counts=cap_counts[p])
                 else:
                     ea = _policy_env_action(policy, env_obs, p, t, max_steps, device,
-                                            deterministic, include_value_rate, policy_kind, min_send)
+                                            deterministic, include_value_rate, policy_kind, min_send,
+                                            cap_counts=cap_counts[p])
                 env_actions.append(ea)
             state = env.step(env_actions)
+            for pl in parse_planets(state[0]["observation"]):
+                pid, own = int(pl.id), int(pl.owner)
+                if own != last_owner.get(pid, -1):
+                    if own in cap_counts:
+                        cap_counts[own][pid] = cap_counts[own].get(pid, 0) + 1
+                    last_owner[pid] = own
             if env.done or any(getattr(state[p], "status", "ACTIVE") == "DONE" for p in players):
                 break
 

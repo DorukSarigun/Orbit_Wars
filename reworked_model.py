@@ -8,10 +8,11 @@ action / value heads (designed separately) will sit on top of.
 Design choices (see ``docs/reworked_features_reference.md`` and the chat
 design notes):
 
-* **Compact inputs.** Node features are ``REWORKED_NODE_FEATURE_DIM = 16``
-  (10 raw ``standard_node_features`` + 6 derived metrics), edge features are
-  ``REWORKED_EDGE_FEATURE_DIM = 4`` (distance, crosses_sun, friendly_flux,
-  enemy_flux).  Global features keep the existing 14-D layout.
+* **Compact inputs.** Node features are ``REWORKED_NODE_FEATURE_DIM = 23``
+  (10 raw ``standard_node_features`` + 6 derived metrics + 7 v12 extras),
+  edge features are ``REWORKED_EDGE_FEATURE_DIM = 9`` (distance, crosses_sun,
+  friendly/enemy flux + v12 kinematics: eta, orbital phase sin/cos,
+  ships-at-arrival, race margin).  Global features keep the 14-D layout.
 * **Input embedding.** Node / edge / global blocks are each projected with a
   ``LayerNorm -> Linear -> GELU -> LayerNorm`` stem to ``d_model``.
 * **Message passing.** ``n_layers`` of a **dense edge-attention GNN** layer:
@@ -52,9 +53,17 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
 # ---------------------------------------------------------------------------
 # Derived per-node metrics appended to the 10 raw standard channels:
 #   discounted_production_potential, closeness_centrality,
-#   potential_threat, potential_support, friendly_compactness
+#   potential_threat, potential_support, friendly_compactness,
+#   capture_affordability
 NUM_DERIVED_NODE_METRICS: int = 6
-REWORKED_NODE_FEATURE_DIM: int = STANDARD_NODE_FEATURE_DIM + NUM_DERIVED_NODE_METRICS  # 16
+# v12 extras appended after the derived block (and after the optional
+# eta_value_rate channel, which keeps legacy 16/17-dim checkpoints sliceable):
+#   friendly_inbound_total, enemy_inbound_total, enemy_min_eta,
+#   defense_deficit, recapture_count, comet_remaining_life, frontier_distance
+NUM_EXTRA_NODE_METRICS: int = 7
+REWORKED_NODE_FEATURE_DIM: int = (
+    STANDARD_NODE_FEATURE_DIM + NUM_DERIVED_NODE_METRICS + NUM_EXTRA_NODE_METRICS
+)  # 23
 REWORKED_GLOBAL_FEATURE_DIM: int = 14  # mirrors obs_builder.GLOBAL_FEATURE_DIM
 
 _NEG_INF = float("-inf")
@@ -1456,6 +1465,7 @@ class ReworkedEdgePolicy(nn.Module):
 
 __all__ = [
     "NUM_DERIVED_NODE_METRICS",
+    "NUM_EXTRA_NODE_METRICS",
     "REWORKED_NODE_FEATURE_DIM",
     "REWORKED_GLOBAL_FEATURE_DIM",
     "DenseEdgeAttnGINELayer",

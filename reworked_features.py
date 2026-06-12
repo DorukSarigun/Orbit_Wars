@@ -112,7 +112,19 @@ EDGE_IDX_DISTANCE = 0       # normalised geometric distance d(i, j)
 EDGE_IDX_CROSSES_SUN = 1    # 1 if the straight i->j path is blocked by the sun
 EDGE_IDX_FRIENDLY_FLUX = 2  # ETA-weighted friendly ship flow i -> j
 EDGE_IDX_ENEMY_FLUX = 3     # ETA-weighted enemy ship flow i -> j
-REWORKED_EDGE_FEATURE_DIM = 4
+# --- v12 channels (zero when the optional kinematic inputs are omitted) ----
+EDGE_IDX_ETA = 4            # rotation-refined travel time i -> j (ref fleet) / 60
+EDGE_IDX_DPHI_SIN = 5       # sin(theta_j - theta_i): time-invariant orbital phase
+EDGE_IDX_DPHI_COS = 6       # cos(theta_j - theta_i)
+EDGE_IDX_SHIPS_AT_ARRIVAL = 7  # est. target garrison when an i->j fleet lands / 50
+EDGE_IDX_RACE_MARGIN = 8    # soft "my fleet beats the soonest enemy inbound" signal
+REWORKED_EDGE_FEATURE_DIM = 9
+
+# ETA channel constants: reference fleet size for the speed model and the
+# turn-normaliser (cross-board at ref speed is ~55-60 turns).
+ETA_REF_SHIPS = 10
+ETA_TURN_NORM = 60.0
+RACE_MARGIN_TAU = 5.0       # turns of ETA difference per sigmoid unit
 
 # Channel layout of ``standard_node_features`` output (10 columns).
 STD_IDX_IS_SELF = 0
@@ -855,6 +867,20 @@ def edge_features(
     tau: float = DEFAULT_FLUX_TAU,
     eta_norm: float = DEFAULT_FLUX_ETA_NORM,
     ship_norm: float = DEFAULT_FLUX_SHIP_NORM,
+    # ---- v12 kinematic channels (left at 0 when these inputs are omitted) ----
+    r_sun: "np.ndarray | None" = None,        # (n,) raw sun-centred radius
+    theta: "np.ndarray | None" = None,        # (n,) sun-centred angle [rad]
+    omega_dt: "np.ndarray | None" = None,     # (n,) per-turn angular step (0 if static)
+    ships: "np.ndarray | None" = None,        # (n,) raw garrison (for ships_at_arrival)
+    production: "np.ndarray | None" = None,   # (n,) ships/turn
+    owner: "np.ndarray | None" = None,        # (n,) -1 neutral else player id
+    enemy_min_eta: "np.ndarray | None" = None,  # (n,) raw turns; 0 = no enemy inbound
+    dphi_sin: "np.ndarray | None" = None,     # (n, n) precomputed sin(theta_j - theta_i)
+    dphi_cos: "np.ndarray | None" = None,     # (n, n) precomputed cos(theta_j - theta_i)
+    max_speed: float = DEFAULT_MAX_SHIP_SPEED,
+    eta_ref_ships: int = ETA_REF_SHIPS,
+    eta_turn_norm: float = ETA_TURN_NORM,
+    race_tau: float = RACE_MARGIN_TAU,
 ) -> np.ndarray:
     r"""Directed per-edge feature stack ``(n, n, REWORKED_EDGE_FEATURE_DIM)``.
 
@@ -864,7 +890,11 @@ def edge_features(
         [ distance(i, j),        # static geometry
           crosses_sun(i, j),     # static: straight path blocked by the sun
           friendly_flux(i->j),   # ETA-weighted friendly ships in transit
-          enemy_flux(i->j) ]     # ETA-weighted enemy ships in transit
+          enemy_flux(i->j),      # ETA-weighted enemy ships in transit
+          eta(i->j),             # rotation-refined travel time, ref fleet / 60
+          sin/cos(dphi),         # time-invariant orbital phase difference
+          ships_at_arrival(j),   # est. defenders when an i->j fleet lands / 50
+          race_margin(i->j) ]    # sigmoid: lands before soonest enemy inbound
 
     This is the **in-flight / actual** counterpart of the garrison-based
     **potential** node metrics (:func:`potential_threat` /
@@ -892,7 +922,7 @@ def edge_features(
 
     Returns
     -------
-    ``(n, n, 4)`` ``float32`` directed edge feature tensor.
+    ``(n, n, REWORKED_EDGE_FEATURE_DIM)`` ``float32`` directed edge tensor.
     """
     d = np.asarray(distance_matrix, dtype=np.float32)
     n = int(d.shape[0])
@@ -914,6 +944,59 @@ def edge_features(
     scale = 1.0 / max(float(ship_norm), 1e-6)
     out[:, :, EDGE_IDX_FRIENDLY_FLUX] = friendly * scale
     out[:, :, EDGE_IDX_ENEMY_FLUX] = enemy * scale
+
+    # ---- v12 kinematic channels ------------------------------------------
+    if dphi_sin is not None and dphi_cos is not None:
+        out[:, :, EDGE_IDX_DPHI_SIN] = np.asarray(dphi_sin, dtype=np.float32)
+        out[:, :, EDGE_IDX_DPHI_COS] = np.asarray(dphi_cos, dtype=np.float32)
+
+    eta_mat: "np.ndarray | None" = None
+    if r_sun is not None and theta is not None:
+        # Reference fleet speed (mirrors orbit_wars / feature_extraction):
+        #   v = 1 + (max_speed - 1) * (ln(s) / ln(1000)) ** 1.5
+        s_ref = max(int(eta_ref_ships), 2)
+        v_ref = 1.0 + (float(max_speed) - 1.0) * (
+            np.log(s_ref) / np.log(1000.0)) ** 1.5
+        v_ref = max(v_ref, 1e-6)
+        r = np.asarray(r_sun, dtype=np.float64).reshape(-1)
+        th = np.asarray(theta, dtype=np.float64).reshape(-1)
+        w = (np.zeros_like(r) if omega_dt is None
+             else np.asarray(omega_dt, dtype=np.float64).reshape(-1))
+        px = r * np.cos(th)
+        py = r * np.sin(th)
+        # First pass: ETA from current positions.
+        dx = px[None, :] - px[:, None]
+        dy = py[None, :] - py[:, None]
+        eta0 = np.hypot(dx, dy) / v_ref
+        # One refinement: rotate each *target* forward by omega * eta0 and
+        # re-measure from the (static at launch) source.  Captures the bulk of
+        # the moving-target correction without an intercept solve per pair.
+        th_j = th[None, :] + w[None, :] * eta0          # (n, n) target angle at arrival
+        qx = r[None, :] * np.cos(th_j)
+        qy = r[None, :] * np.sin(th_j)
+        eta_mat = np.hypot(qx - px[:, None], qy - py[:, None]) / v_ref
+        out[:, :, EDGE_IDX_ETA] = np.clip(
+            eta_mat / max(float(eta_turn_norm), 1e-6), 0.0, 2.0).astype(np.float32)
+
+    if eta_mat is not None and ships is not None:
+        s = np.asarray(ships, dtype=np.float64).reshape(-1)
+        prod = (np.zeros_like(s) if production is None
+                else np.asarray(production, dtype=np.float64).reshape(-1))
+        own = (np.full(s.shape, -1, dtype=np.int64) if owner is None
+               else np.asarray(owner, dtype=np.int64).reshape(-1))
+        produces = (own != -1).astype(np.float64)      # neutrals do not grow
+        at_arrival = s[None, :] + produces[None, :] * prod[None, :] * eta_mat
+        out[:, :, EDGE_IDX_SHIPS_AT_ARRIVAL] = np.clip(
+            at_arrival / max(float(ship_norm), 1e-6), 0.0, 10.0).astype(np.float32)
+
+    if eta_mat is not None and enemy_min_eta is not None:
+        e = np.asarray(enemy_min_eta, dtype=np.float64).reshape(-1)
+        has_enemy = e > 1e-9                            # 0 is the "none" sentinel
+        margin = (e[None, :] - eta_mat) / max(float(race_tau), 1e-6)
+        race = 1.0 / (1.0 + np.exp(-np.clip(margin, -30.0, 30.0)))
+        out[:, :, EDGE_IDX_RACE_MARGIN] = np.where(
+            has_enemy[None, :], race, 1.0).astype(np.float32)
+
     return out
 
 

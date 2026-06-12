@@ -1,13 +1,28 @@
-"""Graph-metric scripted agent: defense, backline support, production attacks.
+"""Graph-metric scripted agent: evacuate, defend, attack, support, consolidate.
 
 Turn pipeline::
 
     1. :func:`orbit_graph.build_orbit_graph`
     2. :func:`orbit_defense.compute_owned_defense` + launch budgets
     3. :func:`orbit_attack_targets.plan_attack_targets`
-    4. **act** — reinforce critical worlds, then
-       :func:`orbit_attack_allocate.allocate_greedy_captures`, then backline
-       support to high-influence frontline planets (remaining budget).
+    4. **act** phases (global cap ``max_launches``):
+
+       0. **Comet evacuation** — garrisons on owned comets about to expire are
+          relocated to the nearest safe friendly planet (they would otherwise
+          be destroyed with the comet).
+       1. **Defense triage** — CRITICAL worlds get multi-source reinforcement,
+          but only when *savable*: help must land **before** the earliest
+          threat and fully cover the gap.  Unsavable worlds are abandoned;
+          if truly doomed their garrison is evacuated instead of fed to the
+          enemy.
+       2. **Attack** — :func:`orbit_attack_allocate.allocate_greedy_captures`
+          (all-or-nothing waves, enemy weak spots first).  ``support_reserve_slots``
+          launch slots are held back when any planet needs support.
+       3. **Support** — backline ships to high enemy-influence frontline
+          planets (partial reinforcement allowed, ETA-aware).
+       4. **Consolidation** — idle backline surplus is pushed toward the
+          owned planet closest to the enemy (rally point) so force is never
+          stranded in the rear.
 
 Public API::
 
@@ -24,7 +39,6 @@ from typing import Any, Optional
 from navigation import compute_launch
 from orbit_attack_allocate import allocate_greedy_captures
 from orbit_attack_targets import (
-    AttackTargetConfig,
     attack_config_from_env,
     plan_attack_targets,
 )
@@ -48,18 +62,19 @@ class OrbitScriptedConfig:
     strained_threshold: float = 0.0
     critical_threshold: float = -10.0
 
-    # Backline → frontline support when enemy influence is high.
-    support_threat_threshold: float = 8.0
-    """Minimum realized + weighted potential threat to request support."""
-    support_min_source_surplus: float = 5.0
-    """Backline source must have at least this defense surplus."""
-    support_max_source_threat: float = 4.0
-    """Sources with higher local enemy influence are not support donors."""
-    support_cushion: float = 3.0
-    """Extra ships above liabilities we try to station on threatened worlds."""
-    support_ship_fraction: float = 0.35
-    """When surplus is thin but influence is high, cover this fraction of it."""
+    # --- Phase 0: comet evacuation ---
+    comet_evac_turns: int = 2
+    """Evacuate owned comets whose remaining life is at most this many turns
+    (0 disables)."""
 
+    # --- Phase 1: defense triage ---
+    max_rescue_launches: int = 3
+    """Per-critical-planet cap on simultaneous rescue launches."""
+    evacuate_doomed: bool = True
+    """When a critical world cannot be saved and inbound enemies overwhelm it,
+    relocate its garrison instead of letting the enemy destroy it."""
+
+    # --- Phase 2: attack ---
     include_neutrals: bool = True
     include_enemies: bool = True
     include_comets: bool = False
@@ -75,6 +90,37 @@ class OrbitScriptedConfig:
     """Penalty for enemy reinforcement / diffusion reach on the target."""
     prioritize_enemy_weakspots: bool = True
     """Rank enemy weak spots before neutral expansion targets."""
+    capture_margin: float = 0.1
+    """Overkill padding on the required capture ship count (estimate buffer)."""
+    max_wave_launches: int = 4
+    """Cap on simultaneous launches funding a single capture wave."""
+    allow_partial_enemy_waves: bool = False
+    """Permit underfunded pressure waves on enemy planets (never neutrals)."""
+
+    # --- Phase 3: backline support ---
+    support_reserve_slots: int = 2
+    """Launch slots held back from the attack phase while any owned planet
+    has a positive support need."""
+    support_threat_threshold: float = 8.0
+    """Minimum realized + weighted potential threat to request support."""
+    support_min_source_surplus: float = 5.0
+    """Backline source must have at least this defense surplus."""
+    support_max_source_threat: float = 4.0
+    """Sources with higher local enemy influence are not support donors."""
+    support_cushion: float = 3.0
+    """Extra ships above liabilities we try to station on threatened worlds."""
+    support_ship_fraction: float = 0.35
+    """When surplus is thin but influence is high, cover this fraction of it."""
+    max_support_launches_per_target: int = 2
+    """Per-receiver cap on simultaneous support launches."""
+
+    # --- Phase 4: consolidation ---
+    consolidation_min_surplus: float = 10.0
+    """Idle backline planets need at least this surplus to donate forward."""
+    consolidation_fraction: float = 0.5
+    """Fraction of the remaining launch budget pushed to the rally planet."""
+    consolidation_min_send: int = 5
+    """Skip consolidation dribbles below this ship count."""
 
 
 def _env_omega(env_obs: Any) -> float:
@@ -136,7 +182,7 @@ class _ReinforcementPick:
     score: float
 
 
-def _best_reinforcement(
+def _plan_reinforcement_wave(
     og: OrbitGraph,
     tgt_id: int,
     need: int,
@@ -144,27 +190,34 @@ def _best_reinforcement(
     remaining: dict[int, int],
     *,
     cfg: OrbitScriptedConfig,
-    used_sources: set[int],
     omega: float,
-    relaxed_source: bool = False,
-) -> Optional[_ReinforcementPick]:
-    """Pick a backline (or any surplus) source to reinforce ``tgt_id``."""
-    if need <= 0:
-        return None
+    eta_limit: float,
+    relaxed_source: bool,
+    max_launches: int,
+    all_or_nothing: bool,
+) -> list[_ReinforcementPick]:
+    """Multi-source reinforcement toward ``tgt_id``.
+
+    Every launch must land **strictly before** ``eta_limit`` (the earliest
+    incoming threat) — ships arriving after the planet falls are wasted.
+    With ``all_or_nothing`` the whole wave is dropped when the combined help
+    cannot cover ``need`` (unsavable planet: do not feed the enemy).
+    """
+    if need <= 0 or max_launches <= 0:
+        return []
     tgt = og.planet_by_id.get(int(tgt_id))
     if tgt is None:
-        return None
+        return []
     tid = int(tgt_id)
 
-    best: Optional[_ReinforcementPick] = None
+    candidates: list[tuple[float, PlanetDefenseState]] = []
     for state in defense_states:
         sid = int(state.planet_id)
-        if sid == tid or sid in used_sources:
+        if sid == tid:
             continue
         budget = int(remaining.get(sid, 0))
         if budget <= 0:
             continue
-
         if relaxed_source:
             if float(state.defense_surplus) <= 0.0:
                 continue
@@ -173,45 +226,162 @@ def _best_reinforcement(
             score = _backline_score(state, cfg)
             if not math.isfinite(score):
                 continue
-
         if not og.G.has_edge(sid, tid):
             continue
         if not og.G.edges[sid, tid].get("reachable", False):
             continue
+        candidates.append((score, state))
+    candidates.sort(key=lambda t: t[0], reverse=True)
 
-        src = og.planet_by_id[sid]
-        ships = min(budget, need, int(state.garrison))
+    picks: list[_ReinforcementPick] = []
+    committed = 0
+    for score, state in candidates:
+        if len(picks) >= int(max_launches) or committed >= int(need):
+            break
+        sid = int(state.planet_id)
+        budget = int(remaining.get(sid, 0))
+        ships = min(budget, int(need) - committed, int(state.garrison))
         if ships <= 0:
             continue
-        launch = compute_launch(src, tgt, ships, og.planets, omega)
+        launch = compute_launch(og.planet_by_id[sid], tgt, ships, og.planets, omega)
         if launch is None:
             continue
         eta = float(launch["eta"])
-        pick = _ReinforcementPick(
+        if eta >= float(eta_limit):
+            continue
+        picks.append(_ReinforcementPick(
             src_id=sid,
             tgt_id=tid,
             angle=float(launch["angle"]),
             ships=int(launch["ships"]),
             eta=eta,
-            score=score,
-        )
-        if best is None or (pick.score, -pick.eta) > (best.score, -best.eta):
-            best = pick
-    return best
+            score=float(score),
+        ))
+        committed += int(launch["ships"])
+
+    if all_or_nothing and committed < int(need):
+        return []
+    return picks
 
 
-def _apply_launch(
-    pick: _ReinforcementPick,
-    remaining: dict[int, int],
-    used_sources: set[int],
-) -> list:
+def _apply_pick(pick: _ReinforcementPick, remaining: dict[int, int]) -> list:
     remaining[pick.src_id] = int(remaining.get(pick.src_id, 0)) - int(pick.ships)
-    used_sources.add(pick.src_id)
     return [pick.src_id, pick.angle, pick.ships]
 
 
+# ---------------------------------------------------------------------------
+# Comet / doomed-planet evacuation
+# ---------------------------------------------------------------------------
+def _comet_remaining_life(p: Any) -> int:
+    """Turns an owned comet stays on the board (``-1`` if not a known comet)."""
+    if not getattr(p, "is_comet", False):
+        return -1
+    path = getattr(p, "comet_path", None)
+    if not path:
+        return -1
+    return (len(path) - 1) - int(getattr(p, "comet_path_index", -1))
+
+
+def _nearest_safe_friendly(comet: Any, friendly: list, evac_turns: int):
+    """Closest friendly planet that will not itself expire within the window."""
+    best = None
+    best_d = math.inf
+    for p in friendly:
+        if int(p.id) == int(comet.id):
+            continue
+        rem = _comet_remaining_life(p)
+        if 0 <= rem <= int(evac_turns):
+            continue
+        d = (float(p.x) - float(comet.x)) ** 2 + (float(p.y) - float(comet.y)) ** 2
+        if d < best_d:
+            best_d = d
+            best = p
+    return best
+
+
+def _comet_evacuation_actions(
+    og: OrbitGraph,
+    *,
+    omega: float,
+    evac_turns: int,
+) -> tuple[list[list], set[int]]:
+    """Rescue garrisons stranded on owned comets about to expire."""
+    if evac_turns <= 0:
+        return [], set()
+    out: list[list] = []
+    evacuated: set[int] = set()
+    friendly = [p for p in og.planets if int(p.owner) == int(og.player)]
+    for c in og.planets:
+        if int(c.owner) != int(og.player):
+            continue
+        rem = _comet_remaining_life(c)
+        if rem < 0 or rem > int(evac_turns):
+            continue
+        garrison = int(round(float(c.ships)))
+        if garrison <= 0:
+            continue
+        dest = _nearest_safe_friendly(c, friendly, evac_turns)
+        if dest is None:
+            continue
+        res = compute_launch(c, dest, garrison, og.planets, omega)
+        if res is None or int(res["ships"]) <= 0:
+            continue
+        out.append([int(c.id), float(res["angle"]), int(res["ships"])])
+        evacuated.add(int(c.id))
+    return out, evacuated
+
+
+def _is_doomed(state: PlanetDefenseState) -> bool:
+    """Inbound enemies overwhelm everything the planet can muster locally."""
+    if state.min_incoming_eta is None:
+        return False
+    local = (
+        float(state.garrison)
+        + float(state.production_buffer)
+        + float(state.friendly_inbound_ships)
+    )
+    return float(state.realized_enemy_ships) > local
+
+
+def _evacuate_garrison(
+    og: OrbitGraph,
+    state: PlanetDefenseState,
+    defense_states: list[PlanetDefenseState],
+    *,
+    omega: float,
+) -> Optional[list]:
+    """Relocate a doomed planet's garrison to the nearest viable own planet."""
+    src = og.planet_by_id.get(int(state.planet_id))
+    if src is None or int(src.ships) <= 0:
+        return None
+    by_id = {int(s.planet_id): s for s in defense_states}
+    best = None
+    best_d = math.inf
+    for p in og.planets:
+        pid = int(p.id)
+        if p.owner != og.player or pid == int(src.id) or p.is_comet:
+            continue
+        st = by_id.get(pid)
+        if st is not None and st.status == DefenseStatus.CRITICAL:
+            continue
+        if not og.G.has_edge(int(src.id), pid):
+            continue
+        if not og.G.edges[int(src.id), pid].get("reachable", False):
+            continue
+        d = (float(p.x) - float(src.x)) ** 2 + (float(p.y) - float(src.y)) ** 2
+        if d < best_d:
+            best_d = d
+            best = p
+    if best is None:
+        return None
+    launch = compute_launch(src, best, int(src.ships), og.planets, omega)
+    if launch is None or int(launch["ships"]) <= 0:
+        return None
+    return [int(src.id), float(launch["angle"]), int(launch["ships"])]
+
+
 class OrbitScriptedAgent:
-    """Defense → attack → support scripted policy on the orbit graph."""
+    """Evacuate → defend → attack → support → consolidate (orbit graph)."""
 
     def __init__(self, cfg: OrbitScriptedConfig | None = None):
         self.cfg = cfg or OrbitScriptedConfig()
@@ -240,6 +410,7 @@ class OrbitScriptedAgent:
             include_enemies=cfg.include_enemies,
             include_comets=cfg.include_comets,
         )
+        omega = float(attack_cfg.angular_velocity)
         defense_states = compute_owned_defense(
             og,
             horizon_cap=cfg.horizon_cap,
@@ -255,32 +426,75 @@ class OrbitScriptedAgent:
         used_sources: set[int] = set()
         actions: list[list] = []
 
-        # Phase 1 — critical worlds: any positive-surplus donor.
+        # ------------------------------------------------------------------
+        # Phase 0 — comet evacuation (garrison dies with the comet otherwise).
+        # ------------------------------------------------------------------
+        evac_actions, evacuated = _comet_evacuation_actions(
+            og, omega=omega, evac_turns=int(cfg.comet_evac_turns),
+        )
+        for action in evac_actions:
+            if len(actions) >= cfg.max_launches:
+                break
+            actions.append(action)
+            remaining[int(action[0])] = 0
+
+        # ------------------------------------------------------------------
+        # Phase 1 — defense triage: save what is savable, abandon the rest.
+        # ------------------------------------------------------------------
         critical = [
-            s for s in defense_states if s.status == DefenseStatus.CRITICAL
+            s for s in defense_states
+            if s.status == DefenseStatus.CRITICAL
+            and int(s.planet_id) not in evacuated
         ]
         critical.sort(key=lambda s: s.defense_surplus)
         for state in critical:
-            if len(actions) >= cfg.max_launches:
+            slots = int(cfg.max_launches) - len(actions)
+            if slots <= 0:
                 break
             need = max(1, int(math.ceil(-float(state.defense_surplus))))
-            pick = _best_reinforcement(
+            eta_limit = (
+                float(state.min_incoming_eta)
+                if state.min_incoming_eta is not None
+                else math.inf
+            )
+            picks = _plan_reinforcement_wave(
                 og,
                 state.planet_id,
                 need,
                 defense_states,
                 remaining,
                 cfg=cfg,
-                used_sources=used_sources,
-                omega=float(attack_cfg.angular_velocity),
+                omega=omega,
+                eta_limit=eta_limit,
                 relaxed_source=True,
+                max_launches=min(slots, int(cfg.max_rescue_launches)),
+                all_or_nothing=True,
             )
-            if pick is not None:
-                actions.append(_apply_launch(pick, remaining, used_sources))
+            if picks:
+                for pick in picks:
+                    actions.append(_apply_pick(pick, remaining))
+                continue
+            # Unsavable.  If truly doomed, deny the enemy the kill.
+            if cfg.evacuate_doomed and _is_doomed(state):
+                evac = _evacuate_garrison(og, state, defense_states, omega=omega)
+                if evac is not None:
+                    actions.append(evac)
+                    remaining[int(state.planet_id)] = 0
 
-        # Phase 2 — greedy multi-target captures (nearest source first, no sync).
-        slots_left = int(cfg.max_launches) - len(actions)
-        if slots_left > 0:
+        # ------------------------------------------------------------------
+        # Phase 2 — attacks, holding back slots for support when needed.
+        # ------------------------------------------------------------------
+        support_receivers = [s for s in defense_states if support_need(s, cfg) > 0]
+        support_receivers.sort(
+            key=lambda s: (
+                enemy_influence(s, potential_weight=cfg.potential_weight),
+                -float(s.defense_surplus),
+            ),
+            reverse=True,
+        )
+        reserve = min(int(cfg.support_reserve_slots), len(support_receivers))
+        attack_slots = max(0, int(cfg.max_launches) - len(actions) - reserve)
+        if attack_slots > 0:
             actions.extend(
                 allocate_greedy_captures(
                     og,
@@ -295,36 +509,91 @@ class OrbitScriptedAgent:
                     empire_support_weight=float(cfg.enemy_empire_support_weight),
                     prioritize_enemy_weakspots=bool(cfg.prioritize_enemy_weakspots),
                     eta_horizon=float(cfg.eta_horizon),
-                    max_launches=slots_left,
+                    max_launches=attack_slots,
+                    capture_margin=float(cfg.capture_margin),
+                    max_wave_launches=int(cfg.max_wave_launches),
+                    allow_partial_enemy_waves=bool(cfg.allow_partial_enemy_waves),
                 )
             )
 
+        # ------------------------------------------------------------------
         # Phase 3 — backline support toward high enemy-influence frontline.
-        support_receivers = [s for s in defense_states if support_need(s, cfg) > 0]
-        support_receivers.sort(
-            key=lambda s: (
-                enemy_influence(s, potential_weight=cfg.potential_weight),
-                -float(s.defense_surplus),
-            ),
-            reverse=True,
-        )
+        # ------------------------------------------------------------------
         for state in support_receivers:
-            if len(actions) >= cfg.max_launches:
+            slots = int(cfg.max_launches) - len(actions)
+            if slots <= 0:
                 break
+            if int(state.planet_id) in evacuated:
+                continue
             need = support_need(state, cfg)
-            pick = _best_reinforcement(
+            eta_limit = (
+                float(state.min_incoming_eta)
+                if state.min_incoming_eta is not None
+                else math.inf
+            )
+            picks = _plan_reinforcement_wave(
                 og,
                 state.planet_id,
                 need,
                 defense_states,
                 remaining,
                 cfg=cfg,
-                used_sources=used_sources,
-                omega=float(attack_cfg.angular_velocity),
+                omega=omega,
+                eta_limit=eta_limit,
                 relaxed_source=False,
+                max_launches=min(slots, int(cfg.max_support_launches_per_target)),
+                all_or_nothing=False,
             )
-            if pick is not None:
-                actions.append(_apply_launch(pick, remaining, used_sources))
+            for pick in picks:
+                actions.append(_apply_pick(pick, remaining))
+
+        # ------------------------------------------------------------------
+        # Phase 4 — consolidation: push idle backline surplus to the front.
+        # ------------------------------------------------------------------
+        slots = int(cfg.max_launches) - len(actions)
+        if slots > 0:
+            rally = None
+            rally_infl = 0.0
+            for s in defense_states:
+                if s.status == DefenseStatus.CRITICAL:
+                    continue
+                if int(s.planet_id) in evacuated:
+                    continue
+                infl = enemy_influence(s, potential_weight=cfg.potential_weight)
+                if infl > rally_infl:
+                    rally_infl = infl
+                    rally = s
+            if rally is not None and rally_infl > 0.0:
+                rid = int(rally.planet_id)
+                donors = [
+                    s for s in defense_states
+                    if int(s.planet_id) != rid
+                    and s.status == DefenseStatus.SECURE
+                    and float(s.defense_surplus) >= float(cfg.consolidation_min_surplus)
+                    and enemy_influence(s, potential_weight=cfg.potential_weight) < rally_infl
+                ]
+                donors.sort(key=lambda s: -float(s.defense_surplus))
+                tgt = og.planet_by_id.get(rid)
+                for s in donors:
+                    if slots <= 0 or tgt is None:
+                        break
+                    sid = int(s.planet_id)
+                    budget = int(remaining.get(sid, 0))
+                    ships = int(math.floor(float(budget) * float(cfg.consolidation_fraction)))
+                    if ships < int(cfg.consolidation_min_send):
+                        continue
+                    if not og.G.has_edge(sid, rid):
+                        continue
+                    if not og.G.edges[sid, rid].get("reachable", False):
+                        continue
+                    launch = compute_launch(
+                        og.planet_by_id[sid], tgt, ships, og.planets, omega,
+                    )
+                    if launch is None:
+                        continue
+                    actions.append([sid, float(launch["angle"]), int(launch["ships"])])
+                    remaining[sid] = budget - int(launch["ships"])
+                    slots -= 1
 
         return actions
 

@@ -15,19 +15,25 @@ from orbit_graph import (
 )
 
 
+# NOTE: planet 1 sits at (80, 20), NOT (80, 50) — the 0 <-> 1 leg must not pass
+# through the sun at (50, 50) or the route becomes unreachable and fleets on it
+# are dropped from the graph.
+_PLANET_ROWS = [
+    [0, 0, 20.0, 50.0, 1.0, 30, 2],
+    [1, -1, 80.0, 20.0, 1.0, 5, 3],
+    [2, 1, 50.0, 20.0, 1.0, 10, 1],
+]
+
+# Headings along the (reachable) routes used by fleet tests below.
+_ANGLE_0_TO_1 = math.atan2(20.0 - 50.0, 80.0 - 20.0)
+_ANGLE_2_TO_0 = math.atan2(50.0 - 20.0, 20.0 - 50.0)
+
+
 def _minimal_env(*, fleets=None):
     return {
-        "planets": [
-            [0, 0, 20.0, 50.0, 1.0, 30, 2],
-            [1, -1, 80.0, 50.0, 1.0, 5, 3],
-            [2, 1, 50.0, 20.0, 1.0, 10, 1],
-        ],
+        "planets": [list(r) for r in _PLANET_ROWS],
         "fleets": fleets or [],
-        "initial_planets": [
-            [0, 0, 20.0, 50.0, 1.0, 30, 2],
-            [1, -1, 80.0, 50.0, 1.0, 5, 3],
-            [2, 1, 50.0, 20.0, 1.0, 10, 1],
-        ],
+        "initial_planets": [list(r) for r in _PLANET_ROWS],
         "angular_velocity": 0.0,
         "comet_planet_ids": [],
         "comets": [],
@@ -70,8 +76,8 @@ def test_build_orbit_graph_topology():
 
 
 def test_fleet_stored_on_directed_edge_with_owner():
-    # Own fleet launched from planet 0 toward neutral 1 (roughly east).
-    fleets = [[7, 0, 22.0, 50.0, 0.0, 0, 25]]
+    # Own fleet launched from planet 0 toward neutral 1, partway along the route.
+    fleets = [[7, 0, 26.0, 47.0, _ANGLE_0_TO_1, 0, 25]]
     og = build_orbit_graph(_minimal_env(fleets=fleets), player=0)
 
     found = []
@@ -94,7 +100,8 @@ def test_fleet_stored_on_directed_edge_with_owner():
 
 
 def test_enemy_fleet_side_relative_to_player():
-    fleets = [[9, 1, 78.0, 50.0, math.pi, 2, 15]]
+    # Enemy fleet from planet 2 inbound on our planet 0.
+    fleets = [[9, 1, 44.0, 26.0, _ANGLE_2_TO_0, 2, 15]]
     og = build_orbit_graph(_minimal_env(fleets=fleets), player=0)
     enemy = [r for r in og.fleets_by_side(side=FleetSide.ENEMY)]
     assert len(enemy) == 1
@@ -122,14 +129,15 @@ def test_potential_vs_realized_enemy_threat_split():
     assert og.potential_enemy_threat(0) > 0.0
     assert og.realized_enemy_threat(0) == 0.0
 
-    # Enemy fleet near player planet 0, heading west into it.
-    fleets = [[9, 1, 25.0, 50.0, math.pi, 2, 15]]
+    # Enemy fleet near player planet 0, heading into it.
+    fleets = [[9, 1, 24.0, 46.0, _ANGLE_2_TO_0, 2, 15]]
     og2 = build_orbit_graph(_minimal_env(fleets=fleets), player=0)
     threats = og2.incoming_threats(planet_id=0)
     assert len(threats) == 1
     assert threats[0].mission == FleetMission.INCOMING_THREAT
     assert og2.realized_enemy_threat(0) > 0.0
-    assert og2.realized_enemy_threat(0) == pytest_approx_sum(threats)
+    # Node aggregates are float32; compare with tolerance.
+    assert abs(og2.realized_enemy_threat(0) - pytest_approx_sum(threats)) < 1e-5
 
 
 def test_friendly_pressure_on_all_nodes():
@@ -144,7 +152,7 @@ def test_friendly_pressure_on_all_nodes():
 
 
 def test_own_attack_fleet_raises_realized_friendly_on_target():
-    fleets = [[7, 0, 22.0, 50.0, 0.0, 0, 25]]
+    fleets = [[7, 0, 26.0, 47.0, _ANGLE_0_TO_1, 0, 25]]
     og = build_orbit_graph(_minimal_env(fleets=fleets), player=0)
     attacks = og.friendly_attacks_inbound()
     assert len(attacks) == 1
@@ -168,7 +176,7 @@ def test_enemy_reinforcement_lowers_attack_window():
 
 
 def test_edge_flux_aggregates_match_fleet_records():
-    fleets = [[7, 0, 22.0, 50.0, 0.0, 0, 25]]
+    fleets = [[7, 0, 26.0, 47.0, _ANGLE_0_TO_1, 0, 25]]
     og = build_orbit_graph(_minimal_env(fleets=fleets), player=0)
     for u, v, data in og.G.edges(data=True):
         fsum = sum(r.flux_weight for r in data["fleets"] if r.side == FleetSide.SELF)
