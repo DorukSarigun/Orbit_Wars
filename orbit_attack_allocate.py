@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 from navigation import compute_launch
 from orbit_attack_targets import (
@@ -477,6 +477,283 @@ def _plan_capture_wave(
     return None
 
 
+@dataclass(frozen=True)
+class _LpEdge:
+    src_id: int
+    tgt_id: int
+    eta: float
+    capacity: int
+    cost: float
+
+
+@dataclass(frozen=True)
+class _LpSolution:
+    targets: tuple[RankedCaptureTarget, ...]
+    demands: dict[int, int]
+    edges: tuple[_LpEdge, ...]
+    flow: tuple[float, ...]
+
+
+def _source_strip_cost(
+    og: OrbitGraph,
+    src_id: int,
+    remaining: dict[int, int],
+    *,
+    source_strip_weight: float,
+) -> float:
+    """Penalty for stripping a source planet.
+
+    Sources with a small remaining launch budget relative to their garrison are
+    probably frontline / constrained.  Interior surplus bases have cheaper
+    budget, so the LP naturally prefers them when ETA is comparable.
+    """
+    if source_strip_weight <= 0.0:
+        return 0.0
+    src = og.planet_by_id.get(int(src_id))
+    if src is None:
+        return 0.0
+    garrison = max(1.0, float(src.ships))
+    budget = max(0.0, float(remaining.get(int(src_id), 0)))
+    constrained = 1.0 - min(1.0, budget / garrison)
+    return float(source_strip_weight) * constrained
+
+
+def _lp_edges_for_targets(
+    og: OrbitGraph,
+    targets: Sequence[RankedCaptureTarget],
+    remaining: dict[int, int],
+    *,
+    omega: float,
+    eta_horizon: float,
+    margin: float,
+    source_strip_weight: float,
+) -> tuple[list[_LpEdge], dict[int, int]]:
+    """Build source-target LP edges and demands for a fixed target prefix."""
+    edges: list[_LpEdge] = []
+    demands: dict[int, int] = {}
+    for target in targets:
+        tid = int(target.planet_id)
+        sources = _sources_by_eta(og, tid, remaining, omega)
+        sources = [s for s in sources if float(s.eta) <= float(eta_horizon)]
+        if not sources:
+            return [], {}
+        latest_eta = max(float(s.eta) for s in sources)
+        demand = _ships_needed_to_capture(og, tid, eta=latest_eta, margin=margin)
+        if demand <= 0:
+            return [], {}
+        demands[tid] = int(demand)
+        for row in sources:
+            sid = int(row.src_id)
+            cap = int(remaining.get(sid, 0))
+            if cap <= 0:
+                continue
+            # Graph reachability was already checked by _sources_by_eta; cost
+            # stays in ETA units plus a source-risk term.
+            cost = float(row.eta) + _source_strip_cost(
+                og, sid, remaining, source_strip_weight=source_strip_weight)
+            edges.append(_LpEdge(
+                src_id=sid,
+                tgt_id=tid,
+                eta=float(row.eta),
+                capacity=cap,
+                cost=float(cost),
+            ))
+    return edges, demands
+
+
+def _solve_lp_prefix(
+    edges: Sequence[_LpEdge],
+    demands: dict[int, int],
+    remaining: dict[int, int],
+) -> Optional[tuple[float, ...]]:
+    """Solve the continuous logistics LP for one fixed target prefix."""
+    if not edges or not demands:
+        return None
+    try:
+        from scipy.optimize import linprog
+    except Exception:
+        return None
+
+    n = len(edges)
+    c = [float(e.cost) for e in edges]
+    a_ub: list[list[float]] = []
+    b_ub: list[float] = []
+
+    source_ids = sorted({int(e.src_id) for e in edges})
+    for sid in source_ids:
+        row = [0.0] * n
+        for i, e in enumerate(edges):
+            if int(e.src_id) == sid:
+                row[i] = 1.0
+        a_ub.append(row)
+        b_ub.append(float(remaining.get(int(sid), 0)))
+
+    for tid, demand in demands.items():
+        row = [0.0] * n
+        for i, e in enumerate(edges):
+            if int(e.tgt_id) == int(tid):
+                row[i] = -1.0
+        a_ub.append(row)
+        b_ub.append(-float(demand))
+
+    bounds = [(0.0, float(e.capacity)) for e in edges]
+    res = linprog(
+        c=c,
+        A_ub=a_ub,
+        b_ub=b_ub,
+        bounds=bounds,
+        method="highs",
+    )
+    if not getattr(res, "success", False):
+        return None
+    return tuple(float(x) for x in res.x)
+
+
+def _flow_to_wave(
+    og: OrbitGraph,
+    solution: _LpSolution,
+    remaining: dict[int, int],
+    *,
+    omega: float,
+    eta_horizon: float,
+    max_launches: int,
+    min_send: int = 1,
+) -> Optional[list[list]]:
+    """Convert continuous LP flow to integer env launch actions.
+
+    Floors flows first, then greedily fills any per-target rounding deficits on
+    the cheapest edges while respecting source budgets.  The returned wave is
+    all-or-nothing for every target in ``solution.targets``.
+    """
+    if max_launches <= 0:
+        return None
+    edges = list(solution.edges)
+    flow = list(solution.flow)
+    used_by_source: dict[int, int] = {}
+    sent_by_target: dict[int, int] = {int(t): 0 for t in solution.demands}
+    ships_by_edge = [0 for _ in edges]
+
+    # Initial floor pass.
+    for i, (edge, val) in enumerate(zip(edges, flow)):
+        ships = int(math.floor(max(0.0, float(val))))
+        if ships < int(min_send):
+            continue
+        sid = int(edge.src_id)
+        tid = int(edge.tgt_id)
+        room = int(remaining.get(sid, 0)) - int(used_by_source.get(sid, 0))
+        ships = min(ships, max(0, room))
+        if ships <= 0:
+            continue
+        ships_by_edge[i] = ships
+        used_by_source[sid] = int(used_by_source.get(sid, 0)) + ships
+        sent_by_target[tid] = int(sent_by_target.get(tid, 0)) + ships
+
+    # Fill rounding deficits by cheapest available edges for each target.
+    for tid, demand in solution.demands.items():
+        deficit = int(demand) - int(sent_by_target.get(int(tid), 0))
+        if deficit <= 0:
+            continue
+        candidates = sorted(
+            [
+                (edge.cost, i, edge)
+                for i, edge in enumerate(edges)
+                if int(edge.tgt_id) == int(tid)
+            ],
+            key=lambda x: (x[0], x[2].eta, x[2].src_id),
+        )
+        for _cost, i, edge in candidates:
+            if deficit <= 0:
+                break
+            sid = int(edge.src_id)
+            room = int(remaining.get(sid, 0)) - int(used_by_source.get(sid, 0))
+            if room <= 0:
+                continue
+            add = min(room, deficit)
+            ships_by_edge[i] += int(add)
+            used_by_source[sid] = int(used_by_source.get(sid, 0)) + int(add)
+            sent_by_target[int(tid)] = int(sent_by_target.get(int(tid), 0)) + int(add)
+            deficit -= int(add)
+        if deficit > 0:
+            return None
+
+    # Final all-or-nothing validation before building actions.
+    for tid, demand in solution.demands.items():
+        if int(sent_by_target.get(int(tid), 0)) < int(demand):
+            return None
+
+    nonzero = [(i, ships) for i, ships in enumerate(ships_by_edge) if int(ships) >= int(min_send)]
+    if not nonzero or len(nonzero) > int(max_launches):
+        return None
+    nonzero.sort(key=lambda row: (
+        next(t.sort_key for t in solution.targets if int(t.planet_id) == int(edges[row[0]].tgt_id)),
+        -edges[row[0]].cost,
+    ), reverse=True)
+
+    actions: list[list] = []
+    for i, ships in nonzero:
+        edge = edges[i]
+        src = og.planet_by_id.get(int(edge.src_id))
+        tgt = og.planet_by_id.get(int(edge.tgt_id))
+        if src is None or tgt is None:
+            return None
+        launch = compute_launch(src, tgt, int(ships), og.planets, omega)
+        if launch is None or float(launch["eta"]) > float(eta_horizon):
+            return None
+        actions.append([int(edge.src_id), float(launch["angle"]), int(launch["ships"])])
+    return actions or None
+
+
+def _solve_lp_largest_prefix(
+    og: OrbitGraph,
+    targets: Sequence[RankedCaptureTarget],
+    remaining: dict[int, int],
+    *,
+    omega: float,
+    eta_horizon: float,
+    margin: float,
+    max_launches: int,
+    top_k_targets: int,
+    source_strip_weight: float,
+) -> Optional[list[list]]:
+    """Find the largest ranked target prefix with a valid LP allocation."""
+    if max_launches <= 0:
+        return None
+    filtered = [
+        t for t in targets
+        if not _inflight_already_captures(og, int(t.planet_id))
+    ][: max(1, int(top_k_targets))]
+    if not filtered:
+        return None
+
+    for k in range(len(filtered), 0, -1):
+        prefix = tuple(filtered[:k])
+        edges, demands = _lp_edges_for_targets(
+            og,
+            prefix,
+            remaining,
+            omega=omega,
+            eta_horizon=eta_horizon,
+            margin=margin,
+            source_strip_weight=source_strip_weight,
+        )
+        if not edges or not demands:
+            continue
+        flow = _solve_lp_prefix(edges, demands, remaining)
+        if flow is None:
+            continue
+        actions = _flow_to_wave(
+            og,
+            _LpSolution(targets=prefix, demands=demands, edges=tuple(edges), flow=flow),
+            remaining,
+            omega=omega,
+            eta_horizon=eta_horizon,
+            max_launches=max_launches,
+        )
+        if actions:
+            return actions
+    return None
+
+
 def _partial_enemy_wave(
     og: OrbitGraph,
     tgt_id: int,
@@ -607,9 +884,95 @@ def allocate_greedy_captures(
     return actions
 
 
+def allocate_lp_captures(
+    og: OrbitGraph,
+    plan: AttackTargetPlan,
+    remaining: dict[int, int],
+    used_sources: set[int],
+    *,
+    attack_cfg: AttackTargetConfig,
+    influence_weight: float = 1.0,
+    production_pressure_weight: float = 1.0,
+    denial_weight: float = 1.0,
+    weakness_weight: float = 1.0,
+    empire_support_weight: float = 1.0,
+    prioritize_enemy_weakspots: bool = True,
+    eta_horizon: float = 60.0,
+    max_launches: int = 8,
+    capture_margin: float = 0.0,
+    max_wave_launches: int = 4,
+    allow_partial_enemy_waves: bool = False,
+    priority_bonus: Optional[dict[int, float]] = None,
+    lp_top_k_targets: int = 4,
+    lp_source_strip_weight: float = 2.0,
+) -> list[list]:
+    """LP/simplex logistics allocation over a ranked target prefix.
+
+    The target *choice* remains strategic and all-or-nothing: we try the largest
+    prefix of the ranked target list (bounded by ``lp_top_k_targets``) whose
+    demands can be fully funded.  The LP only decides source-target ship flow
+    for that fixed prefix.  If SciPy is unavailable, the LP is infeasible, or
+    integer launch conversion fails, this falls back to
+    :func:`allocate_greedy_captures`.
+    """
+    if max_launches <= 0:
+        return []
+
+    omega = float(attack_cfg.angular_velocity)
+    targets = rank_capture_targets(
+        og,
+        plan,
+        attack_cfg=attack_cfg,
+        influence_weight=influence_weight,
+        production_pressure_weight=production_pressure_weight,
+        denial_weight=denial_weight,
+        weakness_weight=weakness_weight,
+        empire_support_weight=empire_support_weight,
+        prioritize_enemy_weakspots=prioritize_enemy_weakspots,
+        priority_bonus=priority_bonus,
+    )
+    actions = _solve_lp_largest_prefix(
+        og,
+        targets,
+        remaining,
+        omega=omega,
+        eta_horizon=eta_horizon,
+        margin=capture_margin,
+        max_launches=max_launches,
+        top_k_targets=lp_top_k_targets,
+        source_strip_weight=lp_source_strip_weight,
+    )
+    if actions:
+        for sid, _angle, ships in actions:
+            remaining[int(sid)] = int(remaining.get(int(sid), 0)) - int(ships)
+            used_sources.add(int(sid))
+        return actions
+
+    return allocate_greedy_captures(
+        og,
+        plan,
+        remaining,
+        used_sources,
+        attack_cfg=attack_cfg,
+        influence_weight=influence_weight,
+        production_pressure_weight=production_pressure_weight,
+        denial_weight=denial_weight,
+        weakness_weight=weakness_weight,
+        empire_support_weight=empire_support_weight,
+        prioritize_enemy_weakspots=prioritize_enemy_weakspots,
+        eta_horizon=eta_horizon,
+        max_launches=max_launches,
+        capture_margin=capture_margin,
+        max_wave_launches=max_wave_launches,
+        allow_partial_enemy_waves=allow_partial_enemy_waves,
+        priority_bonus=priority_bonus,
+    )
+
+
 __all__ = [
     "RankedCaptureTarget",
     "allocate_greedy_captures",
+    "allocate_lp_captures",
     "friendly_influence_on_target",
     "neutral_capture_priority",
     "rank_capture_targets",

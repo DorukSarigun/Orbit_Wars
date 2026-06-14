@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from orbit_attack_allocate import (
+    allocate_lp_captures,
     allocate_greedy_captures,
     friendly_influence_on_target,
     rank_capture_targets,
@@ -94,3 +95,26 @@ def test_greedy_can_use_multiple_sources_for_one_target():
     src_ids = {int(a[0]) for a in actions}
     assert src_ids == {0, 3}
     assert friendly_influence_on_target(og, 2) >= 0.0
+
+
+def test_lp_allocator_can_use_multiple_sources_for_one_target():
+    env = _env_two_sources_one_hard_neutral()
+    og = build_orbit_graph(env, player=0)
+    cfg = AttackTargetConfig(current_turn=10, max_turns=250)
+    plan = plan_attack_targets(og, cfg=cfg)
+    remaining = dict(plan.launch_budgets)
+    used: set[int] = set()
+    actions = allocate_lp_captures(
+        og,
+        plan,
+        remaining,
+        used,
+        attack_cfg=cfg,
+        max_launches=8,
+        lp_top_k_targets=2,
+    )
+    assert len(actions) >= 2
+    src_ids = {int(a[0]) for a in actions}
+    assert src_ids == {0, 3}
+    assert sum(int(a[2]) for a in actions) >= 21
+    assert used == {0, 3}

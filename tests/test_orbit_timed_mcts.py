@@ -42,7 +42,7 @@ def _early_vs_late_env():
     }
 
 
-def test_timed_mcts_action_order_values_early_production_income():
+def test_timed_mcts_action_order_values_game_end_production_potential():
     og = build_orbit_graph(_early_vs_late_env(), player=0)
     mcts = TimedCaptureMCTS(
         og,
@@ -60,7 +60,38 @@ def test_timed_mcts_action_order_values_early_production_income():
     )
     ranked = mcts._rank_actions(mcts._initial_state)
     assert 1 in ranked and 2 in ranked, ranked
-    assert ranked[0] == 1, ranked
+    # With game-end production potential, the farther prod-4 planet beats the
+    # closer prod-3 planet because both captures still have long hold time.
+    assert ranked[0] == 2, ranked
+
+
+def test_timed_mcts_capture_income_uses_game_end_not_search_horizon():
+    og = build_orbit_graph(_early_vs_late_env(), player=0)
+    cfg = TimedMCTSConfig(
+        simulations=0,
+        horizon_turns=6,
+        gamma=1.0,
+    )
+    early = TimedCaptureMCTS(
+        og,
+        cfg,
+        root_player=0,
+        current_turn=0,
+        max_turns=100,
+        rng=random.Random(0),
+    )
+    late = TimedCaptureMCTS(
+        og,
+        cfg,
+        root_player=0,
+        current_turn=90,
+        max_turns=100,
+        rng=random.Random(0),
+    )
+    # Planet 1 has production 3. Arrival is relative to now, so the same
+    # landing at +5 turns is worth 95 turns early, but only 5 turns late.
+    assert early._capture_income(1, 5) == 3 * 95
+    assert late._capture_income(1, 5) == 3 * 5
 
 
 def test_timed_mcts_prefers_gateway_when_horizon_can_use_it():

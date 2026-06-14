@@ -7,7 +7,8 @@ spirit but adds a real turn horizon:
 * owned planets produce ships as time advances;
 * capture actions consume source garrisons now and schedule an arrival event;
 * arrivals resolve after their ETA and can flip ownership;
-* terminal value maximises board metrics at ``horizon_turns``.
+* terminal value maximises board metrics at ``horizon_turns``;
+* capture income is valued from landing time until the actual game end.
 
 It is still intentionally *not* a full env rollout.  The action space is a
 macro "fund a capture wave to target T" action; exact launch headings and
@@ -33,7 +34,7 @@ class TimedMCTSConfig:
     simulations: int = 96
     """Number of MCTS iterations per search."""
     horizon_turns: int = 10
-    """Terminal board is scored this many turns after the current decision."""
+    """Search horizon, in turns after the current decision."""
     exploration_c: float = 1.4
     """UCT exploration constant."""
     top_k_actions: int = 6
@@ -55,7 +56,7 @@ class TimedMCTSConfig:
     rollout_randomness: float = 0.10
     """Probability of a random legal capture during rollout."""
     gamma: float = 0.97
-    """Per-turn discount for production income earned after a capture lands."""
+    """Per-turn discount for production income after a capture lands."""
     capture_income_weight: float = 1.0
     """Weight for discounted production income from successful captures."""
     ship_cost_weight: float = 0.05
@@ -130,11 +131,19 @@ class TimedCaptureMCTS:
         cfg: TimedMCTSConfig,
         *,
         root_player: int,
+        current_turn: int = 0,
+        max_turns: int = 500,
         rng: Optional[random.Random] = None,
     ):
         self.og = og
         self.cfg = cfg
         self.root_player = int(root_player)
+        self.current_turn = max(0, int(current_turn))
+        self.max_turns = max(self.current_turn, int(max_turns))
+        self.horizon_turns = max(
+            0,
+            min(int(self.cfg.horizon_turns), self.max_turns - self.current_turn),
+        )
         self.rng = rng or random.Random()
         self.candidates = _candidate_target_ids(og)
         self._non_comets = {
@@ -209,10 +218,16 @@ class TimedCaptureMCTS:
         )
 
     def _discounted_hold_value(self, arrival_turn: int) -> float:
-        """Discounted number of productive turns after a capture lands."""
-        horizon = int(self.cfg.horizon_turns)
-        arrival = max(0, min(int(arrival_turn), horizon))
-        hold = max(0, horizon - arrival)
+        """Discounted productive turns from landing until the game ends.
+
+        ``arrival_turn`` is relative to this planning call.  The short MCTS
+        ``horizon_turns`` still controls how far the abstract board is
+        simulated; it no longer truncates a successful capture's economic
+        value.
+        """
+        arrival = max(0, int(arrival_turn))
+        absolute_arrival = self.current_turn + arrival
+        hold = max(0, self.max_turns - absolute_arrival)
         if hold <= 0:
             return 0.0
         gamma = float(self.cfg.gamma)
@@ -276,7 +291,7 @@ class TimedCaptureMCTS:
 
     def _advance_to_horizon(self, state: _TimedState) -> _TimedState:
         out = state
-        while int(out.turn) < int(self.cfg.horizon_turns):
+        while int(out.turn) < int(self.horizon_turns):
             out = self._advance_one_turn(out)
         return out
 
@@ -299,7 +314,7 @@ class TimedCaptureMCTS:
         return max(1, int(math.ceil(need)))
 
     def _plan_capture(self, state: _TimedState, player: int, target: int) -> Optional[_MacroAction]:
-        if int(state.turn) >= int(self.cfg.horizon_turns):
+        if int(state.turn) >= int(self.horizon_turns):
             return None
         owners = state.owner_map()
         ships = state.ship_map()
@@ -344,7 +359,7 @@ class TimedCaptureMCTS:
             return None
 
         arrival_turn = int(state.turn) + max(1, int(math.ceil(float(eta_max))))
-        if arrival_turn > int(self.cfg.horizon_turns):
+        if arrival_turn > int(self.horizon_turns):
             return None
 
         remaining = int(need)
@@ -367,7 +382,7 @@ class TimedCaptureMCTS:
             float(need) / max(1e-6, float(self.cfg.ship_cost_norm))
         )
         eta_penalty = float(self.cfg.eta_cost_weight) * (
-            float(eta_max) / max(1.0, float(self.cfg.horizon_turns))
+            float(eta_max) / max(1.0, float(self.horizon_turns))
         )
         heuristic = (
             float(self.cfg.capture_income_weight) * income
@@ -470,7 +485,7 @@ class TimedCaptureMCTS:
     def _rollout(self, state: _TimedState) -> float:
         st = state
         guard = 0
-        while int(st.turn) < int(self.cfg.horizon_turns) and guard < 4 * max(1, len(self.players)) * max(1, int(self.cfg.horizon_turns)):
+        while int(st.turn) < int(self.horizon_turns) and guard < 4 * max(1, len(self.players)) * max(1, int(self.horizon_turns)):
             guard += 1
             legal = self._rank_actions(st)
             if legal:
@@ -481,7 +496,7 @@ class TimedCaptureMCTS:
                 st = self._apply_action(st, int(target))
             else:
                 st = self._pass(st)
-        if int(st.turn) < int(self.cfg.horizon_turns):
+        if int(st.turn) < int(self.horizon_turns):
             st = self._advance_to_horizon(st)
         return self._score(st)
 

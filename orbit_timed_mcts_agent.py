@@ -31,7 +31,7 @@ class OrbitTimedMCTSAgent(OrbitScriptedAgent):
         current_turn: int,
         max_turns: int,
     ) -> Optional[dict[int, float]]:
-        del plan, defense_states, omega, current_turn, max_turns
+        del plan, defense_states, omega
         if (
             int(self.timed_mcts_cfg.simulations) <= 0
             or float(self.timed_mcts_cfg.bonus_weight) == 0.0
@@ -41,6 +41,8 @@ class OrbitTimedMCTSAgent(OrbitScriptedAgent):
             og,
             self.timed_mcts_cfg,
             root_player=int(og.player),
+            current_turn=int(current_turn),
+            max_turns=int(max_turns),
         )
         bonus = mcts.search()
         return bonus or None

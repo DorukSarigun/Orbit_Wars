@@ -63,6 +63,15 @@ def test_act_attacks_best_neutral():
     assert isinstance(angle, float)
 
 
+def test_act_supports_lp_attack_allocator():
+    env = _env_vertical()
+    cfg = OrbitScriptedConfig(attack_allocator="lp", lp_top_k_targets=2)
+    agent = OrbitScriptedAgent(cfg=cfg)
+    actions = agent.act(env, player=0, current_turn=10, max_turns=250)
+    assert actions
+    assert all(len(a) == 3 for a in actions)
+
+
 def test_support_need_rises_with_enemy_influence():
     og = build_orbit_graph(_env_support(), player=0)
     states = {s.planet_id: s for s in compute_owned_defense(og)}
@@ -87,6 +96,23 @@ def test_act_sends_backline_support_when_frontline_threatened():
     assert actions
     reinforcements = [a for a in actions if int(a[0]) == 0 and int(a[2]) > 0]
     assert reinforcements, "expected backline planet 0 to reinforce frontline"
+
+
+def test_act_supports_lp_reinforcement_allocator():
+    env = _env_support()
+    cfg = OrbitScriptedConfig(
+        reinforcement_allocator="lp",
+        support_threat_threshold=5.0,
+        support_min_source_surplus=3.0,
+        max_launches=8,
+        include_neutrals=False,
+        include_enemies=False,
+    )
+    agent = OrbitScriptedAgent(cfg=cfg)
+    actions = agent.act(env, player=0, current_turn=5, max_turns=250)
+    assert actions
+    reinforcements = [a for a in actions if int(a[0]) == 0 and int(a[2]) > 0]
+    assert reinforcements, "expected LP reinforcement from backline planet 0"
 
 
 def _mk_env(planets, fleets=None):
@@ -130,6 +156,29 @@ def test_unsavable_planet_abandoned_and_evacuated():
     # No reinforcement from backline (would land after the planet falls).
     assert not any(int(a[0]) == 1 for a in actions), actions
     # Garrison evacuated off the doomed planet.
+    evac = [a for a in actions if int(a[0]) == 0]
+    assert evac and int(evac[0][2]) == 3, actions
+
+
+def test_lp_reinforcement_does_not_feed_unsavable_planet():
+    import math as _math
+    fleets = [[9, 2, 20.0, 45.0, _math.pi / 2, 2, 50]]
+    env = _mk_env(
+        [
+            [0, 0, 20.0, 50.0, 1.0, 3, 1],
+            [1, 0, 20.0, 95.0, 1.0, 40, 2],
+            [2, 1, 20.0, 5.0, 1.0, 30, 2],
+        ],
+        fleets=fleets,
+    )
+    cfg = OrbitScriptedConfig(
+        reinforcement_allocator="lp",
+        include_neutrals=False,
+        include_enemies=False,
+    )
+    agent = OrbitScriptedAgent(cfg=cfg)
+    actions = agent.act(env, player=0, current_turn=10, max_turns=250)
+    assert not any(int(a[0]) == 1 for a in actions), actions
     evac = [a for a in actions if int(a[0]) == 0]
     assert evac and int(evac[0][2]) == 3, actions
 

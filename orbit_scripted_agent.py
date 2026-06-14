@@ -34,10 +34,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from navigation import compute_launch
-from orbit_attack_allocate import allocate_greedy_captures
+from orbit_attack_allocate import allocate_greedy_captures, allocate_lp_captures
 from orbit_attack_targets import (
     attack_config_from_env,
     plan_attack_targets,
@@ -96,6 +96,12 @@ class OrbitScriptedConfig:
     """Cap on simultaneous launches funding a single capture wave."""
     allow_partial_enemy_waves: bool = False
     """Permit underfunded pressure waves on enemy planets (never neutrals)."""
+    attack_allocator: str = "greedy"
+    """Capture logistics solver: ``"greedy"`` or ``"lp"``."""
+    lp_top_k_targets: int = 4
+    """LP allocator tries the largest feasible prefix of this many targets."""
+    lp_source_strip_weight: float = 2.0
+    """LP cost penalty for stripping constrained/frontline sources."""
 
     # --- Phase 3: backline support ---
     support_reserve_slots: int = 2
@@ -113,6 +119,12 @@ class OrbitScriptedConfig:
     """When surplus is thin but influence is high, cover this fraction of it."""
     max_support_launches_per_target: int = 2
     """Per-receiver cap on simultaneous support launches."""
+    reinforcement_allocator: str = "greedy"
+    """Reinforcement logistics solver: ``"greedy"`` or ``"lp"``."""
+    lp_support_top_k_targets: int = 4
+    """LP reinforcement considers this many urgent rescue/support targets."""
+    lp_reinforcement_source_strip_weight: float = 2.0
+    """LP cost penalty for stripping constrained reinforcement sources."""
 
     # --- Phase 4: consolidation ---
     consolidation_min_surplus: float = 10.0
@@ -180,6 +192,23 @@ class _ReinforcementPick:
     ships: int
     eta: float
     score: float
+
+
+@dataclass(frozen=True)
+class _ReinforcementDemand:
+    state: PlanetDefenseState
+    need: int
+    eta_limit: float
+
+
+@dataclass(frozen=True)
+class _ReinforcementEdge:
+    src_id: int
+    tgt_id: int
+    eta: float
+    capacity: int
+    score: float
+    cost: float
 
 
 def _plan_reinforcement_wave(
@@ -262,6 +291,281 @@ def _plan_reinforcement_wave(
     if all_or_nothing and committed < int(need):
         return []
     return picks
+
+
+def _reinforcement_source_score(
+    state: PlanetDefenseState,
+    cfg: OrbitScriptedConfig,
+    *,
+    relaxed_source: bool,
+) -> float:
+    if relaxed_source:
+        return float(state.defense_surplus) if float(state.defense_surplus) > 0.0 else -math.inf
+    return _backline_score(state, cfg)
+
+
+def _reinforcement_strip_cost(
+    state: PlanetDefenseState,
+    remaining: dict[int, int],
+    cfg: OrbitScriptedConfig,
+) -> float:
+    sid = int(state.planet_id)
+    garrison = max(1.0, float(state.garrison))
+    budget = max(0.0, float(remaining.get(sid, 0)))
+    constrained = 1.0 - min(1.0, budget / garrison)
+    return float(cfg.lp_reinforcement_source_strip_weight) * constrained
+
+
+def _build_reinforcement_edges(
+    og: OrbitGraph,
+    demands: Sequence[_ReinforcementDemand],
+    defense_states: list[PlanetDefenseState],
+    remaining: dict[int, int],
+    *,
+    cfg: OrbitScriptedConfig,
+    omega: float,
+    relaxed_source: bool,
+) -> list[_ReinforcementEdge]:
+    by_id = {int(s.planet_id): s for s in defense_states}
+    edges: list[_ReinforcementEdge] = []
+    for demand in demands:
+        tid = int(demand.state.planet_id)
+        tgt = og.planet_by_id.get(tid)
+        if tgt is None:
+            return []
+        for state in defense_states:
+            sid = int(state.planet_id)
+            if sid == tid:
+                continue
+            budget = int(remaining.get(sid, 0))
+            if budget <= 0:
+                continue
+            score = _reinforcement_source_score(
+                state, cfg, relaxed_source=relaxed_source)
+            if not math.isfinite(score):
+                continue
+            if not og.G.has_edge(sid, tid):
+                continue
+            if not og.G.edges[sid, tid].get("reachable", False):
+                continue
+            src = og.planet_by_id.get(sid)
+            if src is None:
+                continue
+            # Probe with the maximum usable capacity so ETA is close to the
+            # fastest wave this source can provide.
+            cap = min(int(budget), int(max(0, math.floor(float(state.garrison)))))
+            if cap <= 0:
+                continue
+            launch = compute_launch(src, tgt, cap, og.planets, omega)
+            if launch is None:
+                continue
+            eta = float(launch["eta"])
+            if eta >= float(demand.eta_limit):
+                continue
+            cost = eta + _reinforcement_strip_cost(
+                by_id[sid], remaining, cfg)
+            edges.append(_ReinforcementEdge(
+                src_id=sid,
+                tgt_id=tid,
+                eta=eta,
+                capacity=cap,
+                score=float(score),
+                cost=float(cost),
+            ))
+    return edges
+
+
+def _solve_reinforcement_lp(
+    edges: Sequence[_ReinforcementEdge],
+    demands: Sequence[_ReinforcementDemand],
+    remaining: dict[int, int],
+) -> Optional[tuple[float, ...]]:
+    if not edges or not demands:
+        return None
+    try:
+        from scipy.optimize import linprog
+    except Exception:
+        return None
+
+    n = len(edges)
+    c = [float(e.cost) for e in edges]
+    a_ub: list[list[float]] = []
+    b_ub: list[float] = []
+
+    for sid in sorted({int(e.src_id) for e in edges}):
+        row = [0.0] * n
+        for i, edge in enumerate(edges):
+            if int(edge.src_id) == sid:
+                row[i] = 1.0
+        a_ub.append(row)
+        b_ub.append(float(remaining.get(sid, 0)))
+
+    for demand in demands:
+        tid = int(demand.state.planet_id)
+        row = [0.0] * n
+        for i, edge in enumerate(edges):
+            if int(edge.tgt_id) == tid:
+                row[i] = -1.0
+        a_ub.append(row)
+        b_ub.append(-float(demand.need))
+
+    res = linprog(
+        c=c,
+        A_ub=a_ub,
+        b_ub=b_ub,
+        bounds=[(0.0, float(e.capacity)) for e in edges],
+        method="highs",
+    )
+    if not getattr(res, "success", False):
+        return None
+    return tuple(float(x) for x in res.x)
+
+
+def _reinforcement_flow_to_picks(
+    og: OrbitGraph,
+    edges: Sequence[_ReinforcementEdge],
+    flow: Sequence[float],
+    demands: Sequence[_ReinforcementDemand],
+    remaining: dict[int, int],
+    *,
+    omega: float,
+    max_launches: int,
+    max_launches_per_target: Optional[int] = None,
+) -> list[_ReinforcementPick]:
+    if max_launches <= 0:
+        return []
+    demand_by_target = {int(d.state.planet_id): int(d.need) for d in demands}
+    limit_by_target = {int(d.state.planet_id): float(d.eta_limit) for d in demands}
+    used_by_source: dict[int, int] = {}
+    sent_by_target: dict[int, int] = {tid: 0 for tid in demand_by_target}
+    ships_by_edge = [0 for _ in edges]
+
+    for i, (edge, val) in enumerate(zip(edges, flow)):
+        ships = int(math.floor(max(0.0, float(val))))
+        if ships <= 0:
+            continue
+        sid = int(edge.src_id)
+        tid = int(edge.tgt_id)
+        room = int(remaining.get(sid, 0)) - int(used_by_source.get(sid, 0))
+        ships = min(ships, max(0, room))
+        if ships <= 0:
+            continue
+        ships_by_edge[i] = ships
+        used_by_source[sid] = int(used_by_source.get(sid, 0)) + ships
+        sent_by_target[tid] = int(sent_by_target.get(tid, 0)) + ships
+
+    for tid, need in demand_by_target.items():
+        deficit = int(need) - int(sent_by_target.get(tid, 0))
+        if deficit <= 0:
+            continue
+        candidates = sorted(
+            [
+                (edge.cost, edge.eta, i, edge)
+                for i, edge in enumerate(edges)
+                if int(edge.tgt_id) == tid
+            ],
+            key=lambda x: (x[0], x[1], x[3].src_id),
+        )
+        for _cost, _eta, i, edge in candidates:
+            if deficit <= 0:
+                break
+            sid = int(edge.src_id)
+            room = int(remaining.get(sid, 0)) - int(used_by_source.get(sid, 0))
+            if room <= 0:
+                continue
+            add = min(room, deficit)
+            ships_by_edge[i] += int(add)
+            used_by_source[sid] = int(used_by_source.get(sid, 0)) + int(add)
+            sent_by_target[tid] = int(sent_by_target.get(tid, 0)) + int(add)
+            deficit -= int(add)
+        if deficit > 0:
+            return []
+
+    if any(int(sent_by_target.get(tid, 0)) < int(need) for tid, need in demand_by_target.items()):
+        return []
+
+    nonzero = [(i, ships) for i, ships in enumerate(ships_by_edge) if int(ships) > 0]
+    if not nonzero or len(nonzero) > int(max_launches):
+        return []
+    nonzero.sort(key=lambda x: (edges[x[0]].cost, edges[x[0]].eta, edges[x[0]].src_id))
+    if max_launches_per_target is not None:
+        count_by_target: dict[int, int] = {}
+        for i, _ships in nonzero:
+            tid = int(edges[i].tgt_id)
+            count_by_target[tid] = int(count_by_target.get(tid, 0)) + 1
+            if count_by_target[tid] > int(max_launches_per_target):
+                return []
+
+    picks: list[_ReinforcementPick] = []
+    for i, ships in nonzero:
+        edge = edges[i]
+        src = og.planet_by_id.get(int(edge.src_id))
+        tgt = og.planet_by_id.get(int(edge.tgt_id))
+        if src is None or tgt is None:
+            return []
+        launch = compute_launch(src, tgt, int(ships), og.planets, omega)
+        if launch is None:
+            return []
+        eta = float(launch["eta"])
+        if eta >= float(limit_by_target[int(edge.tgt_id)]):
+            return []
+        picks.append(_ReinforcementPick(
+            src_id=int(edge.src_id),
+            tgt_id=int(edge.tgt_id),
+            angle=float(launch["angle"]),
+            ships=int(launch["ships"]),
+            eta=eta,
+            score=float(edge.score),
+        ))
+    return picks
+
+
+def _plan_lp_reinforcement_batch(
+    og: OrbitGraph,
+    demands: Sequence[_ReinforcementDemand],
+    defense_states: list[PlanetDefenseState],
+    remaining: dict[int, int],
+    *,
+    cfg: OrbitScriptedConfig,
+    omega: float,
+    relaxed_source: bool,
+    max_launches: int,
+    max_launches_per_target: Optional[int] = None,
+) -> list[_ReinforcementPick]:
+    """LP allocation for a ranked prefix of rescue/support demands."""
+    if max_launches <= 0 or not demands:
+        return []
+    prefix_cap = max(1, int(cfg.lp_support_top_k_targets))
+    candidates = list(demands)[:prefix_cap]
+    for k in range(len(candidates), 0, -1):
+        prefix = candidates[:k]
+        edges = _build_reinforcement_edges(
+            og,
+            prefix,
+            defense_states,
+            remaining,
+            cfg=cfg,
+            omega=omega,
+            relaxed_source=relaxed_source,
+        )
+        if not edges:
+            continue
+        flow = _solve_reinforcement_lp(edges, prefix, remaining)
+        if flow is None:
+            continue
+        picks = _reinforcement_flow_to_picks(
+            og,
+            edges,
+            flow,
+            prefix,
+            remaining,
+            omega=omega,
+            max_launches=max_launches,
+            max_launches_per_target=max_launches_per_target,
+        )
+        if picks:
+            return picks
+    return []
 
 
 def _apply_pick(pick: _ReinforcementPick, remaining: dict[int, int]) -> list:
@@ -465,7 +769,42 @@ class OrbitScriptedAgent:
             and int(s.planet_id) not in evacuated
         ]
         critical.sort(key=lambda s: s.defense_surplus)
+        lp_rescued: set[int] = set()
+        if str(cfg.reinforcement_allocator).lower() == "lp":
+            slots = int(cfg.max_launches) - len(actions)
+            rescue_demands = [
+                _ReinforcementDemand(
+                    state=s,
+                    need=max(1, int(math.ceil(-float(s.defense_surplus)))),
+                    eta_limit=(
+                        float(s.min_incoming_eta)
+                        if s.min_incoming_eta is not None
+                        else math.inf
+                    ),
+                )
+                for s in critical
+            ]
+            rescue_picks = _plan_lp_reinforcement_batch(
+                og,
+                rescue_demands,
+                defense_states,
+                remaining,
+                cfg=cfg,
+                omega=omega,
+                relaxed_source=True,
+                max_launches=min(
+                    slots,
+                    int(cfg.max_rescue_launches) * max(1, len(rescue_demands)),
+                ),
+                max_launches_per_target=int(cfg.max_rescue_launches),
+            )
+            for pick in rescue_picks:
+                actions.append(_apply_pick(pick, remaining))
+                lp_rescued.add(int(pick.tgt_id))
+
         for state in critical:
+            if int(state.planet_id) in lp_rescued:
+                continue
             slots = int(cfg.max_launches) - len(actions)
             if slots <= 0:
                 break
@@ -519,36 +858,81 @@ class OrbitScriptedAgent:
                 current_turn=int(current_turn),
                 max_turns=int(max_turns),
             )
-            actions.extend(
-                allocate_greedy_captures(
+            common_attack_kwargs = dict(
+                attack_cfg=attack_cfg,
+                influence_weight=float(cfg.influence_weight),
+                production_pressure_weight=float(cfg.production_pressure_weight),
+                denial_weight=float(cfg.denial_weight),
+                weakness_weight=float(cfg.enemy_weakness_weight),
+                empire_support_weight=float(cfg.enemy_empire_support_weight),
+                prioritize_enemy_weakspots=bool(cfg.prioritize_enemy_weakspots),
+                eta_horizon=float(cfg.eta_horizon),
+                max_launches=attack_slots,
+                capture_margin=float(cfg.capture_margin),
+                max_wave_launches=int(cfg.max_wave_launches),
+                allow_partial_enemy_waves=bool(cfg.allow_partial_enemy_waves),
+                priority_bonus=priority_bonus,
+            )
+            if str(cfg.attack_allocator).lower() == "lp":
+                actions.extend(allocate_lp_captures(
                     og,
                     plan,
                     remaining,
                     used_sources,
-                    attack_cfg=attack_cfg,
-                    influence_weight=float(cfg.influence_weight),
-                    production_pressure_weight=float(cfg.production_pressure_weight),
-                    denial_weight=float(cfg.denial_weight),
-                    weakness_weight=float(cfg.enemy_weakness_weight),
-                    empire_support_weight=float(cfg.enemy_empire_support_weight),
-                    prioritize_enemy_weakspots=bool(cfg.prioritize_enemy_weakspots),
-                    eta_horizon=float(cfg.eta_horizon),
-                    max_launches=attack_slots,
-                    capture_margin=float(cfg.capture_margin),
-                    max_wave_launches=int(cfg.max_wave_launches),
-                    allow_partial_enemy_waves=bool(cfg.allow_partial_enemy_waves),
-                    priority_bonus=priority_bonus,
-                )
-            )
+                    **common_attack_kwargs,
+                    lp_top_k_targets=int(cfg.lp_top_k_targets),
+                    lp_source_strip_weight=float(cfg.lp_source_strip_weight),
+                ))
+            else:
+                actions.extend(allocate_greedy_captures(
+                    og,
+                    plan,
+                    remaining,
+                    used_sources,
+                    **common_attack_kwargs,
+                ))
 
         # ------------------------------------------------------------------
         # Phase 3 — backline support toward high enemy-influence frontline.
         # ------------------------------------------------------------------
+        lp_supported: set[int] = set()
+        if str(cfg.reinforcement_allocator).lower() == "lp":
+            slots = int(cfg.max_launches) - len(actions)
+            support_demands = [
+                _ReinforcementDemand(
+                    state=s,
+                    need=support_need(s, cfg),
+                    eta_limit=(
+                        float(s.min_incoming_eta)
+                        if s.min_incoming_eta is not None
+                        else math.inf
+                    ),
+                )
+                for s in support_receivers
+                if int(s.planet_id) not in evacuated and support_need(s, cfg) > 0
+            ]
+            support_picks = _plan_lp_reinforcement_batch(
+                og,
+                support_demands,
+                defense_states,
+                remaining,
+                cfg=cfg,
+                omega=omega,
+                relaxed_source=False,
+                max_launches=slots,
+                max_launches_per_target=int(cfg.max_support_launches_per_target),
+            )
+            for pick in support_picks:
+                actions.append(_apply_pick(pick, remaining))
+                lp_supported.add(int(pick.tgt_id))
+
         for state in support_receivers:
             slots = int(cfg.max_launches) - len(actions)
             if slots <= 0:
                 break
             if int(state.planet_id) in evacuated:
+                continue
+            if int(state.planet_id) in lp_supported:
                 continue
             need = support_need(state, cfg)
             eta_limit = (
