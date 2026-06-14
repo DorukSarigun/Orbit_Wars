@@ -23,9 +23,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import logging
 import random
+import sys
+import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -42,6 +47,47 @@ from macro_selfplay import (
     play_abstract_game,
     random_board,
 )
+
+
+# --------------------------------------------------------------------------- #
+# Logging (always file + stdout, flushed each line).
+# --------------------------------------------------------------------------- #
+class _FlushStreamHandler(logging.StreamHandler):
+    """Stdout handler that flushes after every record (nohup / pipe safe)."""
+
+    def emit(self, record) -> None:
+        super().emit(record)
+        self.flush()
+
+
+def setup_training_logger(log_file: Path) -> logging.Logger:
+    """Configure the training logger: mirror every message to file and stdout."""
+    log_file = Path(log_file)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("macro_alphazero.train")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    sh = _FlushStreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    return logger
+
+
+def _default_log_file(checkpoint_dir: Optional[str]) -> Path:
+    if checkpoint_dir:
+        return Path(checkpoint_dir) / "train.log"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path("logs") / "macro_alphazero" / f"train_{stamp}.log"
 
 
 # --------------------------------------------------------------------------- #
@@ -253,11 +299,15 @@ def train(
     seed: int = 0,
     device: str = "cpu",
     checkpoint_dir: Optional[str] = None,
-    verbose: bool = True,
+    log_file: Optional[str] = None,
+    log_every: int = 8,
 ) -> MacroAlphaZeroNet:
     dev = torch.device(device)
     torch.manual_seed(seed)
     rng = random.Random(seed)
+
+    log_path = Path(log_file) if log_file else _default_log_file(checkpoint_dir)
+    log = setup_training_logger(log_path)
 
     macro_cfg = MacroMCTSConfig(
         timed=TimedMCTSConfig(
@@ -283,21 +333,56 @@ def train(
     approx_samples_per_game = max(1, selfplay_cfg.max_decisions)
     buffer: deque[MacroSample] = deque(maxlen=buffer_games * approx_samples_per_game)
 
+    n_params = sum(p.numel() for p in net.parameters())
+    log.info("=" * 72)
+    log.info("macro AlphaZero training started")
+    log.info("log file: %s", log_path.resolve())
+    log.info(
+        "iter=%d games/iter=%d sims=%d horizon=%d n_planets=%d d_model=%d "
+        "buffer_games=%d device=%s params=%d",
+        iterations, games_per_iter, simulations, horizon_turns, n_planets,
+        d_model, buffer_games, device, n_params,
+    )
+    log.info("=" * 72)
+
     for it in range(int(iterations)):
+        t_iter = time.monotonic()
+        log.info("iter %03d | self-play starting (%d games)...", it, games_per_iter)
+        t_sp = time.monotonic()
+
+        def _sp_progress(done: int, total: int, n_samples: int) -> None:
+            log.info(
+                "iter %03d | self-play %d/%d games | samples=%d",
+                it, done, total, n_samples,
+            )
+
         samples = generate_selfplay(
             games_per_iter, macro_cfg, selfplay_cfg=selfplay_cfg,
             net=best, seed=seed + 1000 + it, n_planets=n_planets, device=dev,
+            log_fn=_sp_progress, log_every=int(log_every),
         )
         buffer.extend(samples)
+        log.info(
+            "iter %03d | self-play done in %.1fs | +%d samples buf=%d",
+            it, time.monotonic() - t_sp, len(samples), len(buffer),
+        )
 
+        t_tr = time.monotonic()
         last = TrainStats()
-        for _ in range(int(epochs_per_iter)):
+        for ep in range(int(epochs_per_iter)):
             last = train_epoch(
                 net, optimizer, list(buffer), device=dev,
                 batch_size=batch_size, value_coef=value_coef,
                 grad_clip=grad_clip, rng=rng,
             )
+        log.info(
+            "iter %03d | train %d epochs in %.1fs | loss=%.3f pol=%.3f val=%.1f",
+            it, epochs_per_iter, time.monotonic() - t_tr,
+            last.loss, last.policy_loss, last.value_loss,
+        )
 
+        t_ev = time.monotonic()
+        log.info("iter %03d | eval-gate starting (%d games)...", it, gate_games)
         winrate = eval_gate(
             net, best, macro_cfg, n_games=gate_games, seed=seed + 7000 + it,
             max_decisions=selfplay_cfg.max_decisions, n_planets=n_planets, device=dev,
@@ -306,23 +391,27 @@ def train(
         if promoted:
             best = copy.deepcopy(net).eval()
 
-        if verbose:
-            print(
-                f"iter {it:03d} | samples={len(samples)} buf={len(buffer)} "
-                f"loss={last.loss:.3f} (pol={last.policy_loss:.3f} "
-                f"val={last.value_loss:.1f}) winrate={winrate:.2f} "
-                f"{'PROMOTED' if promoted else 'kept'}"
-            )
+        log.info(
+            "iter %03d | eval-gate %.1fs winrate=%.2f %s | total %.1fs",
+            it, time.monotonic() - t_ev, winrate,
+            "PROMOTED" if promoted else "kept",
+            time.monotonic() - t_iter,
+        )
         if checkpoint_dir and promoted:
             import os
             os.makedirs(checkpoint_dir, exist_ok=True)
-            save_net(best, os.path.join(checkpoint_dir, "best.pt"),
-                     meta={"iter": it, "winrate": winrate})
+            ckpt = os.path.join(checkpoint_dir, "best.pt")
+            save_net(best, ckpt, meta={"iter": it, "winrate": winrate})
+            log.info("iter %03d | saved checkpoint %s", it, ckpt)
 
     if checkpoint_dir:
         import os
         os.makedirs(checkpoint_dir, exist_ok=True)
-        save_net(best, os.path.join(checkpoint_dir, "best.pt"))
+        final_ckpt = os.path.join(checkpoint_dir, "best.pt")
+        save_net(best, final_ckpt)
+        log.info("training finished | final checkpoint %s", final_ckpt)
+    else:
+        log.info("training finished")
     return best
 
 
@@ -347,6 +436,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_macro_alphazero")
+    p.add_argument(
+        "--log-file", type=str, default=None,
+        help="Training log path (default: <checkpoint-dir>/train.log)",
+    )
+    p.add_argument(
+        "--log-every", type=int, default=8,
+        help="Self-play progress log interval in games (0 = only start/end)",
+    )
     return p
 
 
@@ -372,6 +469,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         seed=args.seed,
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
+        log_file=args.log_file,
+        log_every=args.log_every,
     )
 
 

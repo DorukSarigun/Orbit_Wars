@@ -130,7 +130,7 @@ def test_train_loop_smoke():
     net = train(
         iterations=1, games_per_iter=2, simulations=12, horizon_turns=6,
         n_planets=6, batch_size=16, epochs_per_iter=1, gate_games=2,
-        buffer_games=4, seed=0, checkpoint_dir=None, verbose=False,
+        buffer_games=4, seed=0, checkpoint_dir=None,
     )
     assert sum(p.numel() for p in net.parameters()) > 0
 

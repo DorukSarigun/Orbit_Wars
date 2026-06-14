@@ -227,16 +227,23 @@ def generate_selfplay(
     seed: int = 0,
     n_planets: int = 7,
     device=None,
+    log_fn=None,
+    log_every: int = 8,
 ) -> list[MacroSample]:
     """Generate samples from ``n_games`` random-board self-play games."""
     sp = selfplay_cfg or SelfPlayConfig()
     rng = random.Random(seed)
     out: list[MacroSample] = []
-    for _ in range(int(n_games)):
+    total = int(n_games)
+    for gi in range(total):
         board = random_board(rng, n_planets=n_planets, num_players=sp.num_players)
         out.extend(play_abstract_game(
             board, macro_cfg, selfplay_cfg=sp, net=net, rng=rng, device=device,
         ))
+        if log_fn is not None and log_every > 0 and (
+            (gi + 1) % int(log_every) == 0 or (gi + 1) == total
+        ):
+            log_fn(gi + 1, total, len(out))
     return out
 
 
