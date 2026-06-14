@@ -44,6 +44,7 @@ try:  # package layout
     from .reworked_model import (
         ReworkedHierarchicalPolicy, ReworkedLaunchPolicy, ReworkedEdgePolicy,
         aux_owner_cross_entropy, REWORKED_NODE_FEATURE_DIM,
+        bernoulli_log_prob_per_node,
     )
     from .reworked_features import (
         discounted_production_potential, DEFAULT_GAMMA, DEFAULT_NORM,
@@ -70,6 +71,7 @@ except ImportError:  # pragma: no cover - flat layout / direct execution
     from reworked_model import (  # type: ignore
         ReworkedHierarchicalPolicy, ReworkedLaunchPolicy, ReworkedEdgePolicy,
         aux_owner_cross_entropy, REWORKED_NODE_FEATURE_DIM,
+        bernoulli_log_prob_per_node,
     )
     from reworked_features import (  # type: ignore
         discounted_production_potential, DEFAULT_GAMMA, DEFAULT_NORM,
@@ -487,6 +489,44 @@ def teacher_env_action_to_edge_targets(
         frac_target[h, t] = float(np.clip(sent[h, t] / g,
                                           commit_eps, 1.0 - commit_eps))
     return gate_target, frac_target
+
+
+def teacher_env_action_to_hier_targets(
+    state,
+    obs,
+    player: int,
+    env_action: list,
+    parsed_planets: list,
+    angular_velocity: float,
+    attack_mask: np.ndarray,
+    defend_mask: np.ndarray,
+    *,
+    p_max: int = P_MAX,
+    min_send: int = MIN_SEND,
+    max_speed: float = DEFAULT_MAX_SHIP_SPEED,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Re-express raw teacher env launches as hier per-target BC targets.
+
+    The hierarchical policy selects *which planets to attack* (``attack_sel``,
+    over enemy/neutral targets) and *which to reinforce* (``defend_sel``, over
+    own planets) as independent per-planet Bernoulli picks.  We recover the
+    teacher's destination planet for each launch (intercept-heading match, same
+    as the edge helper), then mark that slot as a positive in ``attack_target``
+    or ``defend_target`` depending on its candidacy.  Returns
+    ``(attack_target (p_max,), defend_target (p_max,))`` float 0/1 — consumed by
+    a supervised gate BCE in :func:`ppo_update`.
+    """
+    # A permissive directed-edge mask (owned, fundable sources -> any planet) is
+    # the candidate set for the heading recovery; the column that receives ships
+    # is the teacher's chosen target.
+    edge_mask = _edge_valid_mask(state, p_max, player, min_send=min_send)
+    gate_target, _ = teacher_env_action_to_edge_targets(
+        state, obs, player, env_action, parsed_planets, angular_velocity,
+        edge_mask, p_max=p_max, max_speed=max_speed)
+    tgt_hit = gate_target.sum(axis=0) > 0.0           # (p_max,) targets that got ships
+    attack_target = (tgt_hit & attack_mask.astype(bool)).astype(np.float32)
+    defend_target = (tgt_hit & defend_mask.astype(bool)).astype(np.float32)
+    return attack_target, defend_target
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1002,29 @@ class EdgeBCSample:
     frac_target: np.ndarray      # (P, P) float teacher garrison fraction
 
 
+@dataclass
+class HierBCSample:
+    """A teacher-forced demonstration in the hierarchical action space.
+
+    The teacher's executed launches are re-expressed as the per-planet attack /
+    defend selection the hier policy would have to make: ``attack_target`` is 1
+    on enemy/neutral planets the teacher sent ships to, ``defend_target`` is 1 on
+    own planets it reinforced.  Consumed by a supervised gate BCE
+    (``-log pi(sel_teacher | s)`` over the attack/defend candidate slots) that
+    pulls the selection heads toward the expert's targeting -- kept OUT of the
+    PPO/GAE path exactly like :class:`EdgeBCSample`.  The continuous knobs
+    (priority order, commit fraction, posture) are left to PPO.
+    """
+    node_feats: np.ndarray       # (P, node_dim)
+    edge_feats: np.ndarray       # (P, P, edge_dim)
+    global_feats: np.ndarray     # (G,)
+    planet_mask: np.ndarray      # (P,) bool
+    attack_mask: np.ndarray      # (P,) bool valid attack candidates
+    defend_mask: np.ndarray      # (P,) bool valid defend candidates
+    attack_target: np.ndarray    # (P,) float 0/1 teacher attack picks
+    defend_target: np.ndarray    # (P,) float 0/1 teacher defend picks
+
+
 class ReworkedBuffer:
     """Flat transition store with per-player GAE (+ a side store for BC demos)."""
 
@@ -1004,6 +1067,25 @@ class ReworkedBuffer:
             "edge_mask": st("edge_mask", torch.bool),
             "gate": st("gate_target", torch.float32),
             "frac": st("frac_target", torch.float32),
+        }
+        if device is not None:
+            batch = {k: v.to(device) for k, v in batch.items()}
+        return batch
+
+    def stack_bc_hier(self, device=None) -> dict:
+        """Stack hier-space BC demonstrations (:class:`HierBCSample`)."""
+        def st(attr, dtype):
+            return torch.as_tensor(
+                np.stack([getattr(s, attr) for s in self.bc_data]), dtype=dtype)
+        batch = {
+            "node_feats": st("node_feats", torch.float32),
+            "edge_feats": st("edge_feats", torch.float32),
+            "global_feats": st("global_feats", torch.float32),
+            "planet_mask": st("planet_mask", torch.bool),
+            "attack_mask": st("attack_mask", torch.bool),
+            "defend_mask": st("defend_mask", torch.bool),
+            "attack_target": st("attack_target", torch.float32),
+            "defend_target": st("defend_target", torch.float32),
         }
         if device is not None:
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -1407,6 +1489,13 @@ def collect_episode(
     last_owner: dict[int, int] = {
         int(pl.id): int(pl.owner) for pl in parse_planets(obs_of(0))}
 
+    # Enemy-kill credit is computed + applied to the buffer in real time (see the
+    # ``observe_enemy_kills`` call in the turn loop), but bypasses the offline
+    # attribution that builds ``RemasteredStats``.  Accumulate it here so it is
+    # surfaced in the episode summary / training log (and thus tunable via
+    # ``--w-enemy-kill``) instead of being silently invisible.
+    enemy_kill_acc = {"total": 0.0, "n": 0}
+
     def _finalize_remastered(final_turn: int) -> tuple:
         if not use_remastered or ep_log is None or campaign_ledger is None:
             return 0.0, 0, 0, None
@@ -1414,6 +1503,11 @@ def collect_episode(
         slot_credits, rstats = attribute_remastered_rewards(
             ep_log, campaign_ledger, remastered_cfg)
         apply_remastered_credits(buffer, slot_credits)
+        # Fold the real-time enemy-kill credit into the reported stats/total so
+        # ``cr`` in the log reflects every credit actually written to the buffer.
+        rstats.enemy_kill_reward = float(enemy_kill_acc["total"])
+        rstats.n_enemy_kill = int(enemy_kill_acc["n"])
+        rstats.total += float(enemy_kill_acc["total"])
         learner = min(policy_players) if policy_players else 0
         detail = summarize_remastered_episode(
             ep_log, campaign_ledger, rstats, remastered_cfg, player=learner)
@@ -1653,6 +1747,22 @@ def collect_episode(
                             gate_target=gate_t,
                             frac_target=frac_t,
                         ))
+                elif record_bc and policy_kind == "hier" and env_action:
+                    attack_np, defend_np = _target_masks(st0, P_MAX, p)
+                    atk_t, def_t = teacher_env_action_to_hier_targets(
+                        st0, obs, p, env_action, parsed, av,
+                        attack_np, defend_np, p_max=P_MAX, min_send=min_send)
+                    if atk_t.any() or def_t.any():
+                        buffer.add_bc(HierBCSample(
+                            node_feats=nf_pol[0].cpu().numpy(),
+                            edge_feats=ef_pol[0].cpu().numpy(),
+                            global_feats=batch["global_feats"][0].cpu().numpy(),
+                            planet_mask=batch["planet_mask"][0].cpu().numpy(),
+                            attack_mask=attack_np,
+                            defend_mask=defend_np,
+                            attack_target=atk_t,
+                            defend_target=def_t,
+                        ))
                 continue
 
             if policy_kind == "edge":
@@ -1869,10 +1979,13 @@ def collect_episode(
         if use_remastered and prev_obs_credit is not None and campaign_ledger is not None:
             av_kill = float(obs_of(0).get("angular_velocity", 0) or 0.0)
             for p in policy_players:
-                kill_credits, _ = observe_enemy_kills(
+                kill_credits, kill_total = observe_enemy_kills(
                     campaign_ledger, ep_log, prev_obs_credit, obs_of(0),
                     turn=t, player=p, omega=av_kill, cfg=remastered_cfg)
                 apply_remastered_credits(buffer, kill_credits)
+                if abs(kill_total) > 1e-12:
+                    enemy_kill_acc["total"] += float(kill_total)
+                    enemy_kill_acc["n"] += len(kill_credits)
 
         # Match the env fleets just created (id >= nfid_before) to this turn's
         # launch records by (owner, source, ships); compute_launch preserves the
@@ -2048,6 +2161,7 @@ def ppo_update(
     N = data["node_feats"].shape[0]
     is_launch = buffer.is_launch
     is_edge = buffer.is_edge
+    is_hier = bool(buffer.data) and not is_launch and not is_edge
     # Hier + remastered: selection heads train per-target (like edge), the
     # PL / commit / posture heads keep the turn-level GAE backbone.
     hier_tgt = buffer.has_hier_target_credit
@@ -2285,6 +2399,46 @@ def ppo_update(
                     action={"commit": bc["commit"][mb], "split_w": bc["split_w"][mb]},
                 )
                 bc_loss = -ev["log_prob"].mean()
+                loss = cfg.bc_coef * bc_loss
+                if not torch.isfinite(loss):
+                    continue
+                optimizer.zero_grad()
+                loss.backward()
+                if not torch.isfinite(
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                ):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                optimizer.step()
+                bc_loss_acc += float(bc_loss.detach())
+                bc_batches += 1
+        stats.bc_loss = bc_loss_acc / max(1, bc_batches)
+        stats.bc_samples = bc_n
+    if is_hier and cfg.bc_coef > 0.0 and bc_n > 0:
+        # Hier-space BC: pull the attack/defend selection heads toward the
+        # teacher's targeting via a per-target Bernoulli NLL (gate BCE) over the
+        # attack/defend candidate slots.  Only the selection logits are
+        # supervised; priority/commit/posture stay on the PPO path.
+        bc = buffer.stack_bc_hier(device=device)
+        Nbc = bc["node_feats"].shape[0]
+        bc_loss_acc = 0.0
+        bc_batches = 0
+        for _ in range(cfg.epochs):
+            perm = torch.randperm(Nbc, device=device)
+            for start in range(0, Nbc, cfg.minibatch_size):
+                mb = perm[start:start + cfg.minibatch_size]
+                out = policy.forward(
+                    bc["node_feats"][mb], bc["edge_feats"][mb],
+                    bc["global_feats"][mb], bc["planet_mask"][mb],
+                    bc["attack_mask"][mb], bc["defend_mask"][mb],
+                )
+                a_logp = bernoulli_log_prob_per_node(
+                    out["attack_logits"], bc["attack_target"][mb], bc["attack_mask"][mb])
+                d_logp = bernoulli_log_prob_per_node(
+                    out["defend_logits"], bc["defend_target"][mb], bc["defend_mask"][mb])
+                valid = (bc["attack_mask"][mb] | bc["defend_mask"][mb]).to(a_logp.dtype)
+                denom = valid.sum().clamp_min(1.0)
+                bc_loss = -((a_logp + d_logp)).sum() / denom
                 loss = cfg.bc_coef * bc_loss
                 if not torch.isfinite(loss):
                     continue

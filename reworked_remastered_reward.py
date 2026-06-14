@@ -1110,6 +1110,8 @@ def summarize_remastered_episode(
             "capture_reward": float(stats.capture_reward),
             "fail_reward": float(stats.fail_reward),
             "defense_reward": float(stats.defense_reward),
+            "n_enemy_kill": int(stats.n_enemy_kill),
+            "enemy_kill_reward": float(stats.enemy_kill_reward),
             "n_source_strip": int(stats.n_source_strip),
             "source_strip_reward": float(stats.source_strip_reward),
         },

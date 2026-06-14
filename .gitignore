@@ -35,3 +35,11 @@ replays/
 replay*.html
 .codex
 .codex/
+
+# Build / submission bundles
+dist/
+
+# GA run state (keep best_genome.json if committed manually)
+ga_runs/**/state.json
+ga_runs/**/ga_log.jsonl
+ga_runs/**/*.log

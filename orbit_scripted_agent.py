@@ -386,6 +386,24 @@ class OrbitScriptedAgent:
     def __init__(self, cfg: OrbitScriptedConfig | None = None):
         self.cfg = cfg or OrbitScriptedConfig()
 
+    def _attack_priority_bonus(
+        self,
+        og: OrbitGraph,
+        plan: Any,
+        defense_states: list[PlanetDefenseState],
+        *,
+        omega: float,
+        current_turn: int,
+        max_turns: int,
+    ) -> Optional[dict[int, float]]:
+        """Per-target priority bonus for the attack phase.
+
+        The base greedy agent plans nothing ahead, so it returns ``None``
+        (identical ranking).  Subclasses (e.g. the lookahead agent) override
+        this to promote stepping-stone captures.
+        """
+        return None
+
     def act(
         self,
         env_obs: Any,
@@ -495,6 +513,12 @@ class OrbitScriptedAgent:
         reserve = min(int(cfg.support_reserve_slots), len(support_receivers))
         attack_slots = max(0, int(cfg.max_launches) - len(actions) - reserve)
         if attack_slots > 0:
+            priority_bonus = self._attack_priority_bonus(
+                og, plan, defense_states,
+                omega=omega,
+                current_turn=int(current_turn),
+                max_turns=int(max_turns),
+            )
             actions.extend(
                 allocate_greedy_captures(
                     og,
@@ -513,6 +537,7 @@ class OrbitScriptedAgent:
                     capture_margin=float(cfg.capture_margin),
                     max_wave_launches=int(cfg.max_wave_launches),
                     allow_partial_enemy_waves=bool(cfg.allow_partial_enemy_waves),
+                    priority_bonus=priority_bonus,
                 )
             )
 

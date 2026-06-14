@@ -115,19 +115,82 @@ def _policy_env_action(policy, env_obs, player, t, max_steps, device, determinis
 
 
 _orbit_agent = None
+_scripted_agent_cache: dict[tuple, object] = {}
 
 
-def _scripted_env_action(env_obs, player, t, max_steps, device, strategy):
+def _load_genome(path: str | Path) -> dict:
+    import json
+    data = json.loads(Path(path).read_text())
+    return data["genome"] if "genome" in data else data
+
+
+def _get_scripted_agent(
+    strategy: str,
+    *,
+    genome_path: Optional[str | Path] = None,
+    mcts_simulations: int = 24,
+):
+    """Cached orbit-family bot (optionally loaded from a GA ``best_genome.json``)."""
+    key = (strategy, str(genome_path) if genome_path else None, int(mcts_simulations))
+    if key in _scripted_agent_cache:
+        return _scripted_agent_cache[key]
+
+    cfg = None
+    if genome_path:
+        try:
+            from .orbit_ga import config_from_genome
+        except ImportError:
+            from orbit_ga import config_from_genome  # type: ignore
+        cfg, _look = config_from_genome(_load_genome(genome_path))
+
     if strategy == "orbit":
-        # Graph-based bot: consumes the raw env obs, emits env launches directly.
-        global _orbit_agent
-        if _orbit_agent is None:
-            try:
-                from .orbit_scripted_agent import OrbitScriptedAgent
-            except ImportError:  # pragma: no cover - flat layout
-                from orbit_scripted_agent import OrbitScriptedAgent  # type: ignore
-            _orbit_agent = OrbitScriptedAgent()
-        return _orbit_agent.act(env_obs, player, current_turn=t, max_turns=max_steps)
+        try:
+            from .orbit_scripted_agent import OrbitScriptedAgent
+        except ImportError:
+            from orbit_scripted_agent import OrbitScriptedAgent  # type: ignore
+        agent = OrbitScriptedAgent(cfg=cfg)
+    elif strategy == "mcts":
+        try:
+            from .orbit_mcts_agent import OrbitMCTSAgent
+            from .orbit_mcts import MCTSConfig
+        except ImportError:
+            from orbit_mcts_agent import OrbitMCTSAgent  # type: ignore
+            from orbit_mcts import MCTSConfig  # type: ignore
+        agent = OrbitMCTSAgent(
+            cfg=cfg,
+            mcts_cfg=MCTSConfig(simulations=int(mcts_simulations)),
+        )
+    elif strategy == "lookahead":
+        try:
+            from .orbit_lookahead_agent import OrbitLookaheadAgent
+            from .orbit_ga import config_from_genome
+        except ImportError:
+            from orbit_lookahead_agent import OrbitLookaheadAgent  # type: ignore
+            from orbit_ga import config_from_genome  # type: ignore
+        if genome_path:
+            _cfg, look = config_from_genome(_load_genome(genome_path))
+            agent = OrbitLookaheadAgent(cfg=_cfg, lookahead_cfg=look)
+        else:
+            agent = OrbitLookaheadAgent()
+    else:
+        raise ValueError(
+            f"strategy {strategy!r} needs action_row bot; use production via legacy path"
+        )
+
+    _scripted_agent_cache[key] = agent
+    return agent
+
+
+def _scripted_env_action(
+    env_obs, player, t, max_steps, device, strategy,
+    *, genome_path: Optional[str | Path] = None,
+    mcts_simulations: int = 24,
+):
+    if strategy in ("orbit", "mcts", "lookahead"):
+        agent = _get_scripted_agent(
+            strategy, genome_path=genome_path, mcts_simulations=mcts_simulations,
+        )
+        return agent.act(env_obs, player, current_turn=t, max_turns=max_steps)
     av = env_obs.get("angular_velocity", 0.0) or 0.0
     obs = build_observation(env_obs, player=player, angular_velocity=av,
                             p_max=P_MAX, f_max=F_MAX, turn=t, max_turns=max_steps)
@@ -135,6 +198,145 @@ def _scripted_env_action(env_obs, player, t, max_steps, device, strategy):
     row = scripted_action_row(strategy, batch["states"][0], player, p_max=P_MAX)
     ea, _ = action_to_env_launches(obs, player, row, parse_planets(env_obs), av)
     return ea
+
+
+def record_scripted_bot_match_html(
+    out_path: str | Path,
+    *,
+    p0_strategy: str = "mcts",
+    p1_strategy: str = "orbit",
+    genome_p0: Optional[str | Path] = None,
+    genome_p1: Optional[str | Path] = None,
+    mcts_simulations: int = 24,
+    num_agents: int = 2,
+    max_steps: int = 300,
+    seed: Optional[int] = None,
+    verbose: bool = True,
+) -> dict:
+    """P0 vs P1 orbit-family bots (optional GA genomes), HTML replay."""
+    from kaggle_environments import make
+    import random as _random
+
+    if int(num_agents) != 2:
+        raise ValueError("scripted bot match supports num_agents=2 only")
+    strategies = {0: p0_strategy, 1: p1_strategy}
+    genomes = {0: genome_p0, 1: genome_p1}
+
+    env = make("orbit_wars", debug=False)
+    if seed is not None:
+        env.configuration["randomSeed"] = int(seed)
+        _random.seed(int(seed))
+    env.reset(num_agents=2)
+    state = env.step([[], []])
+
+    t = 0
+    for t in range(max_steps):
+        env_actions = []
+        for p in range(2):
+            env_obs = state[p]["observation"]
+            env_actions.append(
+                _scripted_env_action(
+                    env_obs, p, t, max_steps, torch.device("cpu"),
+                    strategies[p],
+                    genome_path=genomes[p],
+                    mcts_simulations=mcts_simulations,
+                )
+            )
+        state = env.step(env_actions)
+        if env.done or any(getattr(state[p], "status", "ACTIVE") == "DONE" for p in range(2)):
+            break
+
+    html = env.render(mode="html")
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html)
+
+    rewards = [float(getattr(state[p], "reward", 0.0) or 0.0) for p in range(2)]
+    winner = int(max(range(len(rewards)), key=lambda i: rewards[i])) if rewards else -1
+    if rewards.count(max(rewards)) > 1:
+        winner = -1
+    summary = {
+        "length": t + 1,
+        "winner": winner,
+        "rewards": rewards,
+        "p0_strategy": p0_strategy,
+        "p1_strategy": p1_strategy,
+        "genome_p0": str(genome_p0) if genome_p0 else None,
+        "html_path": str(out_path),
+        "html_size_kb": round(len(html) / 1024, 1),
+    }
+    if verbose:
+        who = "P0" if winner == 0 else (f"P{winner}" if winner >= 0 else "DRAW")
+        gnote = f" +genome" if genome_p0 else ""
+        print(f"[replay] {who} wins @ step {t+1} "
+              f"({p0_strategy}{gnote} vs {p1_strategy}) -> {out_path} "
+              f"({summary['html_size_kb']} KB)")
+    return summary
+
+
+def record_scripted_mirror_html(
+    out_path: str | Path,
+    *,
+    num_agents: int = 2,
+    max_steps: int = 300,
+    scripted_strategy: str = "orbit",
+    seed: Optional[int] = None,
+    verbose: bool = True,
+) -> dict:
+    """Play one game where every seat uses the same scripted bot."""
+    from kaggle_environments import make
+    import random as _random
+
+    num_agents = int(num_agents)
+    if num_agents not in (2, 4):
+        raise ValueError("num_agents must be 2 or 4")
+
+    env = make("orbit_wars", debug=False)
+    if seed is not None:
+        env.configuration["randomSeed"] = int(seed)
+        _random.seed(int(seed))
+    env.reset(num_agents=num_agents)
+    state = env.step([[] for _ in range(num_agents)])
+
+    t = 0
+    for t in range(max_steps):
+        env_actions = []
+        for p in range(num_agents):
+            env_obs = state[p]["observation"]
+            env_actions.append(
+                _scripted_env_action(
+                    env_obs, p, t, max_steps, torch.device("cpu"), scripted_strategy,
+                )
+            )
+        state = env.step(env_actions)
+        if env.done or any(getattr(state[p], "status", "ACTIVE") == "DONE" for p in range(num_agents)):
+            break
+
+    html = env.render(mode="html")
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html)
+
+    rewards = [float(getattr(state[p], "reward", 0.0) or 0.0) for p in range(num_agents)]
+    winner = int(max(range(len(rewards)), key=lambda i: rewards[i])) if rewards else -1
+    if rewards.count(max(rewards)) > 1:
+        winner = -1
+    summary = {
+        "length": t + 1,
+        "winner": winner,
+        "rewards": rewards,
+        "num_agents": num_agents,
+        "opponent": "scripted_mirror",
+        "scripted_strategy": scripted_strategy,
+        "html_path": str(out_path),
+        "html_size_kb": round(len(html) / 1024, 1),
+    }
+    if verbose:
+        who = "P0" if winner == 0 else (f"P{winner}" if winner >= 0 else "DRAW")
+        print(f"[replay] {who} wins @ step {t+1} "
+              f"({scripted_strategy} mirror, {num_agents}p) -> {out_path} "
+              f"({summary['html_size_kb']} KB)")
+    return summary
 
 
 def record_game_html(
@@ -263,11 +465,21 @@ def record_game_html(
 
 def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(description="Watch a trained reworked policy (HTML replay)")
-    p.add_argument("--ckpt", required=True, help="Path to a reworked checkpoint .pt")
+    p.add_argument("--ckpt", default=None,
+                   help="Path to a reworked checkpoint .pt (not needed for scripted_mirror).")
     p.add_argument("--html", default="replay.html", help="Output HTML replay path")
-    p.add_argument("--opponent", choices=["self_play", "scripted", "policy", "frozen"],
+    p.add_argument("--opponent",
+                   choices=["self_play", "scripted", "scripted_mirror", "scripted_bot",
+                            "policy", "frozen"],
                    default="scripted",
-                   help="'policy'/'frozen' = P0 uses --ckpt, P1 uses --ckpt-p1 (e.g. v8 launch vs v7 hier).")
+                   help="'scripted_mirror' = same bot both seats. "
+                        "'scripted_bot' = P0 vs P1 orbit bots (--p0/--p1, optional --genome).")
+    p.add_argument("--p0", default="mcts", help="P0 bot for --opponent scripted_bot")
+    p.add_argument("--p1", default="orbit", help="P1 bot for --opponent scripted_bot")
+    p.add_argument("--genome", default=None,
+                   help="GA best_genome.json for P0 (--opponent scripted_bot)")
+    p.add_argument("--genome-p1", default=None, help="Optional genome for P1")
+    p.add_argument("--mcts-simulations", type=int, default=24)
     p.add_argument("--ckpt-p1", default=None,
                    help="P1 checkpoint (--opponent policy or frozen).")
     p.add_argument("--scripted-strategy", default="production")
@@ -282,6 +494,38 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = p.parse_args(argv)
 
     device = torch.device(args.device)
+    base = Path(args.html)
+
+    if args.opponent == "scripted_mirror":
+        for g in range(args.games):
+            out = base if args.games == 1 else base.with_name(f"{base.stem}_{g:03d}{base.suffix}")
+            record_scripted_mirror_html(
+                out,
+                num_agents=args.num_agents,
+                max_steps=args.max_steps,
+                scripted_strategy=args.scripted_strategy,
+                seed=(args.seed if args.seed is None else args.seed + g),
+            )
+        return
+
+    if args.opponent == "scripted_bot":
+        for g in range(args.games):
+            out = base if args.games == 1 else base.with_name(f"{base.stem}_{g:03d}{base.suffix}")
+            record_scripted_bot_match_html(
+                out,
+                p0_strategy=args.p0,
+                p1_strategy=args.p1,
+                genome_p0=args.genome,
+                genome_p1=args.genome_p1,
+                mcts_simulations=args.mcts_simulations,
+                max_steps=args.max_steps,
+                seed=(args.seed if args.seed is None else args.seed + g),
+            )
+        return
+
+    if not args.ckpt:
+        p.error("--ckpt is required unless --opponent scripted_mirror")
+
     policy, ckpt = load_checkpoint(args.ckpt, device=device)
     # Match the feature layout / policy family the checkpoint was trained with.
     include_value_rate = bool(ckpt.get("arch", {}).get("eta_value_feature", False))

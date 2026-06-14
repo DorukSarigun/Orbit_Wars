@@ -204,13 +204,33 @@ def path_collision(
         d = spawn_offset + speed * t
         return src.x + cos_a * d, src.y + sin_a * d
 
+    sx0, sy0 = fleet_pos(0.0)
+    ex, ey = fleet_pos(t_arrival)
+
+    # Static planets never move, so the whole turn-by-turn walk collapses to a
+    # single segment-vs-point test against the fleet's full straight path. This
+    # is mathematically identical to the per-interval checks below (the union of
+    # the sub-segments is the full segment) but ~``t_arrival``x cheaper. The
+    # source planet is handled in the moving branch to preserve its exact
+    # original (check-2-only) treatment.
+    moving = []
+    for p in other_planets:
+        if p.is_static and p.id != src.id:
+            if segment_min_dist_to_point(sx0, sy0, ex, ey, p.x, p.y) < (p.radius + extra_margin):
+                return p.id
+        else:
+            moving.append(p)
+
+    if not moving:
+        return None
+
     # Walk integer-ish turns; final partial turn handled by clamp.
     t = 0.0
-    fx, fy = fleet_pos(0.0)
+    fx, fy = sx0, sy0
     while t < t_arrival - 1e-9:
         t_next = min(t + sample_step, t_arrival)
         nx, ny = fleet_pos(t_next)
-        for p in other_planets:
+        for p in moving:
             threshold = p.radius + extra_margin
             # (1) Fleet movement check: planet at START of interval
             #     (= end of previous turn = before this turn's rotation).
@@ -441,12 +461,29 @@ def path_collision_from(
         d = spawn_offset + speed * t
         return src_x + cos_a * d, src_y + sin_a * d
 
+    sx0, sy0 = fleet_pos(0.0)
+    ex, ey = fleet_pos(t_arrival)
+
+    # Static planets don't move (position is time-invariant regardless of
+    # t_offset), so collapse their per-interval walk into one segment test.
+    # Identical to the loop below, ~``t_arrival``x cheaper.
+    moving = []
+    for p in other_planets:
+        if p.is_static and p.id != ignore_movement_planet_id:
+            if segment_min_dist_to_point(sx0, sy0, ex, ey, p.x, p.y) < (p.radius + extra_margin):
+                return p.id
+        else:
+            moving.append(p)
+
+    if not moving:
+        return None
+
     t = 0.0
-    fx, fy = fleet_pos(0.0)
+    fx, fy = sx0, sy0
     while t < t_arrival - 1e-9:
         t_next = min(t + sample_step, t_arrival)
         nx, ny = fleet_pos(t_next)
-        for p in other_planets:
+        for p in moving:
             threshold = p.radius + extra_margin
             # (1) Fleet movement check: planet at START of interval.
             px0, py0 = p.position_at(t_offset + t,

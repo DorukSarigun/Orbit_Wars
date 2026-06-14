@@ -441,6 +441,9 @@ def train(
             (s.episode_log or {}).get("n_planet_captures", 0) for s in ep_stats) / n_ep
         avg_planet_loss = sum(
             (s.episode_log or {}).get("n_planet_losses", 0) for s in ep_stats) / n_ep
+        avg_enemy_kill_r = sum(
+            ((s.episode_log or {}).get("reward_stats", {}) or {}).get("enemy_kill_reward", 0.0)
+            for s in ep_stats) / n_ep
         elapsed = time.time() - t0
 
         log = {
@@ -469,6 +472,7 @@ def train(
             "n_defense": round(avg_defense, 1),
             "n_planet_captures": round(avg_planet_cap, 1),
             "n_planet_losses": round(avg_planet_loss, 1),
+            "enemy_kill_reward": round(avg_enemy_kill_r, 4),
             "elapsed_sec": round(elapsed, 1),
         }
         with log_path.open("a") as fp:
@@ -482,7 +486,7 @@ def train(
               f"polL={log['policy_loss']:+.4f} valL={log['value_loss']:.4f} "
               f"H={log['entropy']:.3f} KL={log['approx_kl']:.4f} "
               + (f"cr={log['credit_total']:+.3f} cap={log['n_capture']:.1f} "
-                 f"def={log['n_defense']:.1f} "
+                 f"def={log['n_defense']:.1f} ek={log['enemy_kill_reward']:+.2f} "
                  if (reward_cfg.enable_battle_credit or remastered_cfg is not None) else "")
               + (f"bc={ppo_stats.bc_loss:.3f}({ppo_stats.bc_samples}) "
                  if ppo_stats.bc_samples else "")

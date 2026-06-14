@@ -171,9 +171,10 @@ class Planet:
           integer indices). Returns current position if no path available or
           if the predicted index exceeds the path length (comet will expire).
         """
-        if self.is_static:
-            return self.x, self.y
-
+        # Hot path: check the cheap instance-attr branches directly and skip
+        # the ``is_static`` property (recomputed millions of times during graph
+        # builds). Behaviour is identical: a body is static iff it is neither
+        # rotating nor a comet, which is exactly the fall-through return.
         if self.is_rotating:
             # r_sun is invariant for orbiting bodies; only theta changes.
             theta_future = self.theta + angular_velocity * steps_ahead

@@ -197,13 +197,19 @@ def rank_capture_targets(
     weakness_weight: float = 1.0,
     empire_support_weight: float = 1.0,
     prioritize_enemy_weakspots: bool = True,
+    priority_bonus: Optional[dict[int, float]] = None,
 ) -> list[RankedCaptureTarget]:
     """Merge neutral + enemy metrics into one greedy priority list.
 
     Single-source-infeasible targets are still included when the **sum** of
     reachable launch budgets can cover capture at the earliest ETA.
+
+    ``priority_bonus`` (default ``None``) optionally adds a per-planet score to
+    each target's ``priority`` — used by the lookahead agent to promote
+    stepping-stone captures.  ``None``/empty leaves ranking byte-identical.
     """
     omega = float(attack_cfg.angular_velocity)
+    bonus = priority_bonus or {}
     neutrals: list[RankedCaptureTarget] = []
     enemies: list[RankedCaptureTarget] = []
     seen: set[int] = set()
@@ -221,7 +227,7 @@ def rank_capture_targets(
                 og, m,
                 influence_weight=influence_weight,
                 production_pressure_weight=production_pressure_weight,
-            ),
+            ) + float(bonus.get(pid, 0.0)),
             friendly_influence=friendly_influence_on_target(og, pid),
             diffusion_potential=friendly_diffusion_potential_on_target(og, pid),
             weakness_score=0.0,
@@ -248,7 +254,7 @@ def rank_capture_targets(
                 og, m,
                 weakness_weight=weakness_weight,
                 empire_support_weight=empire_support_weight,
-            ),
+            ) + float(bonus.get(pid, 0.0)),
             friendly_influence=friendly_influence_on_target(og, pid),
             diffusion_potential=friendly_diffusion_potential_on_target(og, pid),
             weakness_score=float(spot.weakness_score) if spot is not None else 0.0,
@@ -298,7 +304,7 @@ def rank_capture_targets(
             planet_id=pid,
             is_enemy=is_enemy,
             production=int(p.production),
-            priority=priority,
+            priority=priority + float(bonus.get(pid, 0.0)),
             friendly_influence=friendly_influence_on_target(og, pid),
             diffusion_potential=friendly_diffusion_potential_on_target(og, pid),
             weakness_score=float(weak),
@@ -540,6 +546,7 @@ def allocate_greedy_captures(
     capture_margin: float = 0.0,
     max_wave_launches: int = 4,
     allow_partial_enemy_waves: bool = False,
+    priority_bonus: Optional[dict[int, float]] = None,
 ) -> list[list]:
     """All-or-nothing greedy captures across ranked targets.
 
@@ -562,6 +569,7 @@ def allocate_greedy_captures(
         weakness_weight=weakness_weight,
         empire_support_weight=empire_support_weight,
         prioritize_enemy_weakspots=prioritize_enemy_weakspots,
+        priority_bonus=priority_bonus,
     )
     actions: list[list] = []
 
