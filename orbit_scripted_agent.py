@@ -708,6 +708,24 @@ class OrbitScriptedAgent:
         """
         return None
 
+    def _defense_priority_bonus(
+        self,
+        og: OrbitGraph,
+        defense_states: list[PlanetDefenseState],
+        *,
+        omega: float,
+        current_turn: int,
+        max_turns: int,
+    ) -> Optional[dict[int, float]]:
+        """Per-owned-planet rescue priority for the defense phase.
+
+        ``None`` (base agent) keeps the scripted CRITICAL-only triage ordered by
+        defense surplus.  Macro/AlphaZero subclasses return a learned per-planet
+        priority so the search can reorder rescues and pull worth-holding
+        STRAINED worlds into the rescue set.
+        """
+        return None
+
     def act(
         self,
         env_obs: Any,
@@ -763,12 +781,28 @@ class OrbitScriptedAgent:
         # ------------------------------------------------------------------
         # Phase 1 — defense triage: save what is savable, abandon the rest.
         # ------------------------------------------------------------------
-        critical = [
-            s for s in defense_states
-            if s.status == DefenseStatus.CRITICAL
-            and int(s.planet_id) not in evacuated
-        ]
-        critical.sort(key=lambda s: s.defense_surplus)
+        defense_bonus = self._defense_priority_bonus(
+            og, defense_states,
+            omega=omega,
+            current_turn=int(current_turn),
+            max_turns=int(max_turns),
+        ) or {}
+
+        def _rescue_target(s: PlanetDefenseState) -> bool:
+            if int(s.planet_id) in evacuated:
+                return False
+            if s.status == DefenseStatus.CRITICAL:
+                return True
+            # Net-promoted: a STRAINED world the macro search wants to hold.
+            return (
+                s.status == DefenseStatus.STRAINED
+                and defense_bonus.get(int(s.planet_id), 0.0) > 0.0
+            )
+
+        critical = [s for s in defense_states if _rescue_target(s)]
+        # Rescue net-prioritised worlds first (bonus desc), then by surplus.  With
+        # an empty bonus this reduces to the original surplus ordering.
+        critical.sort(key=lambda s: (-defense_bonus.get(int(s.planet_id), 0.0), s.defense_surplus))
         lp_rescued: set[int] = set()
         if str(cfg.reinforcement_allocator).lower() == "lp":
             slots = int(cfg.max_launches) - len(actions)

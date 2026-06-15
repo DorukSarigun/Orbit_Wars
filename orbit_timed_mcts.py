@@ -59,6 +59,10 @@ class TimedMCTSConfig:
     """Per-turn discount for production income after a capture lands."""
     capture_income_weight: float = 1.0
     """Weight for discounted production income from successful captures."""
+    denial_income_weight: float = 0.5
+    """Extra reward when a capture is taken *from an enemy* (not a neutral): the
+    captured world stops producing for the opponent, so a cheap enemy kill is
+    worth more than an equivalent neutral grab.  0 restores neutral==enemy."""
     ship_cost_weight: float = 0.05
     """Penalty weight for ships spent by an abstract capture wave."""
     ship_cost_norm: float = 50.0
@@ -272,10 +276,15 @@ class TimedCaptureMCTS:
                 owners[e.target] = int(e.owner)
                 ships[e.target] = int(e.ships) - cur_ships
                 income = self._capture_income(int(e.target), turn)
+                denial = float(self.cfg.denial_income_weight) * income
                 if int(e.owner) == self.root_player:
-                    reward += float(self.cfg.capture_income_weight) * income
+                    # Root captures; bonus denial when taken from an enemy world.
+                    bonus = denial if cur_owner >= 0 else 0.0
+                    reward += float(self.cfg.capture_income_weight) * income + bonus
                 elif int(e.owner) >= 0:
-                    reward -= float(self.cfg.capture_income_weight) * income
+                    # Enemy captures; extra penalty when it strips a root world.
+                    penalty = denial if cur_owner == self.root_player else 0.0
+                    reward -= float(self.cfg.capture_income_weight) * income + penalty
             else:
                 ships[e.target] = cur_ships - int(e.ships)
         remaining.extend(e for e in state.pending if int(e.arrival_turn) > turn)

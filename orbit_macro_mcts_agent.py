@@ -110,6 +110,11 @@ MACRO_FEATURE_NAMES: tuple[str, ...] = (
     "heuristic_norm",
     "turn_frac",
     "root_owned_frac",
+    # Capture economics: let the prior head read "how cheap / how valuable" a
+    # capture is directly, instead of inferring it from squashed scalars.
+    "defender_ratio",      # defender ships / ships sent  (low => easy overwhelm)
+    "capture_efficiency",  # discounted income / ships sent (value per ship)
+    "enemy_denial_norm",   # enemy production removed, as a share of total prod
 )
 
 
@@ -124,6 +129,10 @@ class MacroPriorRequest:
     max_turns: int
     actions: tuple[MacroAction, ...]
     features_by_key: Mapping[tuple[str, int], Mapping[str, float]]
+    # Abstract state the priors are requested for.  Optional so legacy
+    # feature-only providers keep working; the GNN prior uses it to build the
+    # per-planet graph encoding and gather the target-planet node tokens.
+    state: Optional["_TimedState"] = None
 
 
 class MacroPriorProvider(Protocol):
@@ -179,6 +188,11 @@ class MacroMCTSConfig:
     bonus_weight: float = 1.0
     min_bonus: float = 1e-6
 
+    # Defense priority bonus: scales the macro search's Reinforce Q-improvement
+    # into a per-owned-planet rescue priority for the scripted defense phase
+    # (0 disables, leaving defense fully scripted).
+    defense_bonus_weight: float = 1.0
+
 
 @dataclass
 class _MacroNode:
@@ -231,9 +245,25 @@ class MacroSearchResult:
 
     def capture_bonus(self, *, weight: float, min_bonus: float) -> dict[int, float]:
         """Per-target capture priority bonus for the scripted attack allocator."""
+        return self._type_bonus(MacroActionType.CAPTURE, weight=weight, min_bonus=min_bonus)
+
+    def reinforce_bonus(self, *, weight: float, min_bonus: float) -> dict[int, float]:
+        """Per-owned-planet defense priority for the scripted reinforcement phase.
+
+        Mirror of :meth:`capture_bonus` over ``Reinforce`` actions: the search's
+        Q-improvement over the no-op baseline becomes a rescue priority keyed by
+        the *owned planet being defended*.  Lets a trained net steer which
+        threatened worlds the scripted defense phase saves first (and promote
+        STRAINED worlds it deems worth holding).
+        """
+        return self._type_bonus(MacroActionType.REINFORCE, weight=weight, min_bonus=min_bonus)
+
+    def _type_bonus(
+        self, action_type: "MacroActionType", *, weight: float, min_bonus: float,
+    ) -> dict[int, float]:
         out: dict[int, float] = {}
         for key, action in self.actions.items():
-            if action.type is not MacroActionType.CAPTURE:
+            if action.type is not action_type:
                 continue
             if self.visits.get(key, 0) <= 0:
                 continue
@@ -684,6 +714,24 @@ class MacroTimedMCTS(TimedCaptureMCTS):
         total_owned = sum(1 for o in owners.values() if int(o) == self.root_player)
         total_planets = max(1, len(owners))
         horizon = max(1.0, float(self.horizon_turns))
+
+        # --- Capture economics (only meaningful for capture actions) -------- #
+        is_capture = action.type is MacroActionType.CAPTURE
+        is_enemy_target = owner >= 0 and owner != int(state.player_to_move)
+        sent = float(action.ships)
+        defender = float(ships.get(int(action.target), 0))
+        defender_ratio = (defender / sent) if (is_capture and sent > 0.0) else 0.0
+        if is_capture and sent > 0.0:
+            income = float(self._capture_income(int(action.target), int(action.arrival_turn)))
+            capture_efficiency = income / sent
+        else:
+            capture_efficiency = 0.0
+        if is_capture and is_enemy_target:
+            total_prod = float(sum(self._prod.get(int(p), 0) for p in owners)) or 1.0
+            enemy_denial = float(self._prod.get(int(action.target), 0)) / total_prod
+        else:
+            enemy_denial = 0.0
+
         return {
             "bias": 1.0,
             "is_capture": 1.0 if action.type is MacroActionType.CAPTURE else 0.0,
@@ -701,6 +749,9 @@ class MacroTimedMCTS(TimedCaptureMCTS):
             "heuristic_norm": float(action.heuristic) / 1000.0,
             "turn_frac": float(self.current_turn + int(state.turn)) / max(1.0, float(self.max_turns)),
             "root_owned_frac": float(total_owned) / float(total_planets),
+            "defender_ratio": float(min(defender_ratio, 4.0)),
+            "capture_efficiency": float(min(capture_efficiency, 4.0)),
+            "enemy_denial_norm": float(enemy_denial),
         }
 
     def _prior_logits(
@@ -717,6 +768,7 @@ class MacroTimedMCTS(TimedCaptureMCTS):
             max_turns=int(self.max_turns),
             actions=tuple(actions),
             features_by_key=features,
+            state=state,
         )
         logits = dict(self.prior_provider(request))
         return {a.key(): float(logits.get(a.key(), 0.0)) for a in actions}
@@ -880,13 +932,19 @@ class MacroTimedMCTS(TimedCaptureMCTS):
 
 
 class OrbitMacroMCTSAgent(OrbitScriptedAgent):
-    """Scripted agent whose attack ranking is steered by macro MCTS.
+    """Scripted agent whose attack *and* defense ranking are steered by macro MCTS.
 
-    This is the safe Phase-2 integration from the plan: the scripted
-    evacuate/defend/attack/support phases stay intact and the macro search only
-    contributes a per-target capture priority bonus.  Reinforce decisions still
-    influence the search value (they change which captures look good), while the
-    scripted defense phase executes the actual rescues.
+    A single macro search per turn feeds two scripted phases:
+
+    * **Attack** -- :meth:`MacroSearchResult.capture_bonus` promotes the captures
+      the search values most (Phase 2 priority bonus).
+    * **Defense** -- :meth:`MacroSearchResult.reinforce_bonus` promotes the owned
+      worlds the search wants to hold, reordering rescue priority and letting the
+      net pull STRAINED worlds into the rescue set (Phase 1 priority bonus).
+
+    The scripted evacuate/defend/attack/support phases still execute the actual
+    launches; the search only contributes priorities.  The search is run once and
+    cached per ``act()`` call so both phases share it.
     """
 
     def __init__(
@@ -905,6 +963,42 @@ class OrbitMacroMCTSAgent(OrbitScriptedAgent):
         self.macro_cfg = macro_cfg or MacroMCTSConfig()
         self.prior_provider = prior_provider
         self.leaf_value_fn = leaf_value_fn
+        # Last search exposed for real-env self-play sample recording.
+        self.last_mcts: Optional[MacroTimedMCTS] = None
+        self.last_result: Optional[MacroSearchResult] = None
+        self._macro_cache: Optional[tuple[Any, MacroTimedMCTS, MacroSearchResult]] = None
+
+    def _build_macro_mcts(
+        self, og: OrbitGraph, *, current_turn: int, max_turns: int,
+    ) -> MacroTimedMCTS:
+        """Construct the per-turn macro search (overridden to attach a net)."""
+        return MacroTimedMCTS(
+            og,
+            self.macro_cfg,
+            root_player=int(og.player),
+            current_turn=int(current_turn),
+            max_turns=int(max_turns),
+            prior_provider=self.prior_provider,
+            leaf_value_fn=self.leaf_value_fn,
+        )
+
+    def _macro_search(
+        self, og: OrbitGraph, *, current_turn: int, max_turns: int,
+    ) -> Optional[MacroSearchResult]:
+        """Run (and cache) one macro search for this ``act()`` turn."""
+        if int(self.macro_cfg.timed.simulations) <= 0:
+            self.last_mcts = None
+            self.last_result = None
+            return None
+        cached = self._macro_cache
+        if cached is not None and cached[0] is og:
+            return cached[2]
+        mcts = self._build_macro_mcts(og, current_turn=current_turn, max_turns=max_turns)
+        result = mcts.run()
+        self._macro_cache = (og, mcts, result)
+        self.last_mcts = mcts
+        self.last_result = result
+        return result
 
     def _attack_priority_bonus(
         self,
@@ -917,19 +1011,35 @@ class OrbitMacroMCTSAgent(OrbitScriptedAgent):
         max_turns: int,
     ) -> Optional[dict[int, float]]:
         del plan, defense_states, omega
-        if int(self.macro_cfg.timed.simulations) <= 0 or float(self.macro_cfg.bonus_weight) == 0.0:
+        if float(self.macro_cfg.bonus_weight) == 0.0:
             return None
-        mcts = MacroTimedMCTS(
-            og,
-            self.macro_cfg,
-            root_player=int(og.player),
-            current_turn=int(current_turn),
-            max_turns=int(max_turns),
-            prior_provider=self.prior_provider,
-            leaf_value_fn=self.leaf_value_fn,
-        )
-        bonus = mcts.search()
-        return bonus or None
+        result = self._macro_search(og, current_turn=current_turn, max_turns=max_turns)
+        if result is None:
+            return None
+        return result.capture_bonus(
+            weight=float(self.macro_cfg.bonus_weight),
+            min_bonus=float(self.macro_cfg.min_bonus),
+        ) or None
+
+    def _defense_priority_bonus(
+        self,
+        og: OrbitGraph,
+        defense_states: list[PlanetDefenseState],
+        *,
+        omega: float,
+        current_turn: int,
+        max_turns: int,
+    ) -> Optional[dict[int, float]]:
+        del defense_states, omega
+        if float(self.macro_cfg.defense_bonus_weight) == 0.0:
+            return None
+        result = self._macro_search(og, current_turn=current_turn, max_turns=max_turns)
+        if result is None:
+            return None
+        return result.reinforce_bonus(
+            weight=float(self.macro_cfg.defense_bonus_weight),
+            min_bonus=float(self.macro_cfg.min_bonus),
+        ) or None
 
 
 __all__ = [
