@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import subprocess
 import sys
 from pathlib import Path
 
@@ -38,26 +37,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from kaggle_replays import download_episode_replay  # noqa: E402
+
 
 def _download_replay(episode_id: int, dest_dir: Path) -> Path:
     """Fetch replay JSON via ``kaggle competitions replay``."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable, "-m", "kaggle", "competitions", "replay",
-        str(int(episode_id)), "-p", str(dest_dir),
-    ]
     print(f"Downloading episode {episode_id} …")
-    subprocess.run(cmd, check=True)
-    # Kaggle writes <episode_id>.json (or similar) into dest_dir.
-    candidates = sorted(dest_dir.glob(f"*{episode_id}*"))
-    if not candidates:
-        candidates = sorted(dest_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        raise FileNotFoundError(
-            f"No replay JSON found in {dest_dir} after download. "
-            "Check ~/.kaggle/kaggle.json credentials."
-        )
-    path = candidates[0]
+    path = download_episode_replay(episode_id, dest_dir)
     print(f"Replay JSON: {path}")
     return path
 

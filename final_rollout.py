@@ -115,7 +115,65 @@ def _obs_to_tensors(obs: FinalObservation, device: torch.device) -> dict[str, to
     }
 
 
-def _action_to_launch(env_obs: Any, obs: FinalObservation, action, player: int, *, current_turn: int, max_turns: int) -> tuple[list[list], str]:
+def _planner_sources(
+    *,
+    planets,
+    source_id: int,
+    target,
+    player: int,
+    amount_frac: float,
+    omega: float,
+    top_m: int,
+    budget_floor: float,
+) -> tuple[list[SourceOption], str]:
+    """Build source candidates for target-local planning.
+
+    The policy-selected source is not discarded: it is forced into the candidate
+    set first when owned. Other donors are added by ETA/budget order so the
+    planner can solve multi-source captures.
+    """
+
+    scale = max(float(budget_floor), min(1.0, float(amount_frac)))
+    rows: list[tuple[int, float, int, object]] = []
+    for planet in planets:
+        if int(planet.owner) != int(player) or int(planet.ships) <= 0:
+            continue
+        launch = compute_launch(planet, target, 1, planets, omega)
+        if launch is None:
+            continue
+        selected_rank = 0 if int(planet.id) == int(source_id) else 1
+        rows.append((selected_rank, float(launch["eta"]), -int(planet.ships), planet))
+    if not rows:
+        return [], "micro_reject_no_reachable_donor"
+
+    rows.sort(key=lambda r: (r[0], r[1], r[2], int(r[3].id)))
+    selected = [r for r in rows if int(r[3].id) == int(source_id)]
+    others = [r for r in rows if int(r[3].id) != int(source_id)]
+    picked = (selected + others)[: max(1, int(top_m))]
+    out: list[SourceOption] = []
+    for selected_rank, _eta, _neg_ships, planet in picked:
+        raw_budget = int(round(float(planet.ships) * scale))
+        budget = max(1, min(int(planet.ships), raw_budget))
+        # A small preference keeps the policy-selected source meaningful without
+        # forcing impossible one-source captures.
+        strip_cost = -0.15 if int(selected_rank) == 0 else 0.0
+        out.append(SourceOption(source=planet, budget=budget, strip_cost=strip_cost))
+    return out, "ok"
+
+
+def _action_to_launch(
+    env_obs: Any,
+    obs: FinalObservation,
+    action,
+    player: int,
+    *,
+    current_turn: int,
+    max_turns: int,
+    planner_top_m_sources: int = 5,
+    planner_max_launches_per_target: int = 3,
+    planner_budget_floor: float = 0.35,
+    planner_hold_horizon: float = 24.0,
+) -> tuple[list[list], str]:
     source_slot = int(action.source_idx.item())
     target_slot = int(action.target_idx.item())
     if source_slot < 0 or target_slot < 0:
@@ -130,18 +188,11 @@ def _action_to_launch(env_obs: Any, obs: FinalObservation, action, player: int, 
     target = by_id.get(target_id)
     if source is None or target is None or int(source.owner) != int(player):
         return [], "invalid_owner"
-    ships = max(1, int(round(float(action.amount.item()) * float(source.ships))))
-    ships = min(int(source.ships), ships)
-    if ships <= 0:
-        return [], "invalid_amount"
     omega = (
         float(env_obs.get("angular_velocity", 0.0) or 0.0)
         if isinstance(env_obs, dict)
         else float(getattr(env_obs, "angular_velocity", 0.0) or 0.0)
     )
-    launch = compute_launch(source, target, ships, planets, omega)
-    if launch is None:
-        return [], "invalid_geometry"
 
     # Prefer the final micro-planner for non-owned targets.  The policy chooses
     # a target/source intent; the planner verifies capture-and-hold and may add
@@ -151,19 +202,31 @@ def _action_to_launch(env_obs: Any, obs: FinalObservation, action, player: int, 
     if int(target.owner) != int(player):
         try:
             og = build_orbit_graph(env_obs, player=int(player))
+            sources, source_reason = _planner_sources(
+                planets=planets,
+                source_id=int(source.id),
+                target=target,
+                player=int(player),
+                amount_frac=float(action.amount.item()),
+                omega=omega,
+                top_m=int(planner_top_m_sources),
+                budget_floor=float(planner_budget_floor),
+            )
+            if not sources:
+                return [], source_reason
             plan = plan_target_attack(
                 og=og,
                 target=target,
-                sources=[SourceOption(source=source, budget=int(source.ships))],
+                sources=sources,
                 player=int(player),
                 current_turn=int(current_turn),
                 max_turns=int(max_turns),
                 omega=omega,
                 cfg=MicroPlannerConfig(
-                    hold_horizon=24.0,
+                    hold_horizon=float(planner_hold_horizon),
                     beam_width=8,
-                    max_launches_per_target=1,
-                    top_m_sources=1,
+                    max_launches_per_target=int(planner_max_launches_per_target),
+                    top_m_sources=int(planner_top_m_sources),
                     min_send=1,
                     capture_margin=2,
                 ),
@@ -174,7 +237,40 @@ def _action_to_launch(env_obs: Any, obs: FinalObservation, action, player: int, 
         except Exception:
             return [], "micro_error_target"
 
+    ships = max(1, int(round(float(action.amount.item()) * float(source.ships))))
+    ships = min(int(source.ships), ships)
+    if ships <= 0:
+        return [], "invalid_amount"
+    launch = compute_launch(source, target, ships, planets, omega)
+    if launch is None:
+        return [], "invalid_geometry"
     return [[int(source.id), float(launch["angle"]), int(launch["ships"])]], "raw_launch"
+
+
+def _action_validity_reward(
+    reason: str,
+    obs: FinalObservation,
+    *,
+    invalid_penalty: float,
+    reject_penalty: float,
+    capture_bonus: float,
+    raw_launch_bonus: float,
+) -> float:
+    """Dense feedback for action validity, separate from game outcome reward."""
+
+    has_source = bool(obs.source_mask.any())
+    has_target = bool(obs.target_mask.any())
+    if not has_source or not has_target:
+        return 0.0
+    if reason.startswith("invalid"):
+        return -abs(float(invalid_penalty))
+    if reason.startswith("micro_reject") or reason.startswith("micro_error"):
+        return -abs(float(reject_penalty))
+    if reason == "micro_capture":
+        return abs(float(capture_bonus))
+    if reason == "raw_launch":
+        return abs(float(raw_launch_bonus))
+    return 0.0
 
 
 def collect_episode(
@@ -187,6 +283,16 @@ def collect_episode(
     num_agents: int = 2,
     shaping_weight: float = 0.05,
     terminal_weight: float = 1.0,
+    invalid_action_penalty: float = 0.02,
+    reject_action_penalty: float = 0.005,
+    capture_action_bonus: float = 0.002,
+    raw_launch_bonus: float = 0.0,
+    planner_top_m_sources: int = 5,
+    planner_max_launches_per_target: int = 3,
+    planner_budget_floor: float = 0.35,
+    planner_hold_horizon: float = 24.0,
+    truncate_terminal_weight: float = 1.0,
+    include_owned_targets: bool = False,
 ) -> dict[str, float]:
     from kaggle_environments import make
     import random as _random
@@ -203,6 +309,7 @@ def collect_episode(
         for p in range(num_agents)
     ]
     total_rewards = [0.0 for _ in range(num_agents)]
+    validity_rewards = [0.0 for _ in range(num_agents)]
     action_reasons: dict[str, int] = {}
 
     for t in range(int(max_steps)):
@@ -210,27 +317,52 @@ def collect_episode(
         env_actions: list[list] = []
         for p in range(num_agents):
             obs_raw = state[p]["observation"]
-            obs = build_final_observation(obs_raw, p)
+            obs = build_final_observation(
+                obs_raw, p, include_owned_targets=bool(include_owned_targets),
+            )
             tensors = _obs_to_tensors(obs, device)
             with torch.no_grad():
                 action = policy.act(**tensors)
             launch_action, reason = _action_to_launch(
-                obs_raw, obs, action, p, current_turn=t, max_turns=planner_max_turns)
+                obs_raw,
+                obs,
+                action,
+                p,
+                current_turn=t,
+                max_turns=planner_max_turns,
+                planner_top_m_sources=int(planner_top_m_sources),
+                planner_max_launches_per_target=int(planner_max_launches_per_target),
+                planner_budget_floor=float(planner_budget_floor),
+                planner_hold_horizon=float(planner_hold_horizon),
+            )
             action_reasons[reason] = action_reasons.get(reason, 0) + 1
+            validity_reward = _action_validity_reward(
+                reason,
+                obs,
+                invalid_penalty=float(invalid_action_penalty),
+                reject_penalty=float(reject_action_penalty),
+                capture_bonus=float(capture_action_bonus),
+                raw_launch_bonus=float(raw_launch_bonus),
+            )
+            validity_rewards[p] += float(validity_reward)
             env_actions.append(launch_action)
-            pending.append((p, obs, action))
+            pending.append((p, obs, action, validity_reward))
 
         state = env.step(env_actions)
         done = bool(env.done)
-        for p, obs, action in pending:
+        truncated = bool(not done and t == int(max_steps) - 1)
+        step_done = bool(done or truncated)
+        for p, obs, action, validity_reward in pending:
             new_margin = production_share_margin(state[p]["observation"], p, num_agents)
-            reward = float(shaping_weight) * (new_margin - prev_margin[p])
+            reward = float(validity_reward) + float(shaping_weight) * (new_margin - prev_margin[p])
             prev_margin[p] = new_margin
             if done:
                 env_reward = float(getattr(state[p], "reward", 0.0) or 0.0)
                 reward += float(terminal_weight) * env_reward
+            elif truncated:
+                reward += float(truncate_terminal_weight) * float(new_margin)
             total_rewards[p] += reward
-            buffer.add(obs, action, reward, done)
+            buffer.add(obs, action, reward, step_done)
         if done:
             break
 
@@ -239,6 +371,19 @@ def collect_episode(
         "reward_p0": float(total_rewards[0]),
         "reward_mean": float(sum(total_rewards) / max(1, len(total_rewards))),
         "reward_abs_mean": float(sum(abs(r) for r in total_rewards) / max(1, len(total_rewards))),
+        "validity_reward_mean": float(sum(validity_rewards) / max(1, len(validity_rewards))),
+        "validity_reward_abs_mean": float(sum(abs(r) for r in validity_rewards) / max(1, len(validity_rewards))),
+        "truncated": float(1.0 if (not done and int(max_steps) > 0 and t == int(max_steps) - 1) else 0.0),
+        "micro_capture_rate": float(action_reasons.get("micro_capture", 0) / max(1, sum(action_reasons.values()))),
+        "raw_launch_rate": float(action_reasons.get("raw_launch", 0) / max(1, sum(action_reasons.values()))),
+        "reject_rate": float(sum(
+            v for k, v in action_reasons.items()
+            if k.startswith("micro_reject") or k.startswith("micro_error")
+        ) / max(1, sum(action_reasons.values()))),
+        "invalid_rate": float(sum(
+            v for k, v in action_reasons.items()
+            if k.startswith("invalid")
+        ) / max(1, sum(action_reasons.values()))),
         "noop_rate": float(sum(
             v for k, v in action_reasons.items()
             if k.startswith("invalid") or k.startswith("micro_reject") or k.startswith("micro_error")

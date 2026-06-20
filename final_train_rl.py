@@ -97,6 +97,16 @@ def train(args) -> None:
                 num_agents=int(args.num_agents),
                 shaping_weight=float(args.shaping_weight),
                 terminal_weight=float(args.terminal_weight),
+                invalid_action_penalty=float(args.invalid_action_penalty),
+                reject_action_penalty=float(args.reject_action_penalty),
+                capture_action_bonus=float(args.capture_action_bonus),
+                raw_launch_bonus=float(args.raw_launch_bonus),
+                planner_top_m_sources=int(args.planner_top_m_sources),
+                planner_max_launches_per_target=int(args.planner_max_launches_per_target),
+                planner_budget_floor=float(args.planner_budget_floor),
+                planner_hold_horizon=float(args.planner_hold_horizon),
+                truncate_terminal_weight=float(args.truncate_terminal_weight),
+                include_owned_targets=bool(args.include_owned_targets),
             )
             ep_stats.append(stats)
 
@@ -110,7 +120,14 @@ def train(args) -> None:
             "avg_reward": sum(s["reward_mean"] for s in ep_stats) / max(1, len(ep_stats)),
             "avg_reward_p0": sum(s["reward_p0"] for s in ep_stats) / max(1, len(ep_stats)),
             "avg_reward_abs": sum(s["reward_abs_mean"] for s in ep_stats) / max(1, len(ep_stats)),
+            "avg_validity_reward": sum(s["validity_reward_mean"] for s in ep_stats) / max(1, len(ep_stats)),
+            "avg_validity_reward_abs": sum(s["validity_reward_abs_mean"] for s in ep_stats) / max(1, len(ep_stats)),
             "noop_rate": sum(s.get("noop_rate", 0.0) for s in ep_stats) / max(1, len(ep_stats)),
+            "micro_capture_rate": sum(s.get("micro_capture_rate", 0.0) for s in ep_stats) / max(1, len(ep_stats)),
+            "raw_launch_rate": sum(s.get("raw_launch_rate", 0.0) for s in ep_stats) / max(1, len(ep_stats)),
+            "reject_rate": sum(s.get("reject_rate", 0.0) for s in ep_stats) / max(1, len(ep_stats)),
+            "invalid_rate": sum(s.get("invalid_rate", 0.0) for s in ep_stats) / max(1, len(ep_stats)),
+            "truncated_rate": sum(s.get("truncated", 0.0) for s in ep_stats) / max(1, len(ep_stats)),
             "seconds": time.time() - t0,
             **update_stats,
         }
@@ -118,10 +135,16 @@ def train(args) -> None:
             fp.write(json.dumps(row) + "\n")
         print(
             f"[iter {it:04d}] steps={row['transitions']} "
-            f"reward={row['avg_reward']:+.4f} "
+            f"mean={row['avg_reward']:+.4f} "
             f"p0={row['avg_reward_p0']:+.4f} "
             f"abs={row['avg_reward_abs']:.4f} "
+            f"valid={row['avg_validity_reward']:+.4f} "
             f"noop={row['noop_rate']:.3f} "
+            f"cap={row['micro_capture_rate']:.3f} "
+            f"raw={row['raw_launch_rate']:.3f} "
+            f"rej={row['reject_rate']:.3f} "
+            f"inv={row['invalid_rate']:.3f} "
+            f"trunc={row['truncated_rate']:.3f} "
             f"pi={row['policy_loss']:+.4f} v={row['value_loss']:.4f} "
             f"ent={row['entropy']:.3f} sec={row['seconds']:.1f}",
             flush=True,
@@ -153,6 +176,22 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--shaping-weight", type=float, default=0.05)
     p.add_argument("--terminal-weight", type=float, default=1.0)
+    p.add_argument("--invalid-action-penalty", type=float, default=0.02)
+    p.add_argument("--reject-action-penalty", type=float, default=0.005)
+    p.add_argument("--capture-action-bonus", type=float, default=0.002)
+    p.add_argument("--raw-launch-bonus", type=float, default=0.0)
+    p.add_argument("--planner-top-m-sources", type=int, default=5)
+    p.add_argument("--planner-max-launches-per-target", type=int, default=3)
+    p.add_argument("--planner-budget-floor", type=float, default=0.35)
+    p.add_argument("--planner-hold-horizon", type=float, default=24.0)
+    p.add_argument("--truncate-terminal-weight", type=float, default=1.0)
+    p.add_argument(
+        "--include-owned-targets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow owned planets as launch targets (reinforcement/defense). "
+             "Enable when resuming a BC checkpoint trained with owned targets.",
+    )
     p.add_argument("--checkpoint-every", type=int, default=10)
     p.add_argument("--checkpoint-dir", default="checkpoints_final_rl")
     p.add_argument("--log-path", default=None)

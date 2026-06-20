@@ -2546,6 +2546,19 @@ Dosyalar:
     - amount fraction
   - value head
 
+Not: mevcut calisan PPO implementation'i tam node-tag + role-aware allocator
+mimarisi degildir. Model strategic head'ler uretse de training action'i su anda:
+
+```text
+target_idx
+source_idx
+amount_fraction
+```
+
+Bu nedenle "yanlis tag cezasi" su an dogrudan uygulanmaz. Calisan sistemde
+cezalandirilan sey tag mismatch degil, secilen source/target/amount niyetinin
+validation sonucudur.
+
 - `final_rollout.py`
   - self-play rollout
   - production-share delta shaping
@@ -2553,10 +2566,16 @@ Dosyalar:
   - PPO clipped update
   - policy action -> launch conversion
   - non-owned targets icin micro planner gate
+  - non-owned target icin policy'nin sectigi source tek donor olarak zorlanmaz;
+    secili source oncelikli anchor kabul edilir, planner top-M owned donor ile
+    multi-source capture-and-hold cozer
+  - amount fraction donor budget scale olarak kullanilir
   - micro planner non-owned hedefte stable capture bulamazsa weak raw launch
     gondermez; no-op olarak loglar
   - planner horizon'i training truncate `max_steps` yerine env episode horizon'i
     ile uyumlu tutulur
+  - oyun `max_steps` yuzunden truncate olursa terminal fallback olarak
+    production-share margin reward'a eklenir
 
 - `final_train_rl.py`
   - full neural PPO training script
@@ -2572,11 +2591,18 @@ Full training:
 
 ```bash
 ../orbit_wars_env/bin/python final_train_rl.py \
-  --iterations 200 --episodes-per-iter 4 --max-steps 300 \
+  --iterations 100 --episodes-per-iter 2 --max-steps 150 \
   --num-agents 2 --d-model 128 --n-heads 4 --n-layers 2 \
-  --lr 3e-4 --ppo-epochs 4 --minibatch-size 256 \
+  --lr 3e-4 --ppo-epochs 2 --minibatch-size 128 \
   --entropy-coef 0.02 --shaping-weight 0.05 --terminal-weight 1.0 \
-  --checkpoint-every 10 --checkpoint-dir checkpoints_final_rl
+  --invalid-action-penalty 0.02 \
+  --reject-action-penalty 0.005 \
+  --capture-action-bonus 0.002 \
+  --planner-top-m-sources 5 \
+  --planner-max-launches-per-target 3 \
+  --planner-budget-floor 0.35 \
+  --truncate-terminal-weight 1.0 \
+  --checkpoint-every 1 --checkpoint-dir checkpoints_final_rl
 ```
 
 Resume:
@@ -2611,7 +2637,8 @@ Smoke test:
   tests/test_final_timeline.py \
   tests/test_final_obs.py \
   tests/test_final_micro_planner.py \
-  tests/test_final_model.py -q
+  tests/test_final_model.py \
+  tests/test_final_rollout.py -q
 ```
 
 Kapsam:
@@ -2624,10 +2651,73 @@ Kapsam:
 - micro planner stable capture
 - negatif skorlu ama stable capture yapan planin elenmemesi
 - GNN policy action/evaluate finite checks
+- action decoder'in selected target icin multi-source capture uretebilmesi
 - empty mask fallback
 - PPO single-item advantage normalization
 
-### 21.4 Son Duzeltme Kararlari
+### 21.4 Full Game Logging ve Replay
+
+Tum oyunu bastan sona debug etmek icin:
+
+```bash
+../orbit_wars_env/bin/python scripts/final_game_recorder.py record \
+  --agent final_rl --ckpt checkpoints_final_rl/latest.pt \
+  --opponent orbit --games 2 --max-steps 300 \
+  --out-dir game_logs --prefix final_rl_vs_orbit --html
+```
+
+Bu komut her oyun icin JSON log yazar:
+
+```text
+game_logs/final_rl_vs_orbit_000_p0_seed1000.json
+game_logs/final_rl_vs_orbit_000_p1_seed1000.json
+...
+```
+
+`--html` verilirse ayni oyunun HTML replay'i de yazilir.
+
+JSON log icerigi:
+
+- initial state
+- her turn icin state_before
+- player action listesi
+- policy/controller debug reason
+- state_after
+- reward/status
+- production/ship summary
+- final rewards
+- reason_counts
+- Kaggle `steps` replay payload
+
+Terminalde oynatmak:
+
+```bash
+../orbit_wars_env/bin/python scripts/final_game_recorder.py replay \
+  --log game_logs/final_rl_vs_orbit_000_p0_seed1000.json \
+  --sleep 0.05 --debug
+```
+
+Kayitli JSON'dan HTML tekrar render etmek:
+
+```bash
+../orbit_wars_env/bin/python scripts/final_game_recorder.py render \
+  --log game_logs/final_rl_vs_orbit_000_p0_seed1000.json
+```
+
+Deterministic micro-agent icin:
+
+```bash
+../orbit_wars_env/bin/python scripts/final_game_recorder.py record \
+  --agent final_micro --opponent orbit --games 2 \
+  --max-steps 300 --out-dir game_logs --prefix final_micro_vs_orbit --html
+```
+
+Bu arac training loop'un parcasi degil; eval/debug maclarini kaydeder. Training
+sirasinda her episode'u kaydetmek istenirse ayni format `collect_episode`
+icinden opsiyonel hook olarak baglanabilir, ama bu ciddi disk ve runtime maliyeti
+yaratir.
+
+### 21.5 Son Duzeltme Kararlari
 
 Bu turda, egitim kosmadan once reward/action noise uretecek net hatalar
 kapatildi.
@@ -2703,6 +2793,90 @@ planner reject  -> no-op + reason log
 Bu daha konservatif ama egitim icin daha temizdir. Ajan once stable capture
 uretebilen target/source niyetlerini ogrenmelidir.
 
+5.1 Action-validity penalty:
+
+Hard mask sadece acikca imkansiz slotlari policy logits'inden siler. Ancak
+mask sonrasi secilen `(source, target, amount)` yine de deterministic validation
+tarafindan reddedilebilir:
+
+- invalid slot / owner / amount / geometry
+- micro planner stable capture bulamadi
+- trajectory gecersiz
+
+Bu durumlar eski PPO reward'unda zayif gorunuyordu. Artik rollout'a ayri dense
+validity reward eklendi:
+
+```text
+invalid_*           -> -invalid_action_penalty
+micro_reject/error  -> -reject_action_penalty
+micro_capture       -> +capture_action_bonus
+raw_launch          -> +raw_launch_bonus
+```
+
+Default:
+
+```text
+invalid_action_penalty = 0.02
+reject_action_penalty  = 0.005
+capture_action_bonus   = 0.002
+raw_launch_bonus       = 0.0
+```
+
+Ceza sadece state'te kaynak ve hedef secme imkani varsa uygulanir. Yani oyuncunun
+hic source'u veya hic target'i yoksa fallback/no-op cezalandirilmaz.
+
+Training log artik bu kanali da gosterir:
+
+```text
+valid=...
+cap=...
+raw=...
+rej=...
+inv=...
+```
+
+Bu ayrim onemli:
+
+```text
+masking = impossible action'i bastirir
+validation = secilen action'in fizik/timeline kontrolu
+validity reward = validation'dan donen hatayi policy'ye ceza olarak yazar
+```
+
+5.2 Multi-source planner decoder:
+
+Onceki rollout decoder micro-planner'a sadece policy'nin sectigi tek source'u
+veriyordu. Bu, capture'in coklu donor koordinasyonu gerektirdigi ana tasarim
+gerekcesini iptal ediyordu ve `noop/reject` oranini yukseltiyordu.
+
+Yeni davranis:
+
+```text
+policy target_idx secer
+policy source_idx secer = preferred donor / anchor
+policy amount secer = donor budget scale
+decoder selected source'u ilk siraya koyar
+decoder top-M owned donor'u planner'a verir
+micro planner multi-source capture-and-hold cozer
+```
+
+Bu tag/allocator sisteminin tam hali degildir; ama edge-style action ile
+role-aware allocator arasinda daha dogru bir ara katmandir. Source action'i
+tamamen ignore edilmez, fakat tek-source capture zorlamasi da kalkar.
+
+5.3 Turn-cap terminal fallback:
+
+Training `max_steps` env'in `episodeSteps` degerinden kisa olabilir. Oyun
+bitmeden truncate edilirse env terminal reward'u gelmez. Bu durumda son
+transition terminal kabul edilir ve production-share margin reward'a eklenir:
+
+```text
+truncate_terminal_reward = truncate_terminal_weight * production_share_margin
+```
+
+Bu, tasarimdaki terminal ana sinyal prensibini kisa training rollout'larinda
+yaklasik olarak korur.
+
 6. Defense ve strip risk:
 
 Deterministic final agent artik sadece `CRITICAL` degil, `STRAINED` savunma
@@ -2712,7 +2886,7 @@ budget azaldikca strip-risk view yaklasik guncellenir.
 Bu tam yeniden defense hesaplama degildir; ama ayni turn icinde ayni source'un
 arka arkaya fazla soyulmasini azaltir.
 
-### 21.5 Bilerek Sinirli Birakilan Kisimlar
+### 21.6 Bilerek Sinirli Birakilan Kisimlar
 
 Su anki neural training calisir, fakat dokumandaki tam credit/ledger tasariminin
 hepsi bitmis degil.
@@ -2722,7 +2896,9 @@ Implemented:
 - edge-aware GNN observation + model
 - target/source/amount stochastic policy
 - PPO self-play
-- micro planner gate
+- multi-source micro planner decoder/gate
+- action-validity penalty
+- truncate terminal fallback
 - deterministic final micro submission builder
 
 Henuz tam degil:

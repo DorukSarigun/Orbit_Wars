@@ -29,7 +29,7 @@ class FinalObservation:
     valid_mask: np.ndarray    # (P_MAX,)
     edge_mask: np.ndarray     # valid directed planet pairs
     source_mask: np.ndarray   # owned planets with ships
-    target_mask: np.ndarray   # non-owned planets
+    target_mask: np.ndarray   # selectable targets (non-owned; +owned if enabled)
     planet_ids: np.ndarray    # slot -> planet id, -1 padded
 
 
@@ -47,7 +47,22 @@ def _env_omega(env_obs: Any) -> float:
     return float(getattr(env_obs, "angular_velocity", 0.0) or 0.0)
 
 
-def build_final_observation(env_obs: Any, player: int, *, p_max: int = P_MAX) -> FinalObservation:
+def build_final_observation(
+    env_obs: Any,
+    player: int,
+    *,
+    p_max: int = P_MAX,
+    include_owned_targets: bool = False,
+) -> FinalObservation:
+    """Build the padded planet observation.
+
+    ``include_owned_targets`` controls the ``target_mask`` semantics:
+
+    * ``False`` (default, legacy): only non-owned planets are selectable as
+      targets (attack / expansion).  Preserves the original behaviour.
+    * ``True``: owned planets are also selectable, so the policy can issue
+      reinforcement / defense / support launches toward its own worlds.
+    """
     planets = parse_planets(env_obs)
     fleets = parse_fleets(env_obs)
     n = min(len(planets), int(p_max))
@@ -98,7 +113,7 @@ def build_final_observation(env_obs: Any, player: int, *, p_max: int = P_MAX) ->
         own, enemy, neutral = _owner_features(p.owner, player)
         valid[i] = True
         source[i] = bool(own and int(p.ships) > 0)
-        target[i] = bool(not own)
+        target[i] = True if include_owned_targets else bool(not own)
         ids[i] = int(p.id)
 
         node[i] = np.asarray([
